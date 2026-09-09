@@ -244,7 +244,7 @@ inline bool generate_mesh_contacts(const Shape& shape, const glm::vec3& pos, con
     if (!mesh_shape.mesh) return false;
     const geometry::TriangleMesh& mesh = *mesh_shape.mesh;
 
-    glm::mat4 mesh_transform = glm::mat4_cast(mesh_rot);
+    glm::mat4 mesh_transform(glm::mat3_cast(mesh_rot * mesh_shape.local_rotation) * mesh_shape.mesh_scale);
     mesh_transform[3] = glm::vec4(mesh_pos + mesh_rot * mesh_shape.local_center, 1.0f);
 
     out = ContactManifold{};

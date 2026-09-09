@@ -12,6 +12,8 @@
 #include <physxcoopa/util/math.h>
 #include <physxcoopa/dynamics/body.h>
 #include <physxcoopa/dynamics/integrator.h>
+#include <physxcoopa/dynamics/inertia.h>
+#include <physxcoopa/dynamics/joint.h>
 #include <physxcoopa/dynamics/solver.h>
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/collision/manifold.h>
@@ -22,14 +24,18 @@
 #include <physxcoopa/broadphase/pair_cache.h>
 #include <physxcoopa/query/queries.h>
 #include <physxcoopa/debug/debug_draw.h>
+#include <physxcoopa/util/physics_settings.h>
 
 #include <coopa/event/signal.h>
 #include <coopa/debug/logger.h>
+#include <coopa/job/engine.h>
+#include <coopa/job/parallel_for.h>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -79,15 +85,13 @@ public:
             index = free_indices_.back();
             free_indices_.pop_back();
             bodies_[index] = initial;
-            shapes_[index] = shape;
+            body_shapes_[index].clear();
         } else {
             index = static_cast<uint32_t>(bodies_.size());
             bodies_.push_back(initial);
-            shapes_.push_back(shape);
             generations_.push_back(0);
             alive_.push_back(false);
-            tree_proxy_.push_back(broadphase::k_null_node);
-            in_static_tree_.push_back(false);
+            body_shapes_.push_back({});
         }
         alive_[index] = true;
         dynamics::Body& b = bodies_[index];
@@ -96,30 +100,181 @@ public:
         b.last_written_position = b.position;
         b.last_written_orientation = b.orientation;
         dynamics::update_world_inertia(b);
-        create_proxy_(index);
-        return dynamics::BodyId{index, generations_[index]};
+        dynamics::BodyId id{index, generations_[index]};
+        add_shape(id, shape);
+        return id;
     }
 
-    /** @brief Destroys a body immediately. A no-op if `id` is already invalid/stale. */
+    /** @brief Destroys a body immediately, including every shape it owns (see add_shape()'s
+     *         doc for compound bodies). A no-op if `id` is already invalid/stale. */
     void remove_body(dynamics::BodyId id) {
         if (!is_valid(id)) return;
-        destroy_proxy_(id.index);
+        // Copy first -- remove_shape() below mutates body_shapes_[id.index] (its own erase),
+        // so iterating that vector directly while shrinking it under our feet is exactly the
+        // kind of bug this guards against.
+        std::vector<uint32_t> owned = body_shapes_[id.index];
+        for (uint32_t shape_index : owned) remove_shape(shape_index);
+        // Any joint referencing this body must be invalidated NOW -- unlike a contact manifold
+        // (rediscovered fresh by broadphase every substep, so a stale one simply never
+        // reappears), a HingeJoint is a persistent object the solver would otherwise keep
+        // indexing into bodies_[id.index] via the raw index alone (no generation check --
+        // see solve_joint_velocity_pass()'s doc), silently acting on WHATEVER body this slot
+        // gets recycled for next.
+        for (auto& j : joints_) {
+            if (j.valid && (j.a == id || j.b == id)) j.valid = false;
+        }
         alive_[id.index] = false;
         ++generations_[id.index];
         free_indices_.push_back(id.index);
     }
 
-    /** @brief Replaces a live body's collision shape immediately. No-op if `id` is invalid. */
+    /**
+     * @brief Adds an ADDITIONAL shape to an already-live body -- the compound-collider
+     *        primitive: call this once per extra child Collider bound to a Rigidbody (the
+     *        first/primary shape is created for you by add_body() itself). The returned slot is
+     *        a raw, non-generational index (unlike BodyId) -- this is an advanced, PhysicsSystem-
+     *        internal-facing API whose caller (the Scene binding layer) always operates within
+     *        well-defined frame boundaries and never holds a slot across a state where it could
+     *        have gone stale without also already knowing to drop it (regather_() fully
+     *        recomputes what shapes SHOULD exist every time it runs). No-op (returns
+     *        k_invalid_shape) if `owner` is invalid.
+     *
+     * Every world_*() shape-instancing helper (collision/shape.h) already reads a shape's pose
+     * as `owner_body.position + owner_body.orientation * (shape.local_center, .local_rotation)`
+     * -- exactly the composition a compound child's own local offset/rotation needs, and
+     * exactly what Phase 3's Shape::local_rotation addition was a prerequisite for.
+     */
+    static constexpr uint32_t k_invalid_shape = 0xFFFFFFFFu;
+    uint32_t add_shape(dynamics::BodyId owner, const collision::Shape& shape) {
+        if (!is_valid(owner)) return k_invalid_shape;
+        uint32_t slot;
+        if (!free_shape_indices_.empty()) {
+            slot = free_shape_indices_.back();
+            free_shape_indices_.pop_back();
+            shapes_[slot] = shape;
+            shape_owner_[slot] = owner;
+        } else {
+            slot = static_cast<uint32_t>(shapes_.size());
+            shapes_.push_back(shape);
+            shape_owner_.push_back(owner);
+            shape_alive_.push_back(false);
+            tree_proxy_.push_back(broadphase::k_null_node);
+            in_static_tree_.push_back(false);
+        }
+        shape_alive_[slot] = true;
+        body_shapes_[owner.index].push_back(slot);
+        create_shape_proxy_(slot);
+        return slot;
+    }
+
+    /** @brief Removes one shape slot (as returned by add_shape()/add_body()) immediately. A
+     *         body left with zero shapes participates in dynamics but never collision, same as
+     *         Shape::enabled's "Rigidbody with no Collider" doc already describes for the
+     *         single-shape case. No-op if `shape_index` is out of range or already free. */
+    void remove_shape(uint32_t shape_index) {
+        if (shape_index >= shapes_.size() || !shape_alive_[shape_index]) return;
+        destroy_shape_proxy_(shape_index);
+        dynamics::BodyId owner = shape_owner_[shape_index];
+        shape_alive_[shape_index] = false;
+        free_shape_indices_.push_back(shape_index);
+        if (owner.index < body_shapes_.size()) {
+            auto& owned = body_shapes_[owner.index];
+            owned.erase(std::remove(owned.begin(), owned.end(), shape_index), owned.end());
+        }
+    }
+
+    /** @brief The shape slot at `body_shapes_[id.index][i]`, or k_invalid_shape if `id` is
+     *         invalid or has no shape at that position (i=0 is the "primary" shape). */
+    uint32_t shape_at(dynamics::BodyId id, std::size_t i = 0) const {
+        if (!is_valid(id) || i >= body_shapes_[id.index].size()) return k_invalid_shape;
+        return body_shapes_[id.index][i];
+    }
+
+    /** @brief Every shape slot `id` currently owns, primary first. Empty for a shapeless body. */
+    const std::vector<uint32_t>& shapes_of(dynamics::BodyId id) const {
+        static const std::vector<uint32_t> empty;
+        return is_valid(id) ? body_shapes_[id.index] : empty;
+    }
+
+    /** @brief Replaces a live body's PRIMARY shape immediately -- for a compound body (more
+     *         than one shape), every OTHER shape is untouched; use remove_shape()/add_shape()
+     *         to add/remove additional children. No-op if `id` is invalid or already shapeless
+     *         (use add_shape() to give a shapeless body its first shape instead). */
     void set_shape(dynamics::BodyId id, const collision::Shape& shape) {
-        if (!is_valid(id)) return;
-        destroy_proxy_(id.index);
-        shapes_[id.index] = shape;
-        create_proxy_(id.index);
+        uint32_t slot = shape_at(id);
+        if (slot == k_invalid_shape) return;
+        destroy_shape_proxy_(slot);
+        shapes_[slot] = shape;
+        create_shape_proxy_(slot);
+    }
+
+    /** @brief Replaces the shape at slot `shape_index` immediately (see add_shape()'s doc for
+     *         where the slot comes from). No-op if `shape_index` is invalid/free. */
+    void set_shape_at(uint32_t shape_index, const collision::Shape& shape) {
+        if (shape_index >= shapes_.size() || !shape_alive_[shape_index]) return;
+        destroy_shape_proxy_(shape_index);
+        shapes_[shape_index] = shape;
+        create_shape_proxy_(shape_index);
+    }
+
+    /**
+     * @brief Transitions a live body between BodyType::Dynamic and BodyType::Kinematic in
+     *        place -- the only supported transition (a Static body has no Rigidbody to flip
+     *        `is_kinematic` on in the first place, so Static is never a valid `from` or `to`
+     *        here; both other types live in dynamic_tree_, never static_tree_ -- see
+     *        create_proxy_()'s branch -- so this never touches broadphase tree membership or
+     *        the body's proxy at all). No-op (returns false) if `id` is invalid, `new_type` is
+     *        Static, or the body is already Static.
+     *
+     * Becoming Kinematic leaves `mass`/`inv_mass`/`inv_inertia_local` untouched, matching
+     * create_body_for_()'s own Kinematic branch (system/physics_system.h) -- those fields are
+     * simply never read for a non-Dynamic body (every consumer gates on `type == Dynamic`
+     * first: integrate_forces/integrate_velocities in dynamics/integrator.h,
+     * apply_impulse_pair in dynamics/solver.h), so leaving stale values is harmless and
+     * consistent with how a body created straight into Kinematic already behaves.
+     * Becoming Dynamic recomputes `inv_mass` from `mass` and `inv_inertia_local` from `mass`
+     * and the body's CURRENT shape (dynamics::inertia_for_shape()) -- required, since these
+     * are actively consumed by every Dynamic-only pass the moment the flip takes effect.
+     *
+     * @param mass Mass to apply if transitioning TO Dynamic; ignored transitioning to Kinematic.
+     */
+    bool set_body_type(dynamics::BodyId id, dynamics::BodyType new_type, float mass = 1.0f) {
+        if (new_type == dynamics::BodyType::Static) return false;
+        dynamics::Body* body = get_body(id);
+        if (!body || body->type == dynamics::BodyType::Static) return false;
+        if (body->type == new_type) return true;
+
+        body->type = new_type;
+        if (new_type == dynamics::BodyType::Dynamic) {
+            body->mass = mass;
+            body->inv_mass = mass > 0.0f ? 1.0f / mass : 0.0f;
+            const collision::Shape* shape = get_shape(id);
+            if (shape) body->inv_inertia_local = dynamics::inertia_for_shape(*shape, mass);
+        }
+        // inv_inertia_world self-corrects to zero for a non-Dynamic body on the very next
+        // substep (dynamics::update_world_inertia()'s own type gate) -- no action needed here.
+        return true;
     }
 
     /** @brief The layer matrix consulted before any narrowphase work. */
     broadphase::LayerMatrix& layers() { return layer_matrix_; }
     const broadphase::LayerMatrix& layers() const { return layer_matrix_; }
+
+    /**
+     * @brief Installs the JobEngine generate_manifolds_() dispatches its broadphase-bounds,
+     *        pair-discovery and narrowphase passes onto (see those methods' docs). Pass
+     *        nullptr (the default) to force fully serial stepping -- e.g. for a headless test
+     *        that needs bit-exact single-threaded behavior to compare against.
+     */
+    void set_job_engine(coopa::job::JobEngine* jobs) { jobs_ = jobs; }
+    coopa::job::JobEngine* job_engine() const { return jobs_; }
+
+    /** @brief Minimum item count (bodies for bounds/pairs, pairs for narrowphase) before a
+     *         stage dispatches to job_engine() instead of running inline on the calling
+     *         thread -- mirrors the should_parallelize_() idiom used elsewhere in this
+     *         workspace (see toyengine's PixelRenderPipeline). */
+    void set_parallel_threshold(std::size_t n) { parallel_threshold_ = n; }
+    std::size_t parallel_threshold() const { return parallel_threshold_; }
 
     // --- Body lifecycle (deferrable -- safe to call from an on_substep slot) ---
 
@@ -157,6 +312,9 @@ public:
         for (auto& m : manifolds_) {
             if (m.valid && (m.a == id || m.b == id)) m.valid = false;
         }
+        for (auto& j : joints_) {
+            if (j.valid && (j.a == id || j.b == id)) j.valid = false;
+        }
         DeferredCommand cmd;
         cmd.type = DeferredCommand::Type::Destroy;
         cmd.target = id;
@@ -177,12 +335,111 @@ public:
         return is_valid(id) ? &bodies_[id.index] : nullptr;
     }
 
-    /** @brief Returns the shape `id` addresses, or nullptr if `id` is invalid/stale. */
+    /** @brief Returns `id`'s PRIMARY shape (see body_shapes_'s doc), or nullptr if `id` is
+     *         invalid/stale or currently shapeless. For a compound body's other shapes, use
+     *         shapes_of()/shape_at() to get the slot, then get_shape_at(). */
     collision::Shape* get_shape(dynamics::BodyId id) {
-        return is_valid(id) ? &shapes_[id.index] : nullptr;
+        uint32_t slot = shape_at(id);
+        return slot != k_invalid_shape ? &shapes_[slot] : nullptr;
     }
     const collision::Shape* get_shape(dynamics::BodyId id) const {
-        return is_valid(id) ? &shapes_[id.index] : nullptr;
+        uint32_t slot = shape_at(id);
+        return slot != k_invalid_shape ? &shapes_[slot] : nullptr;
+    }
+
+    /** @brief Returns the shape at slot `shape_index` (as returned by add_shape()/shape_at()),
+     *         or nullptr if the slot is out of range or currently free. */
+    collision::Shape* get_shape_at(uint32_t shape_index) {
+        return (shape_index < shapes_.size() && shape_alive_[shape_index]) ? &shapes_[shape_index] : nullptr;
+    }
+    const collision::Shape* get_shape_at(uint32_t shape_index) const {
+        return (shape_index < shapes_.size() && shape_alive_[shape_index]) ? &shapes_[shape_index] : nullptr;
+    }
+
+    // --- Joints ---
+
+    /**
+     * @brief Creates a hinge joint between `a` and `b`, returning a generational handle. Both
+     *        must already be valid bodies (no-op, returns an invalid JointId, otherwise).
+     *        `local_anchor_a`/`local_axis_a` are in `a`'s own local frame, `local_anchor_b`/
+     *        `local_axis_b` in `b`'s -- exactly like collision::Shape's local_center/
+     *        local_rotation (shape.h), rotated/translated by each body's own current pose to
+     *        get the world-space constraint target every solve (see
+     *        dynamics::solve_joint_velocity_pass()'s doc).
+     *
+     * `HingeJoint::rest_relative_rotation` (the reference angle limits are measured from) is
+     * captured automatically from the two bodies' CURRENT orientations at the moment this is
+     * called -- matching Unity's HingeJoint.limits, which are relative to the joint's initial
+     * relative orientation, not some externally-authored zero.
+     *
+     * @param use_limits When true, rotation about the hinge axis is clamped to
+     *                    [min_angle, max_angle] (radians) -- `min_angle == max_angle` (0 is the
+     *                    natural choice) locks the one remaining DOF entirely, giving a fully
+     *                    rigid attachment with no separate "fixed joint" implementation needed.
+     * @param collide_connected When false (the default), `a` and `b` never generate contacts
+     *                          against each other -- see HingeJoint::collide_connected's own doc
+     *                          for why that's the sane default for a hinge specifically (its two
+     *                          bodies are EXPECTED to overlap right at the anchor).
+     */
+    dynamics::JointId add_hinge_joint(dynamics::BodyId a, dynamics::BodyId b, const glm::vec3& local_anchor_a,
+                                       const glm::vec3& local_anchor_b, const glm::vec3& local_axis_a,
+                                       const glm::vec3& local_axis_b, bool use_limits = false, float min_angle = 0.0f,
+                                       float max_angle = 0.0f, bool collide_connected = false) {
+        const dynamics::Body* ba = get_body(a);
+        const dynamics::Body* bb = get_body(b);
+        if (!ba || !bb) return dynamics::JointId{};
+
+        dynamics::HingeJoint j;
+        j.a = a;
+        j.b = b;
+        j.local_anchor_a = local_anchor_a;
+        j.local_anchor_b = local_anchor_b;
+        j.local_axis_a = local_axis_a;
+        j.local_axis_b = local_axis_b;
+        j.use_limits = use_limits;
+        j.min_angle = min_angle;
+        j.max_angle = max_angle;
+        j.collide_connected = collide_connected;
+        j.rest_relative_rotation = glm::inverse(ba->orientation) * bb->orientation;
+        j.enabled = true;
+        j.valid = true;
+
+        uint32_t index;
+        if (!free_joint_indices_.empty()) {
+            index = free_joint_indices_.back();
+            free_joint_indices_.pop_back();
+            joints_[index] = j;
+        } else {
+            index = static_cast<uint32_t>(joints_.size());
+            joints_.push_back(j);
+            joint_generations_.push_back(0);
+            joint_alive_.push_back(false);
+        }
+        joint_alive_[index] = true;
+        return dynamics::JointId{index, joint_generations_[index]};
+    }
+
+    /** @brief True if `id` addresses a currently-alive joint. */
+    bool is_valid(dynamics::JointId id) const {
+        return id.is_valid() && id.index < joints_.size() && joint_alive_[id.index] &&
+               joint_generations_[id.index] == id.generation;
+    }
+
+    /** @brief Destroys a joint immediately. A no-op if `id` is already invalid/stale. */
+    void remove_joint(dynamics::JointId id) {
+        if (!is_valid(id)) return;
+        joint_alive_[id.index] = false;
+        ++joint_generations_[id.index];
+        free_joint_indices_.push_back(id.index);
+    }
+
+    /** @brief Returns the joint `id` addresses, or nullptr if `id` is invalid/stale -- mutable
+     *         access is intentional (e.g. a caller adjusting limits at runtime). */
+    dynamics::HingeJoint* get_joint(dynamics::JointId id) {
+        return is_valid(id) ? &joints_[id.index] : nullptr;
+    }
+    const dynamics::HingeJoint* get_joint(dynamics::JointId id) const {
+        return is_valid(id) ? &joints_[id.index] : nullptr;
     }
 
     /**
@@ -238,25 +495,33 @@ public:
     // Only valid between phases, not from inside on_substep (mid-solve, not-yet-integrated
     // state). `layer_mask` follows Unity's convention: bit `shape.layer` of the mask, not the
     // LayerMatrix used for solver pair rejection -- a query has no "other side" to look up a
-    // collision-matrix entry against.
+    // collision-matrix entry against. `include_triggers` (default true, matching every prior
+    // release of these queries -- a trigger collider always got a normal broadphase proxy and
+    // was never filtered) lets a caller exclude trigger colliders, e.g. a raycast that should
+    // only ever see solid geometry.
 
     /** @brief Closest hit along `ray`, or false if nothing was hit. */
-    bool raycast(const geometry::Ray& ray, query::RaycastHit& hit, uint32_t layer_mask = ~0u) const {
+    bool raycast(const geometry::Ray& ray, query::RaycastHit& hit, uint32_t layer_mask = ~0u,
+                 bool include_triggers = true) const {
         bool found = false;
         float best_t = ray.max_distance;
         auto visit = [&](void* user_data) {
             uint32_t i = user_data_to_index_(user_data);
             if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
+            if (!include_triggers && shapes_[i].is_trigger) return;
+            const dynamics::BodyId owner = shape_owner_[i];
+            const dynamics::Body& body = bodies_[owner.index];
             geometry::Ray clipped = ray;
             clipped.max_distance = best_t;
             float t;
             glm::vec3 n;
-            if (!query::raycast_shape(clipped, shapes_[i], bodies_[i].position, bodies_[i].orientation, t, n)) return;
+            if (!query::raycast_shape(clipped, shapes_[i], body.position, body.orientation, t, n)) return;
             best_t = t;
             hit.point = ray.origin + ray.direction * t;
             hit.normal = n;
             hit.distance = t;
-            hit.body = dynamics::BodyId{i, generations_[i]};
+            hit.body = owner;
+            hit.shape_index = i;
             found = true;
         };
         dynamic_tree_.raycast(ray, visit);
@@ -264,21 +529,50 @@ public:
         return found;
     }
 
+    /**
+     * @brief True if ANYTHING along `ray` is hit, stopping at the first tree-traversal hit --
+     *        NOT necessarily the closest one (unlike raycast()). A distinct, cheaper query for
+     *        "is anything blocking this line" checks that don't care which thing is in the way,
+     *        built on AABBTree::raycast_until()'s early-out traversal.
+     */
+    bool raycast_any(const geometry::Ray& ray, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        bool found = false;
+        auto visit = [&](void* user_data) -> bool {
+            uint32_t i = user_data_to_index_(user_data);
+            if (!((layer_mask >> shapes_[i].layer) & 1u)) return false;
+            if (!include_triggers && shapes_[i].is_trigger) return false;
+            const dynamics::Body& body = bodies_[shape_owner_[i].index];
+            float t;
+            glm::vec3 n;
+            if (!query::raycast_shape(ray, shapes_[i], body.position, body.orientation, t, n)) return false;
+            found = true;
+            return true; // stop the traversal -- this is the one difference from raycast_all()
+        };
+        dynamic_tree_.raycast_until(ray, visit);
+        if (!found) static_tree_.raycast_until(ray, visit);
+        return found;
+    }
+
     /** @brief Every hit along `ray`, sorted nearest-first (unlike raycast(), not clipped to the
      *         closest hit as it goes, since every overlapping body along the ray is wanted). */
-    std::vector<query::RaycastHit> raycast_all(const geometry::Ray& ray, uint32_t layer_mask = ~0u) const {
+    std::vector<query::RaycastHit> raycast_all(const geometry::Ray& ray, uint32_t layer_mask = ~0u,
+                                                bool include_triggers = true) const {
         std::vector<query::RaycastHit> hits;
         auto visit = [&](void* user_data) {
             uint32_t i = user_data_to_index_(user_data);
             if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
+            if (!include_triggers && shapes_[i].is_trigger) return;
+            const dynamics::BodyId owner = shape_owner_[i];
+            const dynamics::Body& body = bodies_[owner.index];
             float t;
             glm::vec3 n;
-            if (!query::raycast_shape(ray, shapes_[i], bodies_[i].position, bodies_[i].orientation, t, n)) return;
+            if (!query::raycast_shape(ray, shapes_[i], body.position, body.orientation, t, n)) return;
             query::RaycastHit hit;
             hit.point = ray.origin + ray.direction * t;
             hit.normal = n;
             hit.distance = t;
-            hit.body = dynamics::BodyId{i, generations_[i]};
+            hit.body = owner;
+            hit.shape_index = i;
             hits.push_back(hit);
         };
         dynamic_tree_.raycast(ray, visit);
@@ -300,7 +594,7 @@ public:
      * revisit with a true swept-volume test if a caller needs exact rounded-corner behavior.
      */
     bool sphere_cast(const glm::vec3& origin, float radius, const glm::vec3& dir, float max_distance,
-                      query::RaycastHit& hit, uint32_t layer_mask = ~0u) const {
+                      query::RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
         geometry::Ray ray;
         ray.origin = origin;
         ray.direction = dir;
@@ -311,6 +605,9 @@ public:
         auto visit = [&](void* user_data) {
             uint32_t i = user_data_to_index_(user_data);
             if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
+            if (!include_triggers && shapes_[i].is_trigger) return;
+            const dynamics::BodyId owner = shape_owner_[i];
+            const dynamics::Body& body = bodies_[owner.index];
             collision::Shape inflated = shapes_[i];
             switch (inflated.type) {
                 case collision::ShapeType::Sphere: inflated.radius += radius; break;
@@ -322,12 +619,13 @@ public:
             clipped.max_distance = best_t;
             float t;
             glm::vec3 n;
-            if (!query::raycast_shape(clipped, inflated, bodies_[i].position, bodies_[i].orientation, t, n)) return;
+            if (!query::raycast_shape(clipped, inflated, body.position, body.orientation, t, n)) return;
             best_t = t;
             hit.point = ray.origin + ray.direction * t;
             hit.normal = n;
             hit.distance = t;
-            hit.body = dynamics::BodyId{i, generations_[i]};
+            hit.body = owner;
+            hit.shape_index = i;
             found = true;
         };
         dynamic_tree_.raycast(ray, visit);
@@ -335,8 +633,61 @@ public:
         return found;
     }
 
-    /** @brief Every body whose shape overlaps a world-space sphere. */
-    std::vector<dynamics::BodyId> overlap_sphere(const glm::vec3& center, float radius, uint32_t layer_mask = ~0u) const {
+    /**
+     * @brief Casts a `half_extents`-sized box from `origin` along `dir`, up to `max_distance`,
+     *        keeping `orientation` fixed throughout the sweep (no tumbling mid-cast).
+     *
+     * Unlike sphere_cast(), a box (or capsule below) can't be folded into an "inflate the
+     * target, raycast" trick in general -- see world.h's own file doc / the plan's "Design
+     * rationale" for why no swept-OBB/conservative-advancement routine exists in this codebase
+     * (no GJK/EPA). v1 approximates instead with a DISCRETIZED STEPPED SWEEP: sample the casting
+     * box's pose at increasing distance along `dir` (step size a quarter of its own smallest
+     * half-extent, so it can't skip past a thin target entirely), overlap-test each sample
+     * against broadphase candidates, and on the first overlapping sample binary-search back
+     * toward the last clear sample to tighten the hit distance. This can miss a target thinner
+     * than the step size (same class of approximation sphere_cast already accepts for box/mesh
+     * corners) -- acceptable for v1's use cases, not a substitute for exact conservative
+     * advancement if a caller ever needs one.
+     */
+    bool box_cast(const glm::vec3& origin, const glm::vec3& half_extents, const glm::quat& orientation,
+                  const glm::vec3& dir, float max_distance, query::RaycastHit& hit,
+                  uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        float min_extent = std::min({half_extents.x, half_extents.y, half_extents.z});
+        auto probe_at = [&](float d, collision::Shape& probe, glm::vec3& pos, glm::quat& rot) {
+            probe = collision::Shape::make_box(half_extents);
+            pos = origin + dir * d;
+            rot = orientation;
+        };
+        return stepped_cast_(origin, dir, max_distance, min_extent, probe_at, layer_mask, include_triggers, hit);
+    }
+
+    /**
+     * @brief Casts a capsule (`radius`, `half_height` along `direction_axis` -- 0=X, 1=Y, 2=Z,
+     *        matching CapsuleCollider's own convention) from `origin` along `dir`, up to
+     *        `max_distance`, keeping `orientation` fixed throughout the sweep.
+     *
+     * Same discretized-stepped-sweep approximation as box_cast() above, for the same reason --
+     * see that doc.
+     */
+    bool capsule_cast(const glm::vec3& origin, float radius, float half_height, int direction_axis,
+                       const glm::quat& orientation, const glm::vec3& dir, float max_distance,
+                       query::RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        float min_extent = std::min(radius, half_height);
+        auto probe_at = [&](float d, collision::Shape& probe, glm::vec3& pos, glm::quat& rot) {
+            probe = collision::Shape::make_capsule(radius, half_height, direction_axis);
+            pos = origin + dir * d;
+            rot = orientation;
+        };
+        return stepped_cast_(origin, dir, max_distance, min_extent, probe_at, layer_mask, include_triggers, hit);
+    }
+
+    /** @brief Every body whose shape overlaps a world-space sphere -- for a compound body
+     *         (more than one shape), its BodyId appears once per CHILD shape that overlaps, so
+     *         it can appear more than once (Unity's own overlap semantics are per-collider, not
+     *         per-body; this is the closest match without a new return type -- see the plan's
+     *         Phase 5 doc for why that trade was made). */
+    std::vector<dynamics::BodyId> overlap_sphere(const glm::vec3& center, float radius, uint32_t layer_mask = ~0u,
+                                                  bool include_triggers = true) const {
         geometry::Sphere query_sphere{center, radius};
         geometry::AABB bounds;
         bounds.min = center - glm::vec3(radius);
@@ -346,8 +697,10 @@ public:
         auto visit = [&](void* user_data) {
             uint32_t i = user_data_to_index_(user_data);
             if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (query::shape_overlaps_sphere(shapes_[i], bodies_[i].position, bodies_[i].orientation, query_sphere)) {
-                results.push_back(dynamics::BodyId{i, generations_[i]});
+            if (!include_triggers && shapes_[i].is_trigger) return;
+            const dynamics::Body& body = bodies_[shape_owner_[i].index];
+            if (query::shape_overlaps_sphere(shapes_[i], body.position, body.orientation, query_sphere)) {
+                results.push_back(shape_owner_[i]);
             }
         };
         dynamic_tree_.query(bounds, visit);
@@ -355,16 +708,45 @@ public:
         return results;
     }
 
-    /** @brief Every body whose shape overlaps a world-space OBB. */
-    std::vector<dynamics::BodyId> overlap_box(const geometry::OBB& box, uint32_t layer_mask = ~0u) const {
+    /** @brief Every body whose shape overlaps a world-space OBB -- see overlap_sphere()'s doc
+     *         for the per-child-shape duplication a compound body can produce here too. */
+    std::vector<dynamics::BodyId> overlap_box(const geometry::OBB& box, uint32_t layer_mask = ~0u,
+                                               bool include_triggers = true) const {
         geometry::AABB bounds = box.bounds();
 
         std::vector<dynamics::BodyId> results;
         auto visit = [&](void* user_data) {
             uint32_t i = user_data_to_index_(user_data);
             if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (query::shape_overlaps_obb(shapes_[i], bodies_[i].position, bodies_[i].orientation, box)) {
-                results.push_back(dynamics::BodyId{i, generations_[i]});
+            if (!include_triggers && shapes_[i].is_trigger) return;
+            const dynamics::Body& body = bodies_[shape_owner_[i].index];
+            if (query::shape_overlaps_obb(shapes_[i], body.position, body.orientation, box)) {
+                results.push_back(shape_owner_[i]);
+            }
+        };
+        dynamic_tree_.query(bounds, visit);
+        static_tree_.query(bounds, visit);
+        return results;
+    }
+
+    /** @brief Every body whose shape overlaps a world-space capsule -- see overlap_sphere()'s
+     *         doc for the per-child-shape duplication a compound body can produce here too. */
+    std::vector<dynamics::BodyId> overlap_capsule(const geometry::Capsule& capsule, uint32_t layer_mask = ~0u,
+                                                   bool include_triggers = true) const {
+        geometry::AABB bounds;
+        glm::vec3 lo = glm::min(capsule.a, capsule.b) - glm::vec3(capsule.radius);
+        glm::vec3 hi = glm::max(capsule.a, capsule.b) + glm::vec3(capsule.radius);
+        bounds.min = lo;
+        bounds.max = hi;
+
+        std::vector<dynamics::BodyId> results;
+        auto visit = [&](void* user_data) {
+            uint32_t i = user_data_to_index_(user_data);
+            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
+            if (!include_triggers && shapes_[i].is_trigger) return;
+            const dynamics::Body& body = bodies_[shape_owner_[i].index];
+            if (query::shape_overlaps_capsule(shapes_[i], body.position, body.orientation, capsule)) {
+                results.push_back(shape_owner_[i]);
             }
         };
         dynamic_tree_.query(bounds, visit);
@@ -382,10 +764,10 @@ public:
      */
     void debug_draw(debug::DebugDraw& out, debug::DebugDrawFlags flags = debug::DebugDrawFlags::All) const {
         if (debug::has_flag(flags, debug::DebugDrawFlags::Colliders)) {
-            for (uint32_t i = 0; i < bodies_.size(); ++i) {
-                if (!alive_[i] || !shapes_[i].enabled) continue;
+            for (uint32_t i = 0; i < shapes_.size(); ++i) {
+                if (!shape_alive_[i] || !shapes_[i].enabled) continue;
                 const collision::Shape& shape = shapes_[i];
-                const dynamics::Body& body = bodies_[i];
+                const dynamics::Body& body = bodies_[shape_owner_[i].index];
                 uint32_t color = shape.is_trigger ? debug::colors::k_trigger
                                                    : (body.awake ? debug::colors::k_awake : debug::colors::k_sleeping);
                 switch (shape.type) {
@@ -400,7 +782,7 @@ public:
                         break;
                     case collision::ShapeType::TriangleMesh: {
                         if (!shape.mesh) break;
-                        glm::mat4 transform = glm::mat4_cast(body.orientation);
+                        glm::mat4 transform(glm::mat3_cast(body.orientation * shape.local_rotation) * shape.mesh_scale);
                         transform[3] = glm::vec4(body.position + body.orientation * shape.local_center, 1.0f);
                         out.add_mesh(*shape.mesh, transform, color);
                         break;
@@ -417,6 +799,23 @@ public:
                     const glm::vec3& p = m.points[i].position;
                     out.add_line(p, p + m.normal * k_normal_length, debug::colors::k_contact_normal);
                 }
+            }
+        }
+
+        if (debug::has_flag(flags, debug::DebugDrawFlags::Joints)) {
+            constexpr float k_axis_length = 0.3f;
+            for (const auto& j : joints_) {
+                if (!j.valid || !j.enabled) continue;
+                const dynamics::Body& a = bodies_[j.a.index];
+                const dynamics::Body& b = bodies_[j.b.index];
+                glm::vec3 world_anchor_a = a.position + a.orientation * j.local_anchor_a;
+                glm::vec3 world_anchor_b = b.position + b.orientation * j.local_anchor_b;
+                // The two anchors should be nearly coincident once converged -- drawing both
+                // ends (rather than just one) makes any solver drift visually obvious.
+                out.add_line(world_anchor_a, world_anchor_b, debug::colors::k_joint);
+                glm::vec3 world_axis_a = glm::normalize(a.orientation * j.local_axis_a);
+                out.add_line(world_anchor_a - world_axis_a * k_axis_length,
+                             world_anchor_a + world_axis_a * k_axis_length, debug::colors::k_joint);
             }
         }
 
@@ -450,7 +849,7 @@ public:
     void step(float dt) {
         events_.clear();
         accumulator_ += std::min(dt, util::k_max_frame_time);
-        const float h = util::k_default_fixed_dt;
+        const float h = config_.fixed_dt;
         uint32_t n = 0;
         while (accumulator_ >= h && n < config_.max_substeps) {
             step_fixed(h);
@@ -489,11 +888,11 @@ public:
             dynamics::integrate_forces(b, h);
         });
 
-        generate_manifolds_();
+        generate_manifolds_(h);
 
         on_substep.emit(*this, h);
 
-        dynamics::solve(bodies_, alive_, manifolds_, solver_state_, config_, h);
+        dynamics::solve(bodies_, alive_, manifolds_, joints_, solver_state_, config_, h);
 
         for_each_body([&](dynamics::BodyId, dynamics::Body& b) {
             b.prev_position = b.position;
@@ -539,33 +938,41 @@ public:
     }
 
 private:
-    /** @brief Creates this body's broadphase proxy if its shape is enabled. Static bodies go
-     *         into static_tree_ (built once, never refit here); Dynamic and Kinematic bodies
-     *         go into dynamic_tree_ (refit every step in sync_broadphase_()). A body with no
-     *         shape gets no proxy at all -- it never participates in broadphase or narrowphase. */
-    void create_proxy_(uint32_t index) {
-        const collision::Shape& shape = shapes_[index];
+    /** @brief Creates one shape slot's broadphase proxy if the shape is enabled. Static bodies'
+     *         shapes go into static_tree_ (built once, never refit here); Dynamic and Kinematic
+     *         bodies' shapes go into dynamic_tree_ (refit every step in sync_broadphase_()). A
+     *         disabled shape gets no proxy at all -- it never participates in broadphase or
+     *         narrowphase (matches the pre-compound-collider "body with no shape" case exactly,
+     *         now expressed per-shape). user_data packs the SHAPE slot index (see
+     *         user_data_to_index_()'s doc) -- resolving which BODY it belongs to is always a
+     *         second step (shape_owner_[slot]), never folded into the packed value itself. */
+    void create_shape_proxy_(uint32_t slot) {
+        const collision::Shape& shape = shapes_[slot];
         if (!shape.enabled) return;
-        const dynamics::Body& body = bodies_[index];
+        const dynamics::Body& body = bodies_[shape_owner_[slot].index];
         geometry::AABB bounds = collision::world_bounds(shape, body.position, body.orientation);
-        void* user_data = index_to_user_data_(index);
+        void* user_data = index_to_user_data_(slot);
         if (body.type == dynamics::BodyType::Static) {
-            tree_proxy_[index] = static_tree_.create_proxy(bounds, user_data);
-            in_static_tree_[index] = true;
+            tree_proxy_[slot] = static_tree_.create_proxy(bounds, user_data);
+            in_static_tree_[slot] = true;
         } else {
-            tree_proxy_[index] = dynamic_tree_.create_proxy(bounds, user_data);
-            in_static_tree_[index] = false;
+            tree_proxy_[slot] = dynamic_tree_.create_proxy(bounds, user_data);
+            in_static_tree_[slot] = false;
         }
     }
 
-    /** @brief Destroys this body's broadphase proxy, if it has one. */
-    void destroy_proxy_(uint32_t index) {
-        if (tree_proxy_[index] == broadphase::k_null_node) return;
-        if (in_static_tree_[index]) static_tree_.destroy_proxy(tree_proxy_[index]);
-        else dynamic_tree_.destroy_proxy(tree_proxy_[index]);
-        tree_proxy_[index] = broadphase::k_null_node;
+    /** @brief Destroys one shape slot's broadphase proxy, if it has one. */
+    void destroy_shape_proxy_(uint32_t slot) {
+        if (tree_proxy_[slot] == broadphase::k_null_node) return;
+        if (in_static_tree_[slot]) static_tree_.destroy_proxy(tree_proxy_[slot]);
+        else dynamic_tree_.destroy_proxy(tree_proxy_[slot]);
+        tree_proxy_[slot] = broadphase::k_null_node;
     }
 
+    /** @brief Packs a SHAPE slot index (into shapes_/tree_proxy_/etc -- see their own doc) as
+     *         opaque proxy user-data. Deliberately not a body index -- see shapes_'s file doc:
+     *         broadphase/narrowphase have always fundamentally operated on shapes, one level
+     *         below bodies, which compound colliders is what makes that distinction visible. */
     static void* index_to_user_data_(uint32_t index) {
         return reinterpret_cast<void*>(static_cast<uintptr_t>(index));
     }
@@ -573,81 +980,346 @@ private:
         return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(user_data));
     }
 
-    /** @brief Refits every dynamic-tree proxy (Dynamic and Kinematic bodies) to this step's
-     *         current world bounds. Static proxies never move, so static_tree_ needs no
-     *         per-step work. */
-    void sync_broadphase_() {
-        for (uint32_t i = 0; i < bodies_.size(); ++i) {
-            if (!alive_[i] || tree_proxy_[i] == broadphase::k_null_node || in_static_tree_[i]) continue;
-            geometry::AABB bounds = collision::world_bounds(shapes_[i], bodies_[i].position, bodies_[i].orientation);
-            dynamic_tree_.move_proxy(tree_proxy_[i], bounds, bodies_[i].linear_velocity);
+    /** @brief A shape's smallest characteristic dimension -- the threshold narrowphase_()'s CCD
+     *         fast-pair gate compares a substep's motion against. TriangleMesh returns +infinity
+     *         (never gates speculative treatment on; meshes are static-only and speculative mesh
+     *         contacts are out of scope for v1 -- see generate_contacts()'s `allow_speculative`
+     *         doc), so a mesh's own motion never triggers the gate, though a fast DYNAMIC body
+     *         moving toward a static mesh still can via the mesh's own min_extent contributing
+     *         infinity to the pairwise std::min() at the call site -- i.e. the OTHER shape's
+     *         extent alone decides it, correctly, since only that side can plausibly tunnel. */
+    static float shape_min_extent_(const collision::Shape& s) {
+        switch (s.type) {
+            case collision::ShapeType::Sphere: return s.radius;
+            case collision::ShapeType::Box: return std::min({s.half_extents.x, s.half_extents.y, s.half_extents.z});
+            case collision::ShapeType::Capsule: return std::min(s.capsule_radius, s.capsule_half_height);
+            case collision::ShapeType::TriangleMesh: return std::numeric_limits<float>::max();
+        }
+        return std::numeric_limits<float>::max();
+    }
+
+    /**
+     * @brief Tests a single probe pose (as built by `probe_at(d, ...)`) against broadphase
+     *        candidates, via the SAME generic collision::generate_contacts() dispatcher
+     *        narrowphase_() itself uses -- not a bespoke overlap test, so box_cast()/
+     *        capsule_cast() get exactly the right pairwise math for whatever shape type the
+     *        candidate turns out to be, including a real contact normal, not an approximated
+     *        one. `id_a` is left invalid (the probe isn't a real body); `out.a` is never read.
+     *        Stops at the FIRST candidate found overlapping, same "any hit" semantics as
+     *        raycast_any() -- box_cast()/capsule_cast() only ever want the closest ALONG THE
+     *        SWEEP, which the caller (stepped_cast_ below) gets by shrinking `d`, not by this
+     *        function comparing multiple simultaneous candidates at one `d`.
+     */
+    template <typename ProbeAtFn>
+    bool test_probe_(ProbeAtFn&& probe_at, float d, uint32_t layer_mask, bool include_triggers,
+                      dynamics::BodyId& out_body, glm::vec3& out_normal) const {
+        collision::Shape probe;
+        glm::vec3 pos;
+        glm::quat rot;
+        probe_at(d, probe, pos, rot);
+        geometry::AABB bounds = collision::world_bounds(probe, pos, rot);
+
+        bool found = false;
+        auto visit = [&](void* user_data) {
+            if (found) return;
+            uint32_t i = user_data_to_index_(user_data);
+            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
+            if (!include_triggers && shapes_[i].is_trigger) return;
+            const dynamics::BodyId owner = shape_owner_[i];
+            const dynamics::Body& body = bodies_[owner.index];
+            collision::ContactManifold m;
+            if (collision::generate_contacts(dynamics::BodyId{}, probe, pos, rot,
+                                              owner, shapes_[i], body.position, body.orientation, m)) {
+                out_body = owner;
+                out_normal = -m.normal; // a(probe)->b(target); negate to point away from the target's surface
+                found = true;
+            }
+        };
+        dynamic_tree_.query(bounds, visit);
+        if (!found) static_tree_.query(bounds, visit);
+        return found;
+    }
+
+    /**
+     * @brief Shared discretized-stepped-sweep implementation for box_cast()/capsule_cast() --
+     *        see either doc for the approximation this performs and why. Samples `probe_at(d,
+     *        Shape&, pos&, rot&)`'s pose at increasing `d` in steps derived from `min_extent`
+     *        (so it can't skip past a target thinner than the probe's own smallest dimension),
+     *        and on the first overlapping sample, binary-searches back toward the last known
+     *        clear sample to tighten the reported hit distance/point/normal.
+     */
+    template <typename ProbeAtFn>
+    bool stepped_cast_(const glm::vec3& origin, const glm::vec3& dir, float max_distance, float min_extent,
+                        ProbeAtFn&& probe_at, uint32_t layer_mask, bool include_triggers,
+                        query::RaycastHit& hit) const {
+        if (max_distance <= 0.0f) return false;
+        float step = std::max(min_extent * 0.25f, 1e-3f);
+        int steps = std::max(1, static_cast<int>(std::ceil(max_distance / step)));
+        float actual_step = max_distance / static_cast<float>(steps);
+
+        float prev_d = 0.0f;
+        for (int i = 0; i <= steps; ++i) {
+            float d = (i == steps) ? max_distance : actual_step * static_cast<float>(i);
+            dynamics::BodyId body;
+            glm::vec3 normal;
+            if (test_probe_(probe_at, d, layer_mask, include_triggers, body, normal)) {
+                float lo = prev_d, hi = d;
+                for (int iter = 0; iter < 12 && hi - lo > 1e-4f; ++iter) {
+                    float mid = 0.5f * (lo + hi);
+                    dynamics::BodyId mid_body;
+                    glm::vec3 mid_normal;
+                    if (test_probe_(probe_at, mid, layer_mask, include_triggers, mid_body, mid_normal)) {
+                        hi = mid;
+                        body = mid_body;
+                        normal = mid_normal;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                hit.point = origin + dir * hi;
+                hit.distance = hi;
+                hit.body = body;
+                hit.normal = normal;
+                return true;
+            }
+            prev_d = d;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Runs `body(begin, end, JobContext)` over `[0, count)`, dispatched onto job_engine()
+     *        when one is installed and `count` clears parallel_threshold_, otherwise run inline
+     *        on the calling thread as a single [0, count) chunk -- the same should_parallelize_
+     *        idiom PixelRenderPipeline uses. `body` must write only through index-addressed
+     *        state (its own chunk's slice of a pre-sized scratch vector, or a per-worker
+     *        bucket keyed by JobContext::worker_index) -- never through a shared container
+     *        that isn't safe for concurrent mutation.
+     */
+    template <typename Fn>
+    void for_range_(std::size_t count, Fn&& body) {
+        if (jobs_ && count >= parallel_threshold_) {
+            jobs_->parallel_for_blocking(count, 0, std::forward<Fn>(body));
+        } else {
+            coopa::job::JobContext ctx{};
+            body(std::size_t{0}, count, ctx);
+        }
+    }
+
+    /** @brief Maps a JobContext::worker_index to a dense [0, worker_slots) bucket index --
+     *         real workers pass through as-is, and both k_main_thread_index (a guest thread
+     *         participating in a blocking wait) and any out-of-range value fall into the last
+     *         slot. `worker_slots` is always job_engine()'s worker_count() + 1 when a job
+     *         engine is installed (1 otherwise), so the last slot is never a real worker's. */
+    static uint32_t bucket_for_(uint32_t worker_index, uint32_t worker_slots) {
+        return (worker_index < worker_slots - 1) ? worker_index : worker_slots - 1;
+    }
+
+    /** @brief Recomputes bounds_scratch_[i] for every alive, proxied SHAPE (not body -- see
+     *         shapes_'s file doc) -- shared by sync_broadphase_() (which only reads the
+     *         non-static entries, to move proxies) and discover_pairs_() (which reads every
+     *         entry, static included, as query bounds). Pure per-index math over
+     *         shapes_/shape_owner_/bodies_, so this is safe to run job-parallel: each iteration
+     *         only ever writes its own index. */
+    void compute_broadphase_bounds_() {
+        if (bounds_scratch_.size() != shapes_.size()) bounds_scratch_.resize(shapes_.size());
+        for_range_(shapes_.size(), [&](std::size_t begin, std::size_t end, const coopa::job::JobContext&) {
+            for (std::size_t k = begin; k < end; ++k) {
+                uint32_t i = static_cast<uint32_t>(k);
+                if (!shape_alive_[i] || tree_proxy_[i] == broadphase::k_null_node) continue;
+                const dynamics::Body& body = bodies_[shape_owner_[i].index];
+                bounds_scratch_[i] = collision::world_bounds(shapes_[i], body.position, body.orientation);
+            }
+        });
+    }
+
+    /** @brief Refits every dynamic-tree proxy (shapes owned by a Dynamic or Kinematic body) to
+     *         this step's current world bounds, fattened along its OWNER's direction of travel
+     *         by `linear_velocity * h` -- the upcoming substep's motion, not the motion that
+     *         already happened (see compute_broadphase_bounds_()'s ordering note: bounds are
+     *         computed from the PREVIOUS substep's positions but CURRENT, post-gravity velocity,
+     *         so this predicts forward rather than re-describing the past). This is what makes a
+     *         fast body's candidate-pair set actually include a thin target it's about to
+     *         tunnel through -- AABBTree::move_proxy()'s `displacement` parameter existed since
+     *         v1 but was previously discarded (see its own doc). Static proxies never move, so
+     *         static_tree_ needs no per-step work. Tree mutation itself stays single-threaded --
+     *         only the bounds math feeding it (compute_broadphase_bounds_()) is job-parallel. */
+    void sync_broadphase_(float h) {
+        compute_broadphase_bounds_();
+        for (uint32_t i = 0; i < shapes_.size(); ++i) {
+            if (!shape_alive_[i] || tree_proxy_[i] == broadphase::k_null_node || in_static_tree_[i]) continue;
+            const dynamics::Body& body = bodies_[shape_owner_[i].index];
+            dynamic_tree_.move_proxy(tree_proxy_[i], bounds_scratch_[i], body.linear_velocity * h);
         }
     }
 
     /**
-     * @brief Broadphase (two-tree query) + narrowphase over this step's overlapping pairs.
+     * @brief Job-parallel broadphase pair discovery: queries both trees for every alive,
+     *        proxied body and records candidate pairs.
      *
      * Static-static, static-kinematic and kinematic-kinematic pairs are never generated:
      * dynamic_tree_ holds both Dynamic and Kinematic bodies (so a self-query against it can
-     * surface a kinematic-kinematic pair), filtered out by the same `either_dynamic` check
-     * brute-force used; static_tree_ holds only Static bodies, so a dynamic-tree-vs-static-
-     * tree cross query can only ever surface dynamic-static or kinematic-static pairs, and
-     * the same filter drops the latter.
+     * surface a kinematic-kinematic pair), filtered out later by generate_manifolds_'s same
+     * `either_dynamic` check the old brute-force loop used; static_tree_ holds only Static
+     * bodies, so a dynamic-tree-vs-static-tree cross query can only ever surface dynamic-static
+     * or kinematic-static pairs.
      *
-     * Determinism: PairCache::add() is called while iterating bodies_ in ascending index
-     * order, and finalize() sorts the result -- so manifolds_' order depends only on body
-     * indices, never on tree-internal layout or query traversal order.
+     * Each worker (and the calling thread, participating as a guest -- see bucket_for_()) owns
+     * a private pair_buckets_ slot, since AABBTree::query() is read-only/thread-safe (its
+     * traversal stack is thread_local -- see aabb_tree.h) but PairCache::add() is not. The
+     * buckets are concatenated into pair_cache_ afterward in a fixed slot order, and
+     * PairCache::finalize()'s sort+dedup makes the result independent of that order and of
+     * which worker discovered which pair -- so this is bit-identical to the old serial
+     * ascending-index loop regardless of thread count.
+     *
+     * Iterates SHAPES, not bodies (see shapes_'s file doc) -- `i`/`j` below are shape slot
+     * indices, and pair_cache_ ends up holding shape pairs, not body pairs. The self-rejection
+     * check is `shape_owner_[i] != shape_owner_[j]` (different OWNING BODIES), not `i != j`
+     * (different shapes) -- the latter would let two sibling shapes of the same compound body
+     * generate a self-collision pair against each other, which is never physically meaningful.
      */
-    void generate_manifolds_() {
-        sync_broadphase_();
+    void discover_pairs_() {
+        uint32_t worker_slots = jobs_ ? jobs_->worker_count() + 1 : 1;
+        if (pair_buckets_.size() != worker_slots) pair_buckets_.resize(worker_slots);
+        for (auto& bucket : pair_buckets_) bucket.clear();
+
+        for_range_(shapes_.size(), [&](std::size_t begin, std::size_t end, const coopa::job::JobContext& ctx) {
+            std::vector<broadphase::ProxyPair>& out = pair_buckets_[bucket_for_(ctx.worker_index, worker_slots)];
+            for (std::size_t k = begin; k < end; ++k) {
+                uint32_t i = static_cast<uint32_t>(k);
+                if (!shape_alive_[i] || tree_proxy_[i] == broadphase::k_null_node) continue;
+                const geometry::AABB& bounds = bounds_scratch_[i];
+                const dynamics::BodyId owner_i = shape_owner_[i];
+
+                dynamic_tree_.query(bounds, [&](void* user_data) {
+                    uint32_t j = user_data_to_index_(user_data);
+                    if (owner_i != shape_owner_[j]) out.push_back(broadphase::ProxyPair{std::min(i, j), std::max(i, j)});
+                });
+                if (!in_static_tree_[i]) {
+                    // A static shape's own tree never needs querying against itself; only a
+                    // dynamic/kinematic shape queries the static tree, giving each cross pair
+                    // exactly one discovery path.
+                    static_tree_.query(bounds, [&](void* user_data) {
+                        uint32_t j = user_data_to_index_(user_data);
+                        if (owner_i != shape_owner_[j]) out.push_back(broadphase::ProxyPair{std::min(i, j), std::max(i, j)});
+                    });
+                }
+            }
+        });
+
+        for (const auto& bucket : pair_buckets_) {
+            for (const auto& p : bucket) pair_cache_.add(p.a, p.b);
+        }
+    }
+
+    /**
+     * @brief Job-parallel narrowphase: generates a contact manifold for every candidate pair
+     *        pair_cache_.current() holds.
+     *
+     * manifold_scratch_ is pre-sized to pairs.size() and each worker writes only its own index
+     * k -- a pure function of pairs[k]/bodies_/shapes_, so results are bit-identical regardless
+     * of thread count or scheduling. The serial compaction pass afterward preserves pair-index
+     * order (== pair_cache_'s sorted order, deterministic) when building manifolds_ and the
+     * collision/trigger pair caches, exactly matching the old serial loop's result.
+     *
+     * `pairs[k].a/.b` are SHAPE slot indices (see shapes_'s file doc), not body indices --
+     * resolved to their owning BodyId via shape_owner_ below. ContactManifold.a/.b are still
+     * BodyIds (the solver only ever acts on bodies), so two different shape-pairs of the same
+     * two compound bodies produce two manifolds with identical `.a`/`.b` but different geometry
+     * -- exactly the intended, physically correct outcome (each child shape contributes its own
+     * independent contact). Event/Collider resolution (PhysicsSystem) only resolves to each
+     * body's PRIMARY shape's Collider, not the exact child touched -- a deliberate scope trim
+     * for this pass (see the plan's Phase 5 doc); raycast queries above DO resolve the exact
+     * child (query::RaycastHit::shape_index).
+     */
+    void narrowphase_(float h) {
+        const std::vector<broadphase::ProxyPair>& pairs = pair_cache_.current();
+        if (manifold_scratch_.size() != pairs.size()) manifold_scratch_.resize(pairs.size());
+
+        for_range_(pairs.size(), [&](std::size_t begin, std::size_t end, const coopa::job::JobContext&) {
+            for (std::size_t k = begin; k < end; ++k) {
+                collision::ContactManifold& m = manifold_scratch_[k];
+                m = collision::ContactManifold{};
+
+                uint32_t i = pairs[k].a;
+                uint32_t j = pairs[k].b;
+                if (i >= shapes_.size() || j >= shapes_.size() || !shape_alive_[i] || !shape_alive_[j]) continue;
+
+                dynamics::BodyId id_i = shape_owner_[i];
+                dynamics::BodyId id_j = shape_owner_[j];
+                if (!is_valid(id_i) || !is_valid(id_j)) continue;
+                const dynamics::Body& bi = bodies_[id_i.index];
+                const dynamics::Body& bj = bodies_[id_j.index];
+                bool either_dynamic = bi.type == dynamics::BodyType::Dynamic || bj.type == dynamics::BodyType::Dynamic;
+                if (!either_dynamic) continue;
+                if (!layer_matrix_.should_collide(shapes_[i].layer, shapes_[j].layer)) continue;
+                if (joint_blocks_collision_(id_i, id_j)) continue;
+
+                // CCD fast-pair gate: only bother with the (slightly pricier) speculative path
+                // when a body's OWN per-substep displacement exceeds its OWN smallest extent --
+                // the classic "is this a bullet" test (same criterion Box2D's `IsBullet`/Unity's
+                // "Continuous Dynamic" mode use), deliberately NOT compared against the other
+                // shape's size. An earlier version compared against min(shape_a, shape_b)'s
+                // extent instead, which falsely triggered on completely ordinary fast falls onto
+                // any thin static platform (ground slabs are routinely thin) and measurably
+                // robbed energy from restitution well before actual contact -- caught by
+                // test_restitution_one_bounces_high regressing. This is a known, accepted
+                // trade-off, not unique to this engine: a slow-but-large body CAN still tunnel
+                // through an extremely thin (near-zero-thickness) target this gate won't catch,
+                // exactly like every other engine using this same per-body heuristic. See
+                // collision::generate_contacts()'s `allow_speculative` doc for exactly which
+                // shape-type pairs actually use this once triggered.
+                float extent_i = shape_min_extent_(shapes_[i]);
+                float extent_j = shape_min_extent_(shapes_[j]);
+                bool allow_speculative =
+                    (extent_i < std::numeric_limits<float>::max() &&
+                     glm::length(bi.linear_velocity) * h > extent_i) ||
+                    (extent_j < std::numeric_limits<float>::max() &&
+                     glm::length(bj.linear_velocity) * h > extent_j);
+                collision::generate_contacts(id_i, shapes_[i], bi.position, bi.orientation,
+                                              id_j, shapes_[j], bj.position, bj.orientation, m, allow_speculative);
+            }
+        });
+
+        manifolds_.clear();
+        for (std::size_t k = 0; k < manifold_scratch_.size(); ++k) {
+            const collision::ContactManifold& m = manifold_scratch_[k];
+            if (!m.valid) continue;
+            manifolds_.push_back(m);
+            (m.is_trigger ? trigger_pair_cache_ : collision_pair_cache_).add(pairs[k].a, pairs[k].b);
+        }
+    }
+
+    /** @brief True if some valid HingeJoint connects `id_i`/`id_j` (either order) with
+     *         `collide_connected == false` -- narrowphase_()'s cue to skip contact generation for
+     *         this pair entirely (see HingeJoint::collide_connected's own doc for why). A linear
+     *         scan over joints_: v1's joint counts (a handful of doors per scene, not thousands)
+     *         make an index unnecessary, matching this feature's "relatively simple" scope. */
+    bool joint_blocks_collision_(dynamics::BodyId id_i, dynamics::BodyId id_j) const {
+        for (const auto& j : joints_) {
+            if (!j.valid || j.collide_connected) continue;
+            bool same_pair = (j.a.index == id_i.index && j.b.index == id_j.index) ||
+                              (j.a.index == id_j.index && j.b.index == id_i.index);
+            if (same_pair) return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Broadphase (two-tree query, job-parallel) + narrowphase (job-parallel) over this
+     *        step's overlapping pairs. See discover_pairs_()/narrowphase_()'s docs for the
+     *        parallelization scheme and the determinism argument for each.
+     */
+    void generate_manifolds_(float h) {
+        sync_broadphase_(h);
         pair_cache_.advance(); // roll last step's pairs into "previous"; start this step fresh
         collision_pair_cache_.advance();
         trigger_pair_cache_.advance();
 
-        for (uint32_t i = 0; i < bodies_.size(); ++i) {
-            if (!alive_[i] || tree_proxy_[i] == broadphase::k_null_node) continue;
-            geometry::AABB bounds = collision::world_bounds(shapes_[i], bodies_[i].position, bodies_[i].orientation);
-
-            dynamic_tree_.query(bounds, [&](void* user_data) {
-                uint32_t j = user_data_to_index_(user_data);
-                pair_cache_.add(i, j);
-            });
-            if (in_static_tree_[i]) {
-                // A static body's own tree never needs querying against itself; only a
-                // dynamic/kinematic body queries the static tree, giving each cross pair
-                // exactly one discovery path.
-            } else {
-                static_tree_.query(bounds, [&](void* user_data) {
-                    uint32_t j = user_data_to_index_(user_data);
-                    pair_cache_.add(i, j);
-                });
-            }
-        }
+        discover_pairs_();
         pair_cache_.finalize();
 
-        manifolds_.clear();
-        for (const auto& pair : pair_cache_.current()) {
-            uint32_t i = pair.a;
-            uint32_t j = pair.b;
-            if (i >= bodies_.size() || j >= bodies_.size() || !alive_[i] || !alive_[j]) continue;
-
-            const dynamics::Body& bi = bodies_[i];
-            const dynamics::Body& bj = bodies_[j];
-            bool either_dynamic = bi.type == dynamics::BodyType::Dynamic || bj.type == dynamics::BodyType::Dynamic;
-            if (!either_dynamic) continue;
-
-            if (!layer_matrix_.should_collide(shapes_[i].layer, shapes_[j].layer)) continue;
-
-            dynamics::BodyId id_i{i, generations_[i]};
-            dynamics::BodyId id_j{j, generations_[j]};
-
-            collision::ContactManifold m;
-            if (collision::generate_contacts(id_i, shapes_[i], bi.position, bi.orientation,
-                                              id_j, shapes_[j], bj.position, bj.orientation, m)) {
-                manifolds_.push_back(m);
-                (m.is_trigger ? trigger_pair_cache_ : collision_pair_cache_).add(i, j);
-            }
-        }
+        narrowphase_(h);
 
         collision_pair_cache_.finalize();
         trigger_pair_cache_.finalize();
@@ -659,25 +1331,32 @@ private:
      * @brief Turns one pair cache's added/stayed/removed classification into ContactEvents,
      *        appended to `events_` for the caller to drain after step()/step_fixed() returns.
      *
-     * Body indices are translated to BodyId here (not when queued into the pair cache, which
-     * only ever stores raw indices) using each index's CURRENT generation -- correct because a
-     * removed pair's bodies are, by definition, either still alive (an ordinary exit as they
-     * separate) or were destroyed via destroy_body(), which the plan's own deferred-command
-     * queue already resolves before generate_manifolds_() runs, so any index still present in
-     * `removed` at this point addresses whatever now legitimately occupies that slot -- an exit
-     * event for a body that no longer exists is meaningless and safe to drop, and for a slot
-     * that's been reused, the generation bump makes it a different BodyId, not a stale one.
+     * `pair.a`/`pair.b` are SHAPE slot indices (see shapes_'s file doc; narrowphase_() is what
+     * feeds this cache), resolved to owning BodyIds via shape_owner_ -- correct because a
+     * removed pair's shapes are, by definition, either still alive (an ordinary exit as they
+     * separate) or were destroyed via remove_body()/remove_shape(), which only ever run outside
+     * a substep or via the deferred-command queue that resolves before generate_manifolds_()
+     * runs (see drain_deferred_commands_()'s doc) -- so any index still present in `removed` at
+     * this point addresses whatever now legitimately occupies that slot; an exit event for a
+     * shape that no longer exists is meaningless and safe to drop. Two different manifolds
+     * between the same two compound bodies (different child shape pairs) fire independent
+     * enter/stay/exit events -- each carries the SAME BodyId pair as every other event for
+     * those two bodies, since ContactEvent (like ContactManifold) is body-identity-only, not
+     * shape-identity (see narrowphase_()'s doc for that same scope trim).
      */
     void emit_contact_events_(const broadphase::PairCache& cache, bool is_trigger) {
         std::vector<broadphase::ProxyPair> added, stayed, removed;
         cache.classify(added, stayed, removed);
 
         auto push = [&](const broadphase::ProxyPair& pair, collision::ContactEvent::Type type) {
-            if (pair.a >= bodies_.size() || pair.b >= bodies_.size()) return;
-            if ((type != collision::ContactEvent::Type::Exit) && (!alive_[pair.a] || !alive_[pair.b])) return;
+            if (pair.a >= shapes_.size() || pair.b >= shapes_.size()) return;
+            if ((type != collision::ContactEvent::Type::Exit) && (!shape_alive_[pair.a] || !shape_alive_[pair.b])) return;
+            dynamics::BodyId owner_a = shape_owner_[pair.a];
+            dynamics::BodyId owner_b = shape_owner_[pair.b];
+            if (!is_valid(owner_a) || !is_valid(owner_b)) return;
             collision::ContactEvent ev;
-            ev.a = dynamics::BodyId{pair.a, generations_[pair.a]};
-            ev.b = dynamics::BodyId{pair.b, generations_[pair.b]};
+            ev.a = owner_a;
+            ev.b = owner_b;
             ev.type = type;
             ev.is_trigger = is_trigger;
             events_.push_back(ev);
@@ -713,15 +1392,39 @@ private:
     glm::vec3 gravity_{0.0f, 0.0f, util::k_gravity_z};
 
     std::vector<dynamics::Body> bodies_;
-    std::vector<collision::Shape> shapes_;
     std::vector<uint32_t> generations_;
     std::vector<bool> alive_;
     std::vector<uint32_t> free_indices_;
+    /** @brief Parallel to bodies_ -- the shape SLOT indices (into shapes_ below) this body
+     *         currently owns, in insertion order; slot [0] is the "primary" shape every
+     *         pre-compound-collider API (get_shape(BodyId), set_shape()) reads/writes. Empty
+     *         for a shapeless body (Shape::enabled's "Rigidbody with no Collider" case). See
+     *         add_shape()'s doc for how a body acquires more than one entry here. */
+    std::vector<std::vector<uint32_t>> body_shapes_;
+
+    /**
+     * @brief Shape storage, with its OWN independent lifecycle from bodies_ (not parallel to
+     *        it) -- this is the compound-collider primitive: a body owns zero or more shape
+     *        slots (body_shapes_[body.index]), not exactly one. Mirrors bodies_'s own
+     *        alive_/free_indices_ pattern one level down, applied to shapes instead. Broadphase
+     *        proxies (tree_proxy_/in_static_tree_ below) are parallel to THIS array, not to
+     *        bodies_ -- the fundamental unit narrowphase/broadphase operate on is a shape, and
+     *        always was even before compound colliders (a 1-shape body just made the two
+     *        concepts look identical). shape_owner_ is how a shape slot resolves back to the
+     *        body it belongs to (position/orientation/dynamics live on the Body, never the
+     *        Shape) -- see e.g. narrowphase_() or any query visit lambda.
+     */
+    std::vector<collision::Shape> shapes_;
+    std::vector<dynamics::BodyId> shape_owner_; /**< Parallel to shapes_. */
+    std::vector<bool> shape_alive_;             /**< Parallel to shapes_. */
+    std::vector<uint32_t> free_shape_indices_;
 
     broadphase::AABBTree static_tree_{config_.aabb_margin};
     broadphase::AABBTree dynamic_tree_{config_.aabb_margin};
-    std::vector<int32_t> tree_proxy_;   /**< Parallel to bodies_; k_null_node if no proxy. */
-    std::vector<bool> in_static_tree_;  /**< Parallel to bodies_; which tree tree_proxy_ indexes into. */
+    std::vector<int32_t> tree_proxy_;   /**< Parallel to shapes_ (see its own doc above -- NOT
+                                              bodies_, even for a single-shape body); k_null_node
+                                              if no proxy. */
+    std::vector<bool> in_static_tree_;  /**< Parallel to shapes_; which tree tree_proxy_ indexes into. */
     broadphase::PairCache pair_cache_;
     broadphase::PairCache collision_pair_cache_; /**< Confirmed (narrowphase-hit) non-trigger pairs, for enter/stay/exit. */
     broadphase::PairCache trigger_pair_cache_;   /**< Confirmed (narrowphase-hit) trigger pairs, for enter/stay/exit. */
@@ -731,12 +1434,45 @@ private:
     std::vector<collision::ContactEvent> events_; /**< This frame's enter/stay/exit events; cleared at the top of step(). */
     dynamics::SolverState solver_state_;
 
+    /** @brief Joint storage -- own independent generational-handle lifecycle (free list +
+     *         generation bump), the exact same shape as bodies_/generations_/alive_/
+     *         free_indices_ above, just for joints instead of bodies (see add_hinge_joint()'s
+     *         doc). Unlike shapes_ (which had to become independent from bodies_ for compound
+     *         colliders), joints were never coupled to bodies_ 1:1 in the first place -- this
+     *         is the same pattern purely because it already proved itself, not because
+     *         anything forced it. */
+    std::vector<dynamics::HingeJoint> joints_;
+    std::vector<uint32_t> joint_generations_;
+    std::vector<bool> joint_alive_;
+    std::vector<uint32_t> free_joint_indices_;
+
     std::vector<DeferredCommand> deferred_commands_;
     bool in_step_ = false;
 
     float accumulator_ = 0.0f;
     float interpolation_alpha_ = 0.0f;
+
+    coopa::job::JobEngine* jobs_ = nullptr;
+    std::size_t parallel_threshold_ = 64;
+    std::vector<geometry::AABB> bounds_scratch_;                        /**< Parallel to shapes_. */
+    std::vector<std::vector<broadphase::ProxyPair>> pair_buckets_;      /**< One per worker slot; see discover_pairs_(). */
+    std::vector<collision::ContactManifold> manifold_scratch_;         /**< Parallel to pair_cache_.current(). */
 };
+
+/**
+ * @brief Applies a scene's `physics:` settings to a freshly-constructed PhysicsWorld -- gravity,
+ *        solver tunables, fixed timestep and the layer collision matrix. Called once by
+ *        install_physics_system() (system/physics_system.h); safe to call again later (e.g. a
+ *        runtime "reload physics settings" action) since every field it touches is a plain
+ *        assignment, not additive.
+ */
+inline void apply_physics_settings(PhysicsWorld& world, const util::PhysicsSettings& settings) {
+    world.set_gravity(settings.gravity);
+    world.config() = settings.solver;
+    for (const auto& pair : settings.ignore_pairs) {
+        world.layers().set_layer_collision(pair.first, pair.second, /*collide=*/false);
+    }
+}
 
 } // namespace physx
 } // namespace coopa

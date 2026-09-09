@@ -11,14 +11,21 @@
 #include <physxcoopa/util/config.h>
 #include <physxcoopa/util/error.h>
 #include <physxcoopa/util/transform_bridge.h>
+#include <physxcoopa/util/physics_settings.h>
 #include <physxcoopa/dynamics/inertia.h>
 #include <physxcoopa/components/collider.h>
+#include <physxcoopa/components/collision.h>
 #include <physxcoopa/components/rigidbody.h>
+#include <physxcoopa/components/hinge_joint.h>
+#include <physxcoopa/query/queries.h>
+#include <physxcoopa/geometry/ray.h>
 
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_system.h>
 #include <coopa/scene/scene_object.h>
 #include <coopa/scene/components/transform_component.h>
+#include <coopa/job/engine.h>
+#include <coopa/job/parallel_for.h>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -29,6 +36,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace coopa {
 namespace physx {
@@ -55,11 +63,17 @@ public:
     void on_attach(coopa::scene::Scene&) override { dirty_ = true; }
 
     void execute(coopa::scene::Scene& scene, const coopa::scene::FrameContext& ctx) override {
+        world_.set_job_engine(ctx.jobs); // cheap pointer assignment; keeps the world in sync
+                                          // even if the scene's JobEngine changes at runtime.
         if (dirty_) {
             regather_(scene);
+            regather_joints_(scene); // after regather_() -- every HingeJointComponent needs
+                                      // BOTH connected objects already bound to a body.
             dirty_ = false;
         }
-        update_changed_shapes_();
+        prime_transforms_(); // serial -- see its own doc; makes every read below race-free.
+        update_changed_shapes_(); // serial -- mutates world_'s broadphase trees (see doc).
+        update_changed_rigidbodies_(); // serial -- see its own doc.
         sync_transforms_in_(ctx.delta_time);
         world_.step(ctx.delta_time);
         write_transforms_back_();
@@ -71,7 +85,7 @@ public:
      *        adding/removing a Collider (or its owning SceneObject) at runtime -- exactly
      *        the same contract AnimationSystem::refresh() documents.
      *
-     * Safe under a missed call: the next real refresh only ever *erases* map entries absent
+     * Safe under a missed call: the next real refresh only ever *erases* entries absent
      * from the fresh gather; a forgotten refresh after destroying an object leaks a body
      * until the next refresh, it never dereferences a stale pointer.
      */
@@ -81,59 +95,557 @@ public:
     const PhysicsWorld& world() const { return world_; }
 
     /** @brief Number of colliders currently bound to a body -- for tests/diagnostics. */
-    size_t bound_count() const { return bound_.size(); }
+    size_t bound_count() const { return bindings_.size(); }
+
+    /** @brief Minimum bound-collider count before this system's own job-parallel passes
+     *         (sync_transforms_in_/write_transforms_back_) dispatch instead of running inline;
+     *         also forwarded to world().set_parallel_threshold() for its own passes. */
+    void set_parallel_threshold(std::size_t n) {
+        parallel_threshold_ = n;
+        world_.set_parallel_threshold(n);
+    }
 
 private:
+    /**
+     * @brief One Collider bound to one physics body -- bindings_' index is stable for one
+     *        frame at a time (rebuilt by regather_()), which is what lets the job-parallel
+     *        passes below address it purely by index instead of through a pointer-keyed map.
+     *
+     * A COMPOUND body (more than one Collider grouped under one Rigidbody -- see
+     * group_root_for_()/create_compound_body_()'s docs) produces one Binding PER COLLIDER, all
+     * sharing the same `body`, but only ONE of them has `is_primary == true`: the one whose
+     * owning object's Transform actually drives the body (`sync_owner`, the group's ROOT --
+     * see create_compound_body_()'s doc for why this isn't always simply `collider->owner`).
+     * Every other member's Binding exists only so update_changed_shapes_()/regather_() can
+     * still track and diff it by its own Collider pointer/revision; sync_transforms_in_()/
+     * write_transforms_back_() skip non-primary bindings entirely (no independent Transform
+     * sync for a compound child -- its shape's fixed offset from the body was baked in once,
+     * at creation, into the Shape itself, see create_compound_body_()'s doc for the current
+     * scope trim on live-editing a compound child's own parameters).
+     */
+    struct Binding {
+        components::Collider* collider = nullptr;
+        dynamics::BodyId body;
+        /** @brief This collider's own shape slot within `body` (PhysicsWorld::shape_at()'s
+         *         return type) -- always valid; for a single (non-compound) binding this is
+         *         `body`'s only shape (slot 0). */
+        uint32_t shape_index = 0xFFFFFFFFu;
+        uint32_t last_revision = 0;
+        bool is_primary = false;
+        /** @brief Meaningful only when `is_primary`: the object whose Transform drives this
+         *         body -- see the class doc and create_compound_body_()'s doc for why this can
+         *         differ from `collider->owner` (a compound group whose Rigidbody-bearing root
+         *         has no Collider of its own, only children). For a non-compound binding this
+         *         is always `collider->owner`. */
+        coopa::scene::SceneObject* sync_owner = nullptr;
+        /** @brief Meaningful only when `is_primary`: world-scaled, local-space (pre-rotation)
+         *         offset from `sync_owner`'s own pivot to the body's true center of mass --
+         *         see create_compound_body_()'s doc for how this is composed across every
+         *         member (a single-collider body's is exactly `col->center() * world_scale`,
+         *         the pre-compound-colliders formula, unchanged). create_compound_body_()
+         *         folds this into body.position instead of leaving it on any one Shape (which
+         *         couldn't represent it for N>1 children anyway), so sync_transforms_in_()/
+         *         write_transforms_back_() need it every frame to convert between
+         *         `sync_owner`'s pivot and body.position. Unlike the pre-compound-colliders
+         *         version of this field, NOT refreshed by update_changed_shapes_() for a
+         *         compound body (see that function's doc) -- only by a full regather_()
+         *         rebuild. */
+        glm::vec3 center_offset{0.0f};
+    };
+
+    /** @brief Runs `body(begin, end, JobContext)` over `[0, bindings_.size())`, dispatched onto
+     *         ctx.jobs when installed and bindings_.size() clears parallel_threshold_,
+     *         otherwise inline on the calling thread -- same idiom as PhysicsWorld::for_range_. */
+    template <typename Fn>
+    void for_range_(Fn&& body) {
+        coopa::job::JobEngine* jobs = world_.job_engine();
+        if (jobs && bindings_.size() >= parallel_threshold_) {
+            jobs->parallel_for_blocking(bindings_.size(), 0, std::forward<Fn>(body));
+        } else {
+            coopa::job::JobContext ctx{};
+            body(std::size_t{0}, bindings_.size(), ctx);
+        }
+    }
+
+    /**
+     * @brief The nearest object that should own the physics Body for `col` -- walks UP from
+     *        `col->owner` (inclusive) through parent() until it finds a RigidbodyComponent,
+     *        returning that object (the group's ROOT for a compound body -- see
+     *        create_compound_body_()'s doc). Falls back to `col->owner` itself if no ancestor
+     *        (including `col->owner`) has one -- a standalone static collider, matching every
+     *        pre-compound-colliders scene exactly (a Collider with no Rigidbody on its OWN
+     *        object never walked any further than that before this existed either).
+     *
+     * For every existing scene (Rigidbody, if any, always on the SAME object as its Collider)
+     * this returns `col->owner` on the FIRST iteration, zero ancestor walking needed -- the
+     * grouping this enables is then trivially "one group per collider," identical to the
+     * pre-compound-colliders behavior. Grouping only does something different once a scene
+     * actually authors a child SceneObject's Collider under a Rigidbody-bearing ancestor.
+     */
+    static coopa::scene::SceneObject* group_root_for_(components::Collider* col) {
+        coopa::scene::SceneObject* obj = col->owner;
+        while (obj) {
+            if (obj->get_component<components::RigidbodyComponent>()) return obj;
+            coopa::scene::SceneObject* parent = obj->parent();
+            if (!parent) break;
+            obj = parent;
+        }
+        return col->owner;
+    }
+
     void regather_(coopa::scene::Scene& scene) {
         std::vector<components::Collider*> current = scene.get_components<components::Collider>();
         std::unordered_set<components::Collider*> current_set(current.begin(), current.end());
 
-        for (auto it = bound_.begin(); it != bound_.end();) {
-            if (current_set.find(it->first) == current_set.end()) {
-                collider_by_index_.erase(it->second.index);
-                world_.remove_body(it->second);
-                last_revision_.erase(it->first);
-                it = bound_.erase(it);
+        std::unordered_map<components::Collider*, Binding> old_by_collider;
+        old_by_collider.reserve(bindings_.size());
+        for (const Binding& b : bindings_) old_by_collider.emplace(b.collider, b);
+
+        // Group current colliders by owning root (see group_root_for_()'s doc). group_order
+        // preserves first-seen order so rebuilds are deterministic frame to frame.
+        std::unordered_map<coopa::scene::SceneObject*, std::vector<components::Collider*>> groups;
+        std::vector<coopa::scene::SceneObject*> group_order;
+        for (components::Collider* col : current) {
+            coopa::scene::SceneObject* root = group_root_for_(col);
+            auto it = groups.find(root);
+            if (it == groups.end()) {
+                group_order.push_back(root);
+                groups.emplace(root, std::vector<components::Collider*>{col});
             } else {
-                ++it;
+                it->second.push_back(col);
             }
         }
 
-        for (components::Collider* col : current) {
-            if (bound_.find(col) != bound_.end()) continue; // already bound, revision handled elsewhere
-            glm::vec3 world_scale = current_world_scale_(col->owner);
-            dynamics::BodyId id = create_body_for_(col, world_scale);
-            bound_[col] = id;
-            collider_by_index_[id.index] = col;
-            col->set_body_id(id);
-            bind_rigidbody_(col, id);
-            last_revision_[col] = col->revision();
+        std::vector<Binding> new_bindings;
+        new_bindings.reserve(current.size());
+
+        for (coopa::scene::SceneObject* root : group_order) {
+            std::vector<components::Collider*>& members = groups[root];
+
+            // A group reuses its existing body only if EVERY member already existed last
+            // frame and all agreed on the same body -- otherwise (a brand new group, a new
+            // member added to an existing group, or a member that moved out of a DIFFERENT
+            // group since last frame, i.e. a reparent) the whole group rebuilds from scratch.
+            // Not maximally incremental, but correct and simple -- see the plan's Phase 5 doc.
+            std::unordered_set<uint32_t> old_body_indices;
+            bool all_old = true;
+            for (auto* col : members) {
+                auto it = old_by_collider.find(col);
+                if (it == old_by_collider.end()) { all_old = false; continue; }
+                old_body_indices.insert(it->second.body.index);
+            }
+
+            if (all_old && old_body_indices.size() == 1) {
+                for (auto* col : members) new_bindings.push_back(old_by_collider.at(col));
+                continue;
+            }
+
+            for (uint32_t old_index : old_body_indices) {
+                for (auto* col : members) {
+                    auto it = old_by_collider.find(col);
+                    if (it != old_by_collider.end() && it->second.body.index == old_index) {
+                        collider_by_index_.erase(it->second.body.index);
+                        world_.remove_body(it->second.body);
+                        break;
+                    }
+                }
+            }
+            create_compound_body_(root, members, new_bindings);
+        }
+
+        // Destroy bodies for colliders that no longer exist at all -- remove_body() no-ops on
+        // an already-dead BodyId, so this is safe even where a rebuild above already handled it.
+        for (const auto& kv : old_by_collider) {
+            if (current_set.find(kv.first) != current_set.end()) continue;
+            collider_by_index_.erase(kv.second.body.index);
+            collider_by_shape_index_.erase(kv.second.shape_index);
+            world_.remove_body(kv.second.body);
+        }
+
+        bindings_ = std::move(new_bindings);
+    }
+
+    /**
+     * @brief Diffs the scene's HingeJointComponent set against joint_bindings_ (identity-diffed
+     *        by Component*, same spirit as regather_()'s Collider diffing) and creates/destroys
+     *        dynamics::HingeJoint entries to match. Runs AFTER regather_() so every
+     *        HingeJointComponent's own object and its `connected_object` are both guaranteed
+     *        already bound to a body, if they're bindable at all this frame.
+     *
+     * A HingeJointComponent whose own object or `connected_object` has no bound Collider yet
+     * (or `connected_object` doesn't resolve to a live SceneObject at all) is silently skipped,
+     * not an error -- create_hinge_joint_for_() returns an invalid JointId in that case, which
+     * is stored as-is; it simply stays inert until the next refresh() finds both sides bound.
+     * A joint whose CONNECTED body is destroyed later (without this component itself being
+     * removed) is left similarly inert -- PhysicsWorld::remove_body() already marks the
+     * dynamics::HingeJoint invalid (every solver pass skips it, see world.h's doc), but this
+     * pass does not notice and attempt to rebind it; a known, documented limitation rather than
+     * added bookkeeping for what should be a rare scene-editing edge case.
+     */
+    void regather_joints_(coopa::scene::Scene& scene) {
+        std::vector<components::HingeJointComponent*> current = scene.get_components<components::HingeJointComponent>();
+        std::unordered_set<components::HingeJointComponent*> current_set(current.begin(), current.end());
+
+        std::unordered_map<components::HingeJointComponent*, dynamics::JointId> old_by_component;
+        old_by_component.reserve(joint_bindings_.size());
+        for (const auto& kv : joint_bindings_) old_by_component.emplace(kv.first, kv.second);
+
+        for (const auto& kv : old_by_component) {
+            if (current_set.find(kv.first) != current_set.end()) continue;
+            world_.remove_joint(kv.second);
+        }
+
+        std::vector<std::pair<components::HingeJointComponent*, dynamics::JointId>> new_bindings;
+        new_bindings.reserve(current.size());
+        for (components::HingeJointComponent* jc : current) {
+            auto it = old_by_component.find(jc);
+            if (it != old_by_component.end()) {
+                new_bindings.push_back(*it); // already bound -- creation-time-only, see the class doc
+                continue;
+            }
+            dynamics::JointId id = create_hinge_joint_for_(jc, scene);
+            jc->set_joint_id(id);
+            new_bindings.emplace_back(jc, id);
+        }
+        joint_bindings_ = std::move(new_bindings);
+    }
+
+    /**
+     * @brief Resolves `jc`'s `connected_object` and both sides' bound Collider/BodyId, computes
+     *        the CONNECTED side's anchor/axis automatically from wherever it currently sits
+     *        (Unity's `autoConfigureConnectedAnchor` default -- see HingeJointComponent's own
+     *        doc for why only one side is authored), and creates the joint. Returns an invalid
+     *        JointId (world_.add_hinge_joint() itself already no-ops safely on an invalid body)
+     *        if anything isn't resolvable yet.
+     */
+    dynamics::JointId create_hinge_joint_for_(components::HingeJointComponent* jc, coopa::scene::Scene& scene) {
+        if (jc->connected_object.empty()) return dynamics::JointId{};
+        coopa::scene::SceneObject* owner = jc->owner;
+        coopa::scene::SceneObject* connected = scene.find_object(jc->connected_object);
+        if (!owner || !connected) return dynamics::JointId{};
+
+        auto* owner_col = owner->get_component<components::Collider>();
+        auto* connected_col = connected->get_component<components::Collider>();
+        if (!owner_col || !connected_col) return dynamics::JointId{};
+
+        dynamics::BodyId owner_body = owner_col->body_id();
+        dynamics::BodyId connected_body = connected_col->body_id();
+        if (!world_.is_valid(owner_body) || !world_.is_valid(connected_body)) return dynamics::JointId{};
+
+        const dynamics::Body* owner_phys = world_.get_body(owner_body);
+        const dynamics::Body* connected_phys = world_.get_body(connected_body);
+        if (!owner_phys || !connected_phys) return dynamics::JointId{};
+
+        util::Trs owner_trs = util::world_trs(owner->get_transform()->transform());
+        util::Trs connected_trs = util::world_trs(connected->get_transform()->transform());
+
+        // World-scaled, matching every other local-offset convention in this codebase (e.g.
+        // Collider::center()'s own `col->center() * world_scale` -- see center_offset_for_()'s
+        // doc). Axis is a direction, rotated but not scaled. `jc->anchor` is authored relative
+        // to the owner's TRANSFORM PIVOT (the natural authoring point -- see
+        // HingeJointComponent's own doc), computed here via owner_trs, but HingeJoint's
+        // local_anchor_a/b are consumed by the solver as offsets from each BODY'S TRUE CENTER
+        // (dynamics::Body::position -- see create_compound_body_()'s doc), which only equals
+        // the pivot when the collider's own `center` is zero. Whenever it isn't (e.g. this
+        // codebase's "BoxCollider size {1,1,1} center {0.5,0.5,0.5}" convention -- see
+        // spinner's own comment in the demo scene), true center is offset from the pivot by
+        // that center-of-mass term, so both anchors must be re-expressed relative to each
+        // body's OWN stored position/orientation, not re-derived from owner_trs/connected_trs.
+        glm::vec3 owner_local_anchor_from_pivot = jc->anchor * owner_trs.scale;
+        glm::vec3 world_anchor = owner_trs.position + owner_trs.rotation * owner_local_anchor_from_pivot;
+        glm::vec3 world_axis = glm::normalize(owner_trs.rotation * jc->axis);
+
+        glm::vec3 owner_local_anchor = glm::inverse(owner_phys->orientation) * (world_anchor - owner_phys->position);
+        glm::vec3 connected_local_anchor =
+            glm::inverse(connected_phys->orientation) * (world_anchor - connected_phys->position);
+        glm::vec3 connected_local_axis = glm::inverse(connected_phys->orientation) * world_axis;
+
+        // hinge_current_angle() (and thus the limit constraint) measures body b's rotation
+        // relative to body a, about a's local axis -- so the CONNECTED object (the static/
+        // reference side, e.g. a door frame) must be body a, and this component's own object
+        // (the side that actually swings, e.g. the door) must be body b. Otherwise the measured
+        // angle runs backwards relative to what min_angle_deg/max_angle_deg authors expect, and
+        // an asymmetric limit range (e.g. [0, 90]) clamps the hinge rigid at the very first
+        // instant of motion instead of letting it swing open.
+        return world_.add_hinge_joint(connected_body, owner_body, connected_local_anchor, owner_local_anchor,
+                                       connected_local_axis, jc->axis, jc->use_limits, glm::radians(jc->min_angle_deg),
+                                       glm::radians(jc->max_angle_deg));
+    }
+
+    /**
+     * @brief Touches get_world_matrix() on every bound owner's Transform, serially, once --
+     *        the prerequisite for every parallel pass below being race-free.
+     *
+     * coopa::util::Transform::get_world_matrix() lazily mutates a cache (and, walking up
+     * parent_ to satisfy an ancestor's own dirty flag, potentially a whole shared ancestor
+     * chain) from what is nominally a const read -- safe for any number of CONCURRENT readers
+     * only once every touched transform (and its ancestors) is already clean, which is exactly
+     * what one serial pass over every bound transform guarantees: PhysicsSystem runs at
+     * UpdatePhase::Physics (100), before TransformSystem's own resolve at TransformResolve
+     * (350), so nothing has cleaned these transforms yet this frame.
+     */
+    void prime_transforms_() {
+        for (const Binding& b : bindings_) {
+            b.collider->owner->get_transform()->transform().get_world_matrix();
+            // A compound group's root can have no Collider of its own (see Binding::sync_owner's
+            // doc) -- in that case `sync_owner != collider->owner` for the primary binding, and
+            // sync_transforms_in_()/write_transforms_back_() read/write sync_owner's Transform
+            // directly from job-parallel code, which needs THIS object's world matrix cache
+            // clean too, not just collider->owner's -- otherwise those parallel passes could
+            // race the very lazy-mutation this serial pass exists to front-load.
+            if (b.is_primary && b.sync_owner && b.sync_owner != b.collider->owner) {
+                b.sync_owner->get_transform()->transform().get_world_matrix();
+            }
         }
     }
 
     /** @brief Checked every frame regardless of dirty_ -- see the plan's rationale: runtime
-     *         parameter changes ride this pass, no separate dirty flag needed for them. */
+     *         parameter changes ride this pass, no separate dirty flag needed for them.
+     *         Deliberately serial: make_shape()/set_shape() mutates world_'s broadphase AABB
+     *         trees (proxy destroy+recreate), which is shared, non-thread-safe state -- unlike
+     *         sync_transforms_in_()/write_transforms_back_() below, each binding here does NOT
+     *         touch disjoint memory only.
+     *
+     *         SCOPE TRIM: a COMPOUND body (more than one shape -- see create_compound_body_()'s
+     *         doc) is skipped here entirely, for every one of its bindings, even if only one
+     *         child's revision actually changed -- correctly re-deriving one child's offset
+     *         would require re-running mass/center-of-mass/inertia composition across ALL its
+     *         siblings (a single child's offset shift moves the shared composite center of
+     *         mass), which this pass isn't structured for. A live parameter edit on a compound
+     *         child's Collider is simply not applied until the whole group next rebuilds (a
+     *         structural change: refresh() + the collider set actually differing) -- a known
+     *         v1 limitation, not a silent-corruption risk (the OLD shape stays in effect,
+     *         nothing goes stale/wrong, it just doesn't hot-reload). Every single-shape body
+     *         (== every pre-compound-colliders scene) is completely unaffected by this trim. */
     void update_changed_shapes_() {
-        for (auto& entry : bound_) {
-            components::Collider* col = entry.first;
-            if (last_revision_[col] == col->revision()) continue;
+        for (Binding& b : bindings_) {
+            if (world_.shapes_of(b.body).size() > 1) continue; // compound: see doc above
+            components::Collider* col = b.collider;
+            if (b.last_revision == col->revision()) continue;
             glm::vec3 world_scale = current_world_scale_(col->owner);
             collision::Shape shape = col->make_shape(world_scale);
+            shape.enabled = shape.enabled && col->is_enabled();
             shape.is_trigger = col->is_trigger();
             shape.layer = col->layer();
             shape.material = col->material();
-            world_.set_shape(entry.second, shape);
-            last_revision_[col] = col->revision();
+            // Mirror create_compound_body_()'s treatment: body.position (not Shape::local_center)
+            // carries the center-of-mass offset, so the shape must stay zeroed here too --
+            // otherwise a runtime collider-parameter change (e.g. a script editing `center`)
+            // would double-apply the offset (once in body.position, once in the shape).
+            shape.local_center = glm::vec3(0.0f);
+            world_.set_shape_at(b.shape_index, shape);
+            b.last_revision = col->revision();
+            b.center_offset = center_offset_for_(col, world_scale);
         }
     }
 
-    dynamics::BodyId create_body_for_(components::Collider* col, const glm::vec3& world_scale) {
-        auto* rb = col->owner->get_component<components::RigidbodyComponent>();
-        util::Trs trs = util::world_trs(col->owner->get_transform()->transform());
+    /**
+     * @brief Reconciles each bound RigidbodyComponent's live-editable fields into its Body every
+     *        frame, so a runtime write like `rb->mass = 5.0f` or `rb->is_kinematic = true` takes
+     *        effect instead of being silently ignored after the body's creation-time bind (a gap
+     *        this closes -- previously RigidbodyComponent's fields were read only once, in
+     *        create_body_for_()).
+     *
+     * No separate revision counter on RigidbodyComponent: unlike Collider (whose setters bump
+     * revision_ to gate an expensive make_shape() + broadphase proxy rebuild), Rigidbody's fields
+     * are plain public members with no rebuild to gate -- Body already mirrors every one of them
+     * (mass, linear_drag, angular_drag, use_gravity, constraints, interpolation) from the
+     * component at creation time, so comparing the component's CURRENT value against the body's
+     * own stored copy IS the "did this change since last frame" signal, with nothing extra to
+     * keep in sync. Unconditional for the cheap scalar copies; mass is compared first since
+     * changing it also means recomputing inv_mass and (unless inertia_tensor_override is set)
+     * inv_inertia_local, which isn't free enough to redo every frame regardless.
+     *
+     * `is_kinematic` toggling is the one field that changes BodyType, not just a scalar -- see
+     * PhysicsWorld::set_body_type()'s own doc for why that's safe here (Dynamic<->Kinematic only,
+     * both live in dynamic_tree_, no broadphase tree migration). Note set_body_type() always
+     * recomputes inv_inertia_local analytically from the shape, so a Kinematic->Dynamic flip on a
+     * body with inertia_tensor_override set is corrected back to the override by the mass check
+     * just below it, on the SAME frame -- the mass check runs unconditionally after the type
+     * flip, and set_body_type() already made body->mass == rb->mass, so it falls through to the
+     * override-only branch instead of a redundant analytic recompute.
+     *
+     * center_of_mass_override/inertia_tensor_override changing the body's actual center of mass
+     * at runtime is intentionally NOT handled here -- see their own doc on RigidbodyComponent,
+     * creation-time only, like initial_velocity/initial_angular_velocity above them.
+     *
+     * Serial like update_changed_shapes_() -- set_body_type() is, like set_shape(), not
+     * documented safe for concurrent callers.
+     */
+    void update_changed_rigidbodies_() {
+        for (Binding& b : bindings_) {
+            auto* rb = b.collider->owner->get_component<components::RigidbodyComponent>();
+            if (!rb) continue;
+            dynamics::Body* body = world_.get_body(b.body);
+            if (!body || body->type == dynamics::BodyType::Static) continue;
+
+            dynamics::BodyType desired_type =
+                rb->is_kinematic ? dynamics::BodyType::Kinematic : dynamics::BodyType::Dynamic;
+            if (body->type != desired_type) {
+                world_.set_body_type(b.body, desired_type, rb->mass);
+            }
+
+            if (body->type == dynamics::BodyType::Dynamic) {
+                if (body->mass != rb->mass) {
+                    body->mass = rb->mass;
+                    body->inv_mass = rb->mass > 0.0f ? 1.0f / rb->mass : 0.0f;
+                    if (rb->inertia_tensor_override) {
+                        body->inv_inertia_local = *rb->inertia_tensor_override;
+                    } else if (const collision::Shape* shape = world_.get_shape(b.body)) {
+                        body->inv_inertia_local = inertia_for_(*shape, body->mass);
+                    }
+                } else if (rb->inertia_tensor_override &&
+                           body->inv_inertia_local != *rb->inertia_tensor_override) {
+                    body->inv_inertia_local = *rb->inertia_tensor_override;
+                }
+            }
+
+            body->linear_drag = rb->drag;
+            body->angular_drag = rb->angular_drag;
+            body->use_gravity = rb->use_gravity;
+            body->constraints = rb->constraints;
+            body->interpolation = rb->interpolation;
+        }
+    }
+
+    /** @brief Thin alias for dynamics::inertia_for_shape() -- kept as a member so every existing
+     *         call site in this file reads the same either way; see that function's doc for why
+     *         the dispatch itself now lives in dynamics/inertia.h instead of here. */
+    static glm::vec3 inertia_for_(const collision::Shape& shape, float mass) {
+        return dynamics::inertia_for_shape(shape, mass);
+    }
+
+    /** @brief Approximate solid volume for a shape -- used only to split one compound
+     *         Rigidbody's authored `mass` across its children proportionally (a uniform-
+     *         density approximation; there is no per-collider density/mass field anywhere in
+     *         this codebase to do better). TriangleMesh returns 1.0 (a mesh child is always
+     *         either static, where mass is irrelevant, or the dynamic-mesh case already throws
+     *         in create_compound_body_() before this value would matter). */
+    static float shape_volume_(const collision::Shape& s) {
+        constexpr float k_pi = 3.14159265358979323846f;
+        switch (s.type) {
+            case collision::ShapeType::Sphere:
+                return (4.0f / 3.0f) * k_pi * s.radius * s.radius * s.radius;
+            case collision::ShapeType::Box:
+                return 8.0f * s.half_extents.x * s.half_extents.y * s.half_extents.z;
+            case collision::ShapeType::Capsule: {
+                float r = s.capsule_radius, hh = s.capsule_half_height;
+                return k_pi * r * r * (2.0f * hh) + (4.0f / 3.0f) * k_pi * r * r * r;
+            }
+            case collision::ShapeType::TriangleMesh:
+            default:
+                return 1.0f;
+        }
+    }
+
+    void bind_rigidbody_(coopa::scene::SceneObject* obj, dynamics::BodyId id) {
+        if (auto* rb = obj->get_component<components::RigidbodyComponent>()) {
+            rb->set_body_binding(&world_, id);
+        }
+    }
+
+    /**
+     * @brief Builds and inserts ONE Body for `root`'s Rigidbody, from `members` (every Collider
+     *        grouped under it by group_root_for_() -- one for a non-compound object, more than
+     *        one for a genuine compound collider), and appends a Binding per member to
+     *        `new_bindings`.
+     *
+     * Generalizes create_body_for_()'s old single-collider logic (the engine's dynamics math
+     * assumes body.position IS the true center of mass -- see that reasoning, unchanged) to N
+     * children: every child's shape offset/rotation is first expressed relative to `root`
+     * (`rel_pos`/`rel_rot`, a rigid transform composition via world_trs() that works regardless
+     * of how deeply a child is nested under root), then each child's OWN collider `center`
+     * offset is folded in on top of that (mirrors the old center_offset_for_() formula, applied
+     * per child), giving every child's shape a `local_center`/`local_rotation` already
+     * expressed in root's frame. Mass is split across children by volume (shape_volume_()'s
+     * doc), producing per-child inertia inputs to dynamics::compose_mass_properties() (see its
+     * own doc for the diagonal-only approximation that composition makes). The resulting
+     * composite center of mass is folded into body.position exactly like the old single-
+     * collider path (plus any RigidbodyComponent::center_of_mass_override, composed the same
+     * way) -- every child shape's local_center is then re-based from ROOT's pivot to the TRUE
+     * CENTER, since N children can't all fold to a zero offset the way one shape used to.
+     *
+     * For a single member with no ancestor Rigidbody offset (i.e. every pre-compound-colliders
+     * scene), this reduces EXACTLY to create_body_for_()'s old formulas: rel_pos=0, rel_rot=
+     * identity, mass fraction=1.0, and compose_mass_properties() over one child has zero
+     * parallel-axis contribution (its own center IS the composite center of mass) and zero
+     * rotation to apply, so the composite tensor is precisely that child's own inertia_for_()
+     * result with no approximation error.
+     *
+     * The PRIMARY binding (the one driving Transform sync, see Binding's own doc) is the member
+     * directly on `root` if one exists, else the first-gathered member -- `sync_owner` is
+     * always `root` itself either way, which is what actually matters (see Binding's doc for
+     * why a compound group whose root has no Collider of its own still needs ITS Transform,
+     * not any particular child's, to drive the body).
+     */
+    void create_compound_body_(coopa::scene::SceneObject* root, std::vector<components::Collider*> members,
+                                std::vector<Binding>& new_bindings) {
+        // Primary member (directly on root) sorted to the front, if one exists.
+        for (std::size_t i = 0; i < members.size(); ++i) {
+            if (members[i]->owner == root) { std::swap(members[0], members[i]); break; }
+        }
+
+        auto* rb = root->get_component<components::RigidbodyComponent>();
+        util::Trs root_trs = util::world_trs(root->get_transform()->transform());
+        glm::vec3 root_world_scale = root_trs.scale;
+
+        struct Child {
+            components::Collider* col;
+            collision::Shape shape;      // local_center/local_rotation already expressed relative to root
+            glm::vec3 local_offset;      // == shape.local_center, kept separately for compose_mass_properties()
+        };
+        std::vector<Child> children;
+        children.reserve(members.size());
+
+        for (auto* col : members) {
+            glm::vec3 world_scale = current_world_scale_(col->owner);
+            collision::Shape shape = col->make_shape(world_scale);
+            shape.enabled = shape.enabled && col->is_enabled();
+            shape.is_trigger = col->is_trigger();
+            shape.layer = col->layer();
+            shape.material = col->material();
+
+            glm::vec3 rel_pos(0.0f);
+            glm::quat rel_rot(1.0f, 0.0f, 0.0f, 0.0f);
+            if (col->owner != root) {
+                util::Trs child_trs = util::world_trs(col->owner->get_transform()->transform());
+                glm::quat inv_root_rot = glm::inverse(root_trs.rotation);
+                rel_pos = inv_root_rot * (child_trs.position - root_trs.position);
+                rel_rot = inv_root_rot * child_trs.rotation;
+            }
+
+            // shape.local_center/local_rotation are this collider's OWN offset/rotation, in
+            // the CHILD's own local frame -- compose with rel_pos/rel_rot to express in ROOT's.
+            glm::vec3 offset_in_root = rel_pos + rel_rot * shape.local_center;
+            shape.local_center = offset_in_root;
+            shape.local_rotation = rel_rot * shape.local_rotation;
+
+            children.push_back(Child{col, shape, offset_in_root});
+        }
+
+        float total_mass = rb ? rb->mass : 0.0f;
+        float total_volume = 0.0f;
+        for (auto& c : children) total_volume += shape_volume_(c.shape);
+        bool degenerate = total_volume <= util::k_epsilon;
+
+        std::vector<dynamics::ChildMassInput> mass_inputs;
+        mass_inputs.reserve(children.size());
+        for (auto& c : children) {
+            float fraction = degenerate ? (1.0f / static_cast<float>(children.size()))
+                                         : (shape_volume_(c.shape) / total_volume);
+            float child_mass = total_mass * fraction;
+            glm::vec3 inv_i = child_mass > util::k_epsilon ? inertia_for_(c.shape, child_mass) : glm::vec3(0.0f);
+            mass_inputs.push_back(dynamics::ChildMassInput{c.local_offset, c.shape.local_rotation, child_mass, inv_i});
+        }
+        dynamics::MassProperties mp = dynamics::compose_mass_properties(mass_inputs);
+
+        glm::vec3 com = mp.center_of_mass;
+        if (rb && rb->center_of_mass_override) com += *rb->center_of_mass_override * root_world_scale;
+        glm::vec3 true_center = root_trs.position + root_trs.rotation * com;
 
         dynamics::Body body;
-        body.position = trs.position;
-        body.orientation = trs.rotation;
+        body.position = true_center;
+        body.orientation = root_trs.rotation;
 
         if (!rb) {
             body.type = dynamics::BodyType::Static;
@@ -141,92 +653,115 @@ private:
             body.type = dynamics::BodyType::Kinematic;
         } else {
             body.type = dynamics::BodyType::Dynamic;
-            body.mass = rb->mass;
-            body.inv_mass = rb->mass > 0.0f ? 1.0f / rb->mass : 0.0f;
+            body.mass = total_mass;
+            body.inv_mass = total_mass > 0.0f ? 1.0f / total_mass : 0.0f;
             body.linear_drag = rb->drag;
             body.angular_drag = rb->angular_drag;
             body.use_gravity = rb->use_gravity;
             body.constraints = rb->constraints;
             body.interpolation = rb->interpolation;
+            body.linear_velocity = rb->initial_velocity;
+            body.angular_velocity = rb->initial_angular_velocity;
         }
 
-        collision::Shape shape = col->make_shape(world_scale);
-        shape.is_trigger = col->is_trigger();
-        shape.layer = col->layer();
-        shape.material = col->material();
-
-        if (shape.type == collision::ShapeType::TriangleMesh && body.type == dynamics::BodyType::Dynamic) {
-            util::throw_error("MeshCollider on '" + col->owner->name() +
-                               "' is attached to a non-kinematic Rigidbody -- non-convex mesh "
-                               "colliders are static-only (matching Unity); mark the Rigidbody "
-                               "kinematic or remove the MeshCollider.");
+        for (auto& c : children) {
+            if (c.shape.type == collision::ShapeType::TriangleMesh && body.type == dynamics::BodyType::Dynamic) {
+                util::throw_error("MeshCollider on '" + c.col->owner->name() +
+                                   "' is attached to a non-kinematic Rigidbody -- non-convex mesh "
+                                   "colliders are static-only (matching Unity); mark the Rigidbody "
+                                   "kinematic or remove the MeshCollider.");
+            }
         }
 
         if (body.type == dynamics::BodyType::Dynamic) {
-            body.inv_inertia_local = inertia_for_(shape, body.mass);
+            body.inv_inertia_local = (rb && rb->inertia_tensor_override) ? *rb->inertia_tensor_override
+                                                                          : mp.inv_inertia_local;
         }
 
-        dynamics::BodyId id = world_.add_body(body, shape);
+        // Re-base every child's offset from root's pivot to the TRUE CENTER just computed --
+        // the generalization of the old single-collider "zero shape.local_center" trick: N
+        // children can't all fold to zero, so each keeps its own (now much smaller) offset.
+        for (auto& c : children) c.shape.local_center -= com;
+
+        dynamics::BodyId id = world_.add_body(body, children[0].shape);
         dynamics::Body* stored = world_.get_body(id);
-        stored->last_written_position = trs.position;
-        stored->last_written_orientation = trs.rotation;
-        return id;
-    }
+        stored->last_written_position = true_center;
+        stored->last_written_orientation = root_trs.rotation;
+        bind_rigidbody_(root, id);
 
-    static glm::vec3 inertia_for_(const collision::Shape& shape, float mass) {
-        switch (shape.type) {
-            case collision::ShapeType::Sphere:
-                return dynamics::sphere_inverse_inertia(shape.radius, mass);
-            case collision::ShapeType::Box:
-                return dynamics::box_inverse_inertia(shape.half_extents, mass);
-            case collision::ShapeType::Capsule: {
-                glm::vec3 raw = dynamics::capsule_inverse_inertia(shape.capsule_radius, shape.capsule_half_height, mass);
-                if (shape.capsule_axis == 0) return glm::vec3(raw.z, raw.y, raw.x);
-                if (shape.capsule_axis == 1) return glm::vec3(raw.x, raw.z, raw.y);
-                return raw;
-            }
-            case collision::ShapeType::TriangleMesh:
-            default:
-                return glm::vec3(0.0f);
+        components::Collider* primary_col = children[0].col;
+        coopa::scene::SceneObject* sync_owner = root;
+
+        for (std::size_t i = 0; i < children.size(); ++i) {
+            uint32_t slot = (i == 0) ? world_.shape_at(id, 0) : world_.add_shape(id, children[i].shape);
+            children[i].col->set_body_id(id);
+            collider_by_shape_index_[slot] = children[i].col;
+
+            Binding b;
+            b.collider = children[i].col;
+            b.body = id;
+            b.shape_index = slot;
+            b.last_revision = children[i].col->revision();
+            b.is_primary = (i == 0);
+            b.sync_owner = sync_owner;
+            b.center_offset = com;
+            new_bindings.push_back(b);
         }
+        collider_by_index_[id.index] = primary_col;
     }
 
-    void bind_rigidbody_(components::Collider* col, dynamics::BodyId id) {
-        if (auto* rb = col->owner->get_component<components::RigidbodyComponent>()) {
-            rb->set_body_binding(&world_, id);
-        }
-    }
-
-    /** @brief Reads world position/rotation for every bound body, deriving kinematic
-     *         velocity or detecting a script-driven teleport on a dynamic body. */
+    /**
+     * @brief Reads world position/rotation for every bound body, deriving kinematic velocity
+     *        or detecting a script-driven teleport on a dynamic body. Job-parallel: each
+     *        binding's Body (unique per binding -- one BodyId per Collider) and owner
+     *        Transform (a pure, race-free read post prime_transforms_()) are touched by
+     *        exactly one binding, so concurrent iterations never share mutable state --
+     *        UNLESS two bound Colliders sit on the very same SceneObject and so share one
+     *        Transform, which was already semantically dubious pre-parallelism (each Collider
+     *        gets its own independently-simulated Body, so two of them fighting over one
+     *        Transform's position never made physical sense); this pass does not special-case it.
+     *
+     *        Skips every non-primary binding (a compound body's child colliders -- see
+     *        Binding's own doc): they have no independent Transform to sync, their shape's
+     *        fixed offset from the body was baked in once at creation.
+     */
     void sync_transforms_in_(float dt) {
-        for (auto& entry : bound_) {
-            dynamics::Body* body = world_.get_body(entry.second);
-            if (!body) continue;
-            coopa::util::Transform& transform = entry.first->owner->get_transform()->transform();
-            util::Trs trs = util::world_trs(transform);
+        for_range_([&](std::size_t begin, std::size_t end, const coopa::job::JobContext&) {
+            for (std::size_t k = begin; k < end; ++k) {
+                Binding& b = bindings_[k];
+                if (!b.is_primary) continue;
+                dynamics::Body* body = world_.get_body(b.body);
+                if (!body) continue;
+                coopa::util::Transform& transform = b.sync_owner->get_transform()->transform();
+                util::Trs trs = util::world_trs(transform);
+                // body->position lives in true-center space (see create_compound_body_()'s doc);
+                // trs.position is the Transform's authored pivot -- convert before every
+                // comparison/assignment below via the same rotated offset make_shape() bakes
+                // into the shape.
+                glm::vec3 true_center = trs.position + trs.rotation * b.center_offset;
 
-            if (body->type == dynamics::BodyType::Kinematic) {
-                if (dt > util::k_epsilon) {
-                    body->linear_velocity = (trs.position - body->last_written_position) / dt;
-                    body->angular_velocity = derive_angular_velocity_(
-                        body->last_written_orientation, trs.rotation, dt);
-                }
-                body->position = trs.position;
-                body->orientation = trs.rotation;
-                body->last_written_position = trs.position;
-                body->last_written_orientation = trs.rotation;
-            } else if (body->type == dynamics::BodyType::Dynamic) {
-                float pos_delta = glm::length(trs.position - body->last_written_position);
-                glm::quat rot_diff = trs.rotation * glm::inverse(body->last_written_orientation);
-                float rot_delta = 1.0f - std::abs(std::clamp(rot_diff.w, -1.0f, 1.0f));
-                if (pos_delta > 1e-4f || rot_delta > 1e-5f) {
-                    body->position = trs.position;
+                if (body->type == dynamics::BodyType::Kinematic) {
+                    if (dt > util::k_epsilon) {
+                        body->linear_velocity = (true_center - body->last_written_position) / dt;
+                        body->angular_velocity = derive_angular_velocity_(
+                            body->last_written_orientation, trs.rotation, dt);
+                    }
+                    body->position = true_center;
                     body->orientation = trs.rotation;
-                    body->wake();
+                    body->last_written_position = true_center;
+                    body->last_written_orientation = trs.rotation;
+                } else if (body->type == dynamics::BodyType::Dynamic) {
+                    float pos_delta = glm::length(true_center - body->last_written_position);
+                    glm::quat rot_diff = trs.rotation * glm::inverse(body->last_written_orientation);
+                    float rot_delta = 1.0f - std::abs(std::clamp(rot_diff.w, -1.0f, 1.0f));
+                    if (pos_delta > 1e-4f || rot_delta > 1e-5f) {
+                        body->position = true_center;
+                        body->orientation = trs.rotation;
+                        body->wake();
+                    }
                 }
             }
-        }
+        });
     }
 
     static glm::vec3 derive_angular_velocity_(const glm::quat& from, const glm::quat& to, float dt) {
@@ -239,34 +774,81 @@ private:
         return (axis / axis_len) * (angle / dt);
     }
 
-    /** @brief Writes each dynamic body's interpolated (or raw, per Body::interpolation)
-     *         transform back, and records exactly what was written for next frame's
-     *         teleport-detection comparison. */
+    /**
+     * @brief Writes each dynamic body's interpolated (or raw, per Body::interpolation)
+     *        transform back, and records exactly what was written for next frame's
+     *        teleport-detection comparison. Job-parallel -- set_world_trs() may read a
+     *        parented transform's PARENT chain (to convert world->local), but prime_transforms_()
+     *        already walked (and thus cleaned) every bound transform's full ancestor chain this
+     *        frame, so every such read here is a pure, already-clean read -- see
+     *        prime_transforms_()'s doc. Same one-Transform-per-binding caveat as
+     *        sync_transforms_in_() applies to the WRITE side too. Skips every non-primary
+     *        binding, same reasoning as sync_transforms_in_()'s own doc.
+     */
     void write_transforms_back_() {
         float alpha = world_.interpolation_alpha();
-        for (auto& entry : bound_) {
-            dynamics::Body* body = world_.get_body(entry.second);
-            if (!body || body->type != dynamics::BodyType::Dynamic) continue;
+        for_range_([&](std::size_t begin, std::size_t end, const coopa::job::JobContext&) {
+            for (std::size_t k = begin; k < end; ++k) {
+                Binding& b = bindings_[k];
+                if (!b.is_primary) continue;
+                dynamics::Body* body = world_.get_body(b.body);
+                if (!body || body->type != dynamics::BodyType::Dynamic) continue;
 
-            glm::vec3 pos;
-            glm::quat rot;
-            if (body->interpolation == dynamics::Interpolation::Interpolate) {
-                pos = glm::mix(body->prev_position, body->position, alpha);
-                rot = glm::slerp(body->prev_orientation, body->orientation, alpha);
-            } else {
-                pos = body->position;
-                rot = body->orientation;
+                glm::vec3 center_pos;
+                glm::quat rot;
+                if (body->interpolation == dynamics::Interpolation::Interpolate) {
+                    center_pos = glm::mix(body->prev_position, body->position, alpha);
+                    rot = glm::slerp(body->prev_orientation, body->orientation, alpha);
+                } else {
+                    center_pos = body->position;
+                    rot = body->orientation;
+                }
+
+                // center_pos is the true center of mass (see create_compound_body_()'s doc);
+                // convert back to sync_owner's authored pivot before writing it out -- the
+                // inverse of the offset applied in sync_transforms_in_(). last_written_position
+                // stays in true-center space so next frame's teleport-detection comparison in
+                // sync_transforms_in_() lines up with the true_center it computes there.
+                glm::vec3 pivot_pos = center_pos - rot * b.center_offset;
+
+                coopa::util::Transform& transform = b.sync_owner->get_transform()->transform();
+                util::set_world_trs(transform, pivot_pos, rot);
+                body->last_written_position = center_pos;
+                body->last_written_orientation = rot;
             }
-
-            coopa::util::Transform& transform = entry.first->owner->get_transform()->transform();
-            util::set_world_trs(transform, pos, rot);
-            body->last_written_position = pos;
-            body->last_written_orientation = rot;
-        }
+        });
     }
 
     static glm::vec3 current_world_scale_(coopa::scene::SceneObject* owner) {
         return util::world_trs(owner->get_transform()->transform()).scale;
+    }
+
+    /**
+     * @brief The world-scaled, local-space (pre-rotation) offset from a Collider's owning
+     *        Transform's own pivot to the body's true center of mass -- exactly the quantity
+     *        every make_shape() override bakes into Shape::local_center (`col->center() *
+     *        world_scale`), PLUS a RigidbodyComponent::center_of_mass_override on top if one is
+     *        set (Unity's Rigidbody.centerOfMass, world-scaled the same way `center` already is
+     *        for consistency). body.position is folded to the true center instead of Shape
+     *        carrying the offset (see create_body_for_()'s doc), so this is recomputed whenever
+     *        a Binding's center_offset needs a refresh (creation, or a shape-changing revision
+     *        bump) -- create_body_for_() itself calls this too rather than re-deriving the
+     *        collider-center term from shape.local_center, so there is exactly one place this
+     *        composition happens.
+     */
+    static glm::vec3 center_offset_for_(components::Collider* col, const glm::vec3& world_scale) {
+        glm::vec3 offset = col->center() * world_scale;
+        if (auto* rb = col->owner->get_component<components::RigidbodyComponent>()) {
+            if (rb->center_of_mass_override) offset += *rb->center_of_mass_override * world_scale;
+        }
+        return offset;
+    }
+
+    /** @brief Packs two body indices into an order-independent 64-bit key, for the manifold
+     *         lookup below -- same canonical-pair convention as broadphase::PairCache. */
+    static uint64_t pack_pair_(uint32_t a, uint32_t b) {
+        uint32_t lo = std::min(a, b), hi = std::max(a, b);
+        return (static_cast<uint64_t>(lo) << 32) | hi;
     }
 
     /**
@@ -279,40 +861,235 @@ private:
      * silently skipped -- there is no Collider left to fire on, and PhysicsWorld's own
      * generation check already keeps a reused slot's events from being misattributed (see
      * PhysicsWorld::emit_contact_events_'s doc).
+     *
+     * Non-trigger events additionally carry contact geometry: this step's manifolds are
+     * indexed by canonical body-index pair once, then looked up per event -- an Exit event's
+     * pair is (by definition) no longer in this step's manifold set, so it naturally resolves
+     * to no contact data, matching Unity.
      */
     void dispatch_events_() {
+        std::unordered_map<uint64_t, const collision::ContactManifold*> manifold_by_pair;
+        for (const auto& m : world_.manifolds()) {
+            if (m.is_trigger) continue;
+            manifold_by_pair[pack_pair_(m.a.index, m.b.index)] = &m;
+        }
+
         for (const auto& ev : world_.events()) {
             auto it_a = collider_by_index_.find(ev.a.index);
             auto it_b = collider_by_index_.find(ev.b.index);
             if (it_a == collider_by_index_.end() || it_b == collider_by_index_.end()) continue;
-            fire_(ev, it_a->second, it_b->second);
-            fire_(ev, it_b->second, it_a->second);
+
+            if (ev.is_trigger) {
+                fire_trigger_(ev, it_a->second, it_b->second);
+                fire_trigger_(ev, it_b->second, it_a->second);
+                continue;
+            }
+
+            auto mit = manifold_by_pair.find(pack_pair_(ev.a.index, ev.b.index));
+            const collision::ContactManifold* m = mit != manifold_by_pair.end() ? mit->second : nullptr;
+            fire_collision_(ev, it_a->second, it_b->second, m, /*self_is_a=*/true);
+            fire_collision_(ev, it_b->second, it_a->second, m, /*self_is_a=*/false);
         }
     }
 
-    static void fire_(const collision::ContactEvent& ev, components::Collider* self, components::Collider* other) {
+    static void fire_trigger_(const collision::ContactEvent& ev, components::Collider* self, components::Collider* other) {
         coopa::event::Signal<components::Collider&, components::Collider&>* signal = nullptr;
-        if (ev.is_trigger) {
-            switch (ev.type) {
-                case collision::ContactEvent::Type::Enter: signal = &self->on_trigger_enter; break;
-                case collision::ContactEvent::Type::Stay: signal = &self->on_trigger_stay; break;
-                case collision::ContactEvent::Type::Exit: signal = &self->on_trigger_exit; break;
-            }
-        } else {
-            switch (ev.type) {
-                case collision::ContactEvent::Type::Enter: signal = &self->on_collision_enter; break;
-                case collision::ContactEvent::Type::Stay: signal = &self->on_collision_stay; break;
-                case collision::ContactEvent::Type::Exit: signal = &self->on_collision_exit; break;
-            }
+        switch (ev.type) {
+            case collision::ContactEvent::Type::Enter: signal = &self->on_trigger_enter; break;
+            case collision::ContactEvent::Type::Stay: signal = &self->on_trigger_stay; break;
+            case collision::ContactEvent::Type::Exit: signal = &self->on_trigger_exit; break;
         }
         signal->emit(*self, *other);
     }
 
+    /**
+     * @brief Builds this event's Collision payload (from `self`'s perspective, against `other`)
+     *        and fires the matching signal. `m` is nullptr on an Exit (pair no longer touching,
+     *        so no contact geometry this step) -- the payload's contacts/impulse/contact_count
+     *        stay at their zero defaults in that case, matching Unity.
+     */
+    void fire_collision_(const collision::ContactEvent& ev, components::Collider* self, components::Collider* other,
+                          const collision::ContactManifold* m, bool self_is_a) {
+        components::Collision c;
+        c.collider = other;
+        c.object = other->owner;
+
+        dynamics::Body* self_body = world_.get_body(self->body_id());
+        dynamics::Body* other_body = world_.get_body(other->body_id());
+        if (self_body && other_body) c.relative_velocity = self_body->linear_velocity - other_body->linear_velocity;
+
+        if (m) {
+            // m.normal points from body a toward body b; self_is_a means self==a, so the
+            // self-relative direction (Collision::normal's own convention -- see its doc) is
+            // m.normal as-is; otherwise it's the other way around.
+            c.normal = self_is_a ? m->normal : -m->normal;
+            c.contact_count = m->count;
+            float normal_impulse_sum = 0.0f;
+            for (uint8_t i = 0; i < m->count; ++i) {
+                c.contacts[i] = m->points[i];
+                normal_impulse_sum += m->points[i].normal_impulse;
+            }
+            c.impulse = c.normal * normal_impulse_sum;
+        }
+
+        coopa::event::Signal<components::Collider&, const components::Collision&>* signal = nullptr;
+        switch (ev.type) {
+            case collision::ContactEvent::Type::Enter: signal = &self->on_collision_enter; break;
+            case collision::ContactEvent::Type::Stay: signal = &self->on_collision_stay; break;
+            case collision::ContactEvent::Type::Exit: signal = &self->on_collision_exit; break;
+        }
+        signal->emit(*self, c);
+    }
+
+public:
+    /**
+     * @name Scene-level queries
+     * @brief Thin wrappers over PhysicsWorld's raw-BodyId queries that resolve each hit back
+     *        to its owning Collider/SceneObject/RigidbodyComponent -- the ergonomic surface
+     *        gameplay code actually wants (Unity's Physics.Raycast(...) returns a Collider,
+     *        never a bare body handle). Same "only valid between phases, not from inside
+     *        on_substep" caveat as the underlying PhysicsWorld queries.
+     */
+    ///@{
+    struct RaycastHit {
+        glm::vec3 point{0.0f};
+        glm::vec3 normal{0.0f, 0.0f, 1.0f};
+        float distance = 0.0f;
+        components::Collider* collider = nullptr;
+        coopa::scene::SceneObject* object = nullptr;
+        components::RigidbodyComponent* rigidbody = nullptr;
+    };
+
+    bool raycast(const geometry::Ray& ray, RaycastHit& hit, uint32_t layer_mask = ~0u,
+                 bool include_triggers = true) const {
+        query::RaycastHit raw;
+        if (!world_.raycast(ray, raw, layer_mask, include_triggers)) return false;
+        fill_hit_(raw, hit);
+        return true;
+    }
+
+    /** @brief True if anything along `ray` is hit -- see PhysicsWorld::raycast_any()'s doc:
+     *         first tree-traversal hit, not necessarily the closest. No Collider resolution
+     *         (unlike every other query here) since the caller only asked whether, not what. */
+    bool raycast_any(const geometry::Ray& ray, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        return world_.raycast_any(ray, layer_mask, include_triggers);
+    }
+
+    std::vector<RaycastHit> raycast_all(const geometry::Ray& ray, uint32_t layer_mask = ~0u,
+                                         bool include_triggers = true) const {
+        std::vector<RaycastHit> out;
+        for (const auto& raw : world_.raycast_all(ray, layer_mask, include_triggers)) {
+            RaycastHit hit;
+            fill_hit_(raw, hit);
+            out.push_back(hit);
+        }
+        return out;
+    }
+
+    bool sphere_cast(const glm::vec3& origin, float radius, const glm::vec3& dir, float max_distance,
+                      RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        query::RaycastHit raw;
+        if (!world_.sphere_cast(origin, radius, dir, max_distance, raw, layer_mask, include_triggers)) return false;
+        fill_hit_(raw, hit);
+        return true;
+    }
+
+    /** @brief See PhysicsWorld::box_cast()'s doc for the discretized-stepped-sweep approximation. */
+    bool box_cast(const glm::vec3& origin, const glm::vec3& half_extents, const glm::quat& orientation,
+                  const glm::vec3& dir, float max_distance, RaycastHit& hit,
+                  uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        query::RaycastHit raw;
+        if (!world_.box_cast(origin, half_extents, orientation, dir, max_distance, raw, layer_mask, include_triggers))
+            return false;
+        fill_hit_(raw, hit);
+        return true;
+    }
+
+    /** @brief See PhysicsWorld::capsule_cast()'s doc for the discretized-stepped-sweep approximation. */
+    bool capsule_cast(const glm::vec3& origin, float radius, float half_height, int direction_axis,
+                       const glm::quat& orientation, const glm::vec3& dir, float max_distance,
+                       RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        query::RaycastHit raw;
+        if (!world_.capsule_cast(origin, radius, half_height, direction_axis, orientation, dir, max_distance,
+                                  raw, layer_mask, include_triggers))
+            return false;
+        fill_hit_(raw, hit);
+        return true;
+    }
+
+    std::vector<components::Collider*> overlap_sphere(const glm::vec3& center, float radius,
+                                                        uint32_t layer_mask = ~0u,
+                                                        bool include_triggers = true) const {
+        std::vector<components::Collider*> out;
+        for (dynamics::BodyId id : world_.overlap_sphere(center, radius, layer_mask, include_triggers)) {
+            if (components::Collider* c = collider_for(id)) out.push_back(c);
+        }
+        return out;
+    }
+
+    std::vector<components::Collider*> overlap_box(const geometry::OBB& box, uint32_t layer_mask = ~0u,
+                                                     bool include_triggers = true) const {
+        std::vector<components::Collider*> out;
+        for (dynamics::BodyId id : world_.overlap_box(box, layer_mask, include_triggers)) {
+            if (components::Collider* c = collider_for(id)) out.push_back(c);
+        }
+        return out;
+    }
+
+    std::vector<components::Collider*> overlap_capsule(const geometry::Capsule& capsule,
+                                                         uint32_t layer_mask = ~0u,
+                                                         bool include_triggers = true) const {
+        std::vector<components::Collider*> out;
+        for (dynamics::BodyId id : world_.overlap_capsule(capsule, layer_mask, include_triggers)) {
+            if (components::Collider* c = collider_for(id)) out.push_back(c);
+        }
+        return out;
+    }
+
+    /** @brief The PRIMARY Collider bound to `id`, or nullptr if `id` doesn't address a bound
+     *         body -- for a compound body (see Binding's doc) this is the one member driving
+     *         Transform sync, not necessarily the exact child a query touched. Event
+     *         resolution (dispatch_events_()) and overlap_sphere()/overlap_box()/
+     *         overlap_capsule() both use this; raycast-family queries use collider_for_shape_()
+     *         instead, which resolves the EXACT child (see query::RaycastHit::shape_index's doc). */
+    components::Collider* collider_for(dynamics::BodyId id) const {
+        auto it = collider_by_index_.find(id.index);
+        return it != collider_by_index_.end() ? it->second : nullptr;
+    }
+    ///@}
+
+private:
+    /** @brief The exact Collider owning shape slot `shape_index` (query::RaycastHit::
+     *         shape_index's doc) -- for a compound body this resolves to the specific CHILD
+     *         touched, unlike collider_for(BodyId)'s primary-only resolution. */
+    components::Collider* collider_for_shape_(uint32_t shape_index) const {
+        auto it = collider_by_shape_index_.find(shape_index);
+        return it != collider_by_shape_index_.end() ? it->second : nullptr;
+    }
+
+    void fill_hit_(const query::RaycastHit& raw, RaycastHit& out) const {
+        out.point = raw.point;
+        out.normal = raw.normal;
+        out.distance = raw.distance;
+        out.collider = collider_for_shape_(raw.shape_index);
+        if (!out.collider) out.collider = collider_for(raw.body); // fallback: e.g. a shapeless probe result
+        out.object = out.collider ? out.collider->owner : nullptr;
+        out.rigidbody = out.object ? out.object->get_component<components::RigidbodyComponent>() : nullptr;
+    }
+
     PhysicsWorld world_;
-    std::unordered_map<components::Collider*, dynamics::BodyId> bound_;
+    std::vector<Binding> bindings_;
+    /** @brief Body index -> PRIMARY Collider* (collider_for()'s doc). */
     std::unordered_map<uint32_t, components::Collider*> collider_by_index_;
-    std::unordered_map<components::Collider*, uint32_t> last_revision_;
+    /** @brief Shape slot index -> the exact Collider owning it (collider_for_shape_()'s doc). */
+    std::unordered_map<uint32_t, components::Collider*> collider_by_shape_index_;
+    /** @brief HingeJointComponent* -> the dynamics::HingeJoint it's currently bound to (see
+     *         regather_joints_()'s doc); a flat vector, not a map, since it only ever needs
+     *         full-scan diffing (same identity-diff pattern as bindings_'s own Collider set),
+     *         never random lookup by component. */
+    std::vector<std::pair<components::HingeJointComponent*, dynamics::JointId>> joint_bindings_;
     bool dirty_ = true;
+    std::size_t parallel_threshold_ = 64;
 };
 
 /**
@@ -332,6 +1109,31 @@ inline PhysicsSystem* install_physics_system(coopa::scene::Scene& scene,
                                               const util::PhysicsConfig& config = {}) {
     auto sys = std::make_unique<PhysicsSystem>(config);
     PhysicsSystem* raw = sys.get();
+    scene.add_system(std::move(sys), order);
+    return raw;
+}
+
+/**
+ * @brief Constructs a PhysicsSystem from a full project-wide PhysicsSettings (gravity, solver
+ *        tunables, fixed timestep, layer collision matrix, job-parallel threshold) and
+ *        registers it -- the settings-aware counterpart to the PhysicsConfig-only overload
+ *        above. `settings` is a required argument here (unlike `order`) specifically so that
+ *        `install_physics_system(scene)` alone still resolves unambiguously to the simpler
+ *        overload.
+ *
+ * @param scene    Scene to install into.
+ * @param settings Project-wide physics settings (see util/physics_settings.h), applied via
+ *                 apply_physics_settings() immediately after construction.
+ * @param order    Registration order; see the other overload's doc.
+ * @return Non-owning pointer to the installed system.
+ */
+inline PhysicsSystem* install_physics_system(coopa::scene::Scene& scene,
+                                              const util::PhysicsSettings& settings,
+                                              int order = static_cast<int>(coopa::scene::UpdatePhase::Physics)) {
+    auto sys = std::make_unique<PhysicsSystem>(settings.solver);
+    PhysicsSystem* raw = sys.get();
+    apply_physics_settings(raw->world(), settings);
+    raw->set_parallel_threshold(settings.parallel_threshold);
     scene.add_system(std::move(sys), order);
     return raw;
 }

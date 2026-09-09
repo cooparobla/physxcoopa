@@ -7,6 +7,8 @@
 #ifndef PHYSXCOOPA_UTIL_CONFIG_H
 #define PHYSXCOOPA_UTIL_CONFIG_H
 
+#include <physxcoopa/util/math.h>
+
 #include <cstdint>
 
 namespace coopa {
@@ -72,9 +74,22 @@ struct PhysicsConfig {
     /** @brief Maximum fixed substeps run per PhysicsWorld::step() call. */
     uint32_t max_substeps = 8;
 
-    /** @brief Hard clamp on a dynamic body's linear speed. Stands in for full CCD in v1 --
-     *         see the plan's "Design rationale" for why margin-inflated speculative contacts
-     *         don't actually work with a penetration-based velocity-solver bias. */
+    /** @brief Substep length in seconds -- Unity's Time.fixedDeltaTime equivalent. Defaults to
+     *         the historical 1/60 constant; PhysicsWorld::step() reads this field rather than
+     *         the constant directly, so a scene's `physics:` settings block can override it. */
+    float fixed_dt = k_default_fixed_dt;
+
+    /** @brief Hard clamp on a dynamic body's linear speed. Originally v1's entire stand-in for
+     *         CCD (see the plan's "Design rationale" for why the FIRST attempt at margin-
+     *         inflated speculative contacts didn't work against that era's velocity-solver
+     *         bias); real speculative contacts now exist (world.h's narrowphase_() fast-pair
+     *         gate, collision::generate_contacts()'s `allow_speculative`, this file's own
+     *         solve_velocity_pass()) and are the PRIMARY tunneling defense for the shape pairs
+     *         they cover (Sphere/Box, not yet Capsule or TriangleMesh -- see
+     *         generate_contacts()'s doc). This clamp remains as a cheap backstop for whatever
+     *         isn't covered (a fast body against a static mesh, or two bodies both moving fast
+     *         enough simultaneously that neither's per-body gate alone tells the full story),
+     *         not the primary mechanism anymore. */
     float max_linear_velocity = 200.0f;
 
     /** @brief Use the exact exponential-map quaternion integration step instead of the

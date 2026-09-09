@@ -42,7 +42,8 @@ enum class DebugDrawFlags : uint32_t {
     Colliders = 1u << 0,
     BVH = 1u << 1,
     Contacts = 1u << 2,
-    All = Colliders | BVH | Contacts,
+    Joints = 1u << 3,
+    All = Colliders | BVH | Contacts | Joints,
 };
 
 inline DebugDrawFlags operator|(DebugDrawFlags a, DebugDrawFlags b) {
@@ -53,13 +54,15 @@ inline bool has_flag(DebugDrawFlags flags, DebugDrawFlags flag) {
 }
 
 /** @brief Color palette debug_draw() colors state by: white awake, green sleeping, red contact
- *         normals, yellow trigger colliders (overrides the awake/sleeping color). */
+ *         normals, yellow trigger colliders (overrides the awake/sleeping color), magenta joint
+ *         anchors/axes. */
 namespace colors {
 inline constexpr uint32_t k_awake = 0xFFFFFFFFu;
 inline constexpr uint32_t k_sleeping = 0x00FF00FFu;
 inline constexpr uint32_t k_trigger = 0xFFFF00FFu;
 inline constexpr uint32_t k_contact_normal = 0xFF0000FFu;
 inline constexpr uint32_t k_bvh_node = 0x4080FFFFu;
+inline constexpr uint32_t k_joint = 0xFF00FFFFu;
 } // namespace colors
 
 /**

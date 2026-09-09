@@ -34,8 +34,15 @@ namespace collision {
  */
 struct SatAxisResult {
     float penetration = 0.0f;
+    /** @brief Signed gap, meaningful only when `is_separated` -- see sat_test_obb_obb()'s
+     *         `allow_separated` doc. Zero whenever `is_separated` is false. */
+    float separation = 0.0f;
     int best_axis = -1;
     glm::vec3 normal{0.0f, 0.0f, 1.0f}; /**< Points from A toward B. */
+    /** @brief True if this result describes a not-yet-touching pair found only because the
+     *         caller passed `allow_separated = true` -- `separation` (not `penetration`) is the
+     *         field to read. Always false for an ordinary (overlapping) result. */
+    bool is_separated = false;
 };
 
 /**
@@ -47,10 +54,27 @@ struct SatAxisResult {
  * frame. A near-degenerate edge-cross axis (parallel edges) is skipped as a candidate rather
  * than causing a false separation.
  *
- * @return False if any axis proves separation (no collision); true with `result` populated
- *         otherwise.
+ * @param allow_separated When false (the default -- every pre-existing call site), behavior is
+ *        byte-for-byte identical to before this parameter existed: the first axis that proves
+ *        separation short-circuits the remaining tests and the function returns false. When
+ *        true, ALL 15 axes are tested regardless, and if every one of them proves separation
+ *        (the pair is definitively NOT touching), the function still returns true with
+ *        `result.is_separated = true` and `result.separation` set from whichever separating
+ *        axis has the SMALLEST gap -- for box-box specifically, the same 15 candidate axes that
+ *        contain the true minimum-PENETRATION axis when overlapping also contain the true
+ *        minimum-SEPARATION axis when not (the mirror-image selection: max overlap among the
+ *        negative values, vs. min overlap among the positive ones), so no additional geometry
+ *        beyond what this function already computes is needed. This is what lets a fast-moving
+ *        pair get a genuine (not merely inflated-margin) speculative contact -- see
+ *        generate_box_box_contacts()'s own `allow_speculative` parameter, the only caller that
+ *        passes true here.
+ * @return False if `allow_separated` is false and any axis proves separation (no collision), or
+ *         if `allow_separated` is true and no axis produced a usable result at all (should not
+ *         happen in practice -- every one of the 15 axes is degenerate only for coincident
+ *         boxes). True with `result` populated otherwise, either the touching or separated case.
  */
-inline bool sat_test_obb_obb(const geometry::OBB& a, const geometry::OBB& b, SatAxisResult& result) {
+inline bool sat_test_obb_obb(const geometry::OBB& a, const geometry::OBB& b, SatAxisResult& result,
+                              bool allow_separated = false) {
     glm::vec3 a_axes[3];
     a.axes(a_axes[0], a_axes[1], a_axes[2]);
     glm::vec3 b_axes[3];
@@ -63,8 +87,15 @@ inline bool sat_test_obb_obb(const geometry::OBB& a, const geometry::OBB& b, Sat
     glm::vec3 best_normal(0.0f, 0.0f, 1.0f);
     bool separated = false;
 
+    // Only populated when allow_separated -- the LEAST-negative (smallest-gap) overlap seen
+    // across every axis that proved separation, and its axis/normal. See this function's own
+    // `allow_separated` doc for why the same 15 axes give the true minimum-separation axis too.
+    float best_sep_overlap = -std::numeric_limits<float>::max();
+    int best_sep_axis = -1;
+    glm::vec3 best_sep_normal(0.0f, 0.0f, 1.0f);
+
     auto test_axis = [&](const glm::vec3& axis_raw, int axis_id, float bias) {
-        if (separated) return;
+        if (separated && !allow_separated) return;
         float len2 = glm::dot(axis_raw, axis_raw);
         if (len2 < 1e-8f) return; // near-parallel edges: not a valid candidate, just skip it
 
@@ -76,8 +107,14 @@ inline bool sat_test_obb_obb(const geometry::OBB& a, const geometry::OBB& b, Sat
         }
         float dist = std::abs(glm::dot(d, axis));
         float overlap = ra + rb - dist;
+        glm::vec3 normal = glm::dot(d, axis) < 0.0f ? -axis : axis;
         if (overlap < 0.0f) {
             separated = true;
+            if (allow_separated && overlap > best_sep_overlap) {
+                best_sep_overlap = overlap;
+                best_sep_axis = axis_id;
+                best_sep_normal = normal;
+            }
             return;
         }
         float score = overlap + bias;
@@ -85,7 +122,7 @@ inline bool sat_test_obb_obb(const geometry::OBB& a, const geometry::OBB& b, Sat
             best_score = score;
             best_overlap = overlap;
             best_axis = axis_id;
-            best_normal = glm::dot(d, axis) < 0.0f ? -axis : axis;
+            best_normal = normal;
         }
     };
 
@@ -96,17 +133,30 @@ inline bool sat_test_obb_obb(const geometry::OBB& a, const geometry::OBB& b, Sat
     test_axis(b_axes[0], 3, 0.0f);
     test_axis(b_axes[1], 4, 0.0f);
     test_axis(b_axes[2], 5, 0.0f);
-    for (int i = 0; i < 3 && !separated; ++i) {
-        for (int j = 0; j < 3 && !separated; ++j) {
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            if (separated && !allow_separated) break;
             test_axis(glm::cross(a_axes[i], b_axes[j]), 6 + i * 3 + j, k_edge_bias);
         }
+        if (separated && !allow_separated) break;
     }
 
-    if (separated || best_axis < 0) return false;
+    if (separated) {
+        if (!allow_separated || best_sep_axis < 0) return false;
+        result.penetration = 0.0f;
+        result.separation = -best_sep_overlap; // best_sep_overlap is negative; separation is the positive gap
+        result.best_axis = best_sep_axis;
+        result.normal = best_sep_normal;
+        result.is_separated = true;
+        return true;
+    }
+    if (best_axis < 0) return false;
 
     result.penetration = best_overlap;
+    result.separation = 0.0f;
     result.best_axis = best_axis;
     result.normal = best_normal;
+    result.is_separated = false;
     return true;
 }
 
@@ -123,14 +173,46 @@ inline bool sat_test_obb_obb(const geometry::OBB& a, const geometry::OBB& b, Sat
  * @param b   Second box.
  * @param out Output manifold (`out.a`/`out.b`/material/friction are NOT set here -- the
  *            caller, collision::generate_contacts, fills those in).
- * @return True if `a` and `b` overlap and `out` now holds contact points.
+ * @param allow_speculative When true, a not-yet-touching pair (see sat_test_obb_obb()'s
+ *        `allow_separated` doc) still produces a manifold: a SINGLE speculative point
+ *        (ContactManifold::add_speculative_point()) at the midpoint of each box's closest point
+ *        to the OTHER box's center (geometry::closest_point_on_obb()) -- an approximation, not a
+ *        full clipped face manifold, since the only job a speculative point has is stopping
+ *        tunneling for one substep before the ordinary (non-speculative) path takes over once
+ *        the pair genuinely touches next substep. Deliberately NOT each box's support point
+ *        (farthest vertex along the separating axis): for a pure face-separation case the other
+ *        two axes have an ambiguous (zero-dot) choice and a support point can land on an
+ *        arbitrary corner far from the real contact area, injecting a large phantom moment arm
+ *        that neutralizes almost all of the resulting impulse -- an earlier version of this
+ *        function did exactly that and a fast box was measurably barely slowed down at all
+ *        before landing on closest_point_on_obb instead. Default false: every pre-existing call
+ *        site is completely unaffected (separation still just returns false, same as ever).
+ * @return True if `a` and `b` overlap (or, with `allow_speculative`, are merely close and
+ *         closing fast) and `out` now holds contact points.
  */
-inline bool generate_box_box_contacts(const geometry::OBB& a, const geometry::OBB& b, ContactManifold& out) {
+inline bool generate_box_box_contacts(const geometry::OBB& a, const geometry::OBB& b, ContactManifold& out,
+                                       bool allow_speculative = false) {
     SatAxisResult r;
-    if (!sat_test_obb_obb(a, b, r)) return false;
+    if (!sat_test_obb_obb(a, b, r, allow_speculative)) return false;
 
     out = ContactManifold{};
     out.normal = r.normal;
+
+    if (r.is_separated) {
+        // Closest point on each box TO THE OTHER BOX'S CENTER (not a support/vertex point --
+        // a support point picks whichever corner is farthest along the axis, which for a pure
+        // face-separation case like axis-aligned boxes has an ambiguous (zero-dot) choice on
+        // the other two axes and can land on an arbitrary corner far from the real contact
+        // area, injecting a large phantom moment arm that neutralizes almost all of the
+        // resulting impulse -- caught by test_fast_box_does_not_tunnel_through_thin_wall
+        // measurably failing to slow the box down at all before this fix). closest_point_on_obb
+        // naturally lands on the correct face/edge/corner for whichever axis actually separates.
+        glm::vec3 closest_a = geometry::closest_point_on_obb(b.center, a);
+        glm::vec3 closest_b = geometry::closest_point_on_obb(a.center, b);
+        glm::vec3 point = 0.5f * (closest_a + closest_b);
+        out.add_speculative_point(point, r.separation, 0x2000u | static_cast<uint32_t>(r.best_axis));
+        return true;
+    }
 
     if (r.best_axis <= 5) {
         bool ref_is_a = r.best_axis <= 2;

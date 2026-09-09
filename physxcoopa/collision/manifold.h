@@ -28,6 +28,16 @@ struct ContactPoint {
     glm::vec3 position{0.0f};
     float penetration = 0.0f;
 
+    /** @brief Signed gap for a SPECULATIVE (not-yet-touching, CCD) point only -- positive means
+     *         still separated by this distance along `ContactManifold::normal`. Zero for every
+     *         ordinary point (`add_point()`), where `penetration` is the field that drives the
+     *         solver instead; a speculative point (`add_speculative_point()`) leaves
+     *         `penetration` at 0 and sets this instead. See solve_velocity_pass()'s doc in
+     *         dynamics/solver.h for the distinct velocity-target branch this feeds
+     *         (`v_n >= -separation/h`), and sat_test_obb_obb()'s `allow_separated` parameter in
+     *         collision/sat.h for how it's produced. */
+    float separation = 0.0f;
+
     float normal_impulse = 0.0f;
     float tangent_impulse[2] = {0.0f, 0.0f};
 
@@ -69,6 +79,19 @@ struct ContactManifold {
         p = ContactPoint{};
         p.position = position;
         p.penetration = penetration;
+        p.feature_id = feature_id;
+    }
+
+    /** @brief Appends a SPECULATIVE point -- not yet overlapping (`penetration` stays 0), but
+     *         close enough and closing fast enough this substep that the solver should
+     *         constrain it anyway to prevent tunneling before the shapes actually touch. See
+     *         ContactPoint::separation's doc. */
+    void add_speculative_point(const glm::vec3& position, float separation, uint32_t feature_id) {
+        if (count >= 4) return;
+        ContactPoint& p = points[count++];
+        p = ContactPoint{};
+        p.position = position;
+        p.separation = separation;
         p.feature_id = feature_id;
     }
 };

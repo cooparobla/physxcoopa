@@ -128,16 +128,43 @@ struct Body {
     /** @brief Union-find island root index, rebuilt every substep by dynamics/island.h. */
     uint32_t island_id = 0;
 
-    /** @brief Applies a world-space force at the center of mass; cleared after each integrate. */
-    void add_force(const glm::vec3& f) { force_accum += f; }
+    /** @brief Applies a world-space force at the center of mass; cleared after each integrate.
+     *         Wakes a sleeping Dynamic body (matches Unity's AddForce) -- a force accumulated
+     *         into a sleeping body's force_accum would otherwise sit inert, since
+     *         integrate_forces()/integrate_velocities() both early-out on `!awake`. */
+    void add_force(const glm::vec3& f) {
+        force_accum += f;
+        if (type == BodyType::Dynamic) wake();
+    }
 
-    /** @brief Applies a world-space torque; cleared after each integrate. */
-    void add_torque(const glm::vec3& t) { torque_accum += t; }
+    /** @brief Applies a world-space torque; cleared after each integrate. See add_force()'s doc
+     *         for why this wakes the body. */
+    void add_torque(const glm::vec3& t) {
+        torque_accum += t;
+        if (type == BodyType::Dynamic) wake();
+    }
 
-    /** @brief Applies a world-space force at a world-space point, deriving the resulting torque. */
+    /** @brief Applies a world-space force at a world-space point, deriving the resulting torque.
+     *         See add_force()'s doc for why this wakes the body. */
     void add_force_at_position(const glm::vec3& f, const glm::vec3& world_point) {
         force_accum += f;
         torque_accum += glm::cross(world_point - position, f);
+        if (type == BodyType::Dynamic) wake();
+    }
+
+    /** @brief Applies an instantaneous world-space impulse at the center of mass, changing
+     *         linear_velocity immediately (unlike add_force(), which accumulates for the next
+     *         integrate_forces() call). Wakes a sleeping Dynamic body -- see add_force()'s doc. */
+    void apply_impulse(const glm::vec3& impulse) {
+        linear_velocity += impulse * inv_mass;
+        if (type == BodyType::Dynamic) wake();
+    }
+
+    /** @brief Applies an instantaneous world-space angular impulse, changing angular_velocity
+     *         immediately. See apply_impulse()'s doc. */
+    void apply_angular_impulse(const glm::vec3& angular_impulse) {
+        angular_velocity += inv_inertia_world * angular_impulse;
+        if (type == BodyType::Dynamic) wake();
     }
 
     /** @brief Clears accumulated force/torque -- called once per substep after integration. */
@@ -150,6 +177,17 @@ struct Body {
     void wake() {
         awake = true;
         sleep_timer = 0.0f;
+    }
+
+    /** @brief Puts the body to sleep immediately, bypassing the usual sleep_time-below-threshold
+     *         accumulation in update_islands_and_sleep() -- for explicit script control (Unity's
+     *         Rigidbody.Sleep()). Also zeroes velocity, matching Unity: a sleeping body is meant
+     *         to be at rest, not merely "not yet re-evaluated." */
+    void sleep() {
+        awake = false;
+        sleep_timer = 0.0f;
+        linear_velocity = glm::vec3(0.0f);
+        angular_velocity = glm::vec3(0.0f);
     }
 };
 

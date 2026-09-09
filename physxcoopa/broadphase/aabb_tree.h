@@ -59,20 +59,30 @@ public:
     }
 
     /**
-     * @brief Updates a proxy's tight bounds. Only triggers a tree re-insertion (relatively
-     *        expensive) when `tight_bounds` has escaped the proxy's current fat bounds.
+     * @brief Updates a proxy's tight bounds, PREDICTIVELY fattened along `displacement` -- the
+     *        swept volume the leaf is expected to cover before its next refit, so a fast body's
+     *        candidate-pair set includes a thin target it's about to pass through, not just what
+     *        it already overlaps this instant. This is what CCD's speculative-contact path
+     *        (collision/sat.h's `allow_separated`, PhysicsWorld::narrowphase_()) needs from
+     *        broadphase: the pair has to be DISCOVERED before a per-pair speculative test can
+     *        ever run on it. Only triggers a tree re-insertion (relatively expensive) when the
+     *        swept bounds have escaped the proxy's current fat bounds.
      *
-     * @param displacement Accepted for interface parity with the plan's design (predictive
-     *                      fattening along the direction of travel) but not used in v1 --
-     *                      omitting it only means more frequent re-insertion on a fast-moving
-     *                      body, never an incorrect query result.
+     * @param displacement Swept offset to fatten the refit bounds by, in addition to the usual
+     *                      `margin_` -- normally `velocity * h` for the upcoming substep (see
+     *                      PhysicsWorld::sync_broadphase_()'s call site). A zero vector
+     *                      degenerates to plain un-swept refitting, this function's original v1
+     *                      behavior before this fattening was implemented (this parameter used
+     *                      to be accepted-but-discarded).
      * @return True if the proxy was actually re-inserted.
      */
     bool move_proxy(int32_t proxy, const geometry::AABB& tight_bounds, const glm::vec3& displacement) {
-        (void)displacement;
-        if (nodes_[proxy].aabb.contains(tight_bounds)) return false;
+        geometry::AABB swept = tight_bounds;
+        swept.min = glm::min(swept.min, tight_bounds.min + displacement);
+        swept.max = glm::max(swept.max, tight_bounds.max + displacement);
+        if (nodes_[proxy].aabb.contains(swept)) return false;
         remove_leaf_(proxy);
-        nodes_[proxy].aabb = tight_bounds.expand(margin_);
+        nodes_[proxy].aabb = swept.expand(margin_);
         insert_leaf_(proxy);
         return true;
     }
@@ -83,43 +93,82 @@ public:
     /** @brief Returns a proxy's user data. */
     void* user_data(int32_t proxy) const { return nodes_[proxy].user_data; }
 
-    /** @brief Invokes `fn(void* user_data)` for every leaf whose fat AABB overlaps `bounds`. */
+    /**
+     * @brief Invokes `fn(void* user_data)` for every leaf whose fat AABB overlaps `bounds`.
+     *
+     * The traversal stack is `thread_local` (not the `stack_` member it used to be) so that
+     * PhysicsSystem's job-parallel pair-discovery pass (Phase 3 -- many worker threads calling
+     * query() on the same tree concurrently, each read-only) never races another thread's
+     * traversal. Reused across calls on the same thread, same as the old member did per-tree.
+     */
     template <typename Fn>
     void query(const geometry::AABB& bounds, Fn&& fn) const {
         if (root_ == k_null_node) return;
-        stack_.clear();
-        stack_.push_back(root_);
-        while (!stack_.empty()) {
-            int32_t idx = stack_.back();
-            stack_.pop_back();
+        thread_local std::vector<int32_t> stack;
+        stack.clear();
+        stack.push_back(root_);
+        while (!stack.empty()) {
+            int32_t idx = stack.back();
+            stack.pop_back();
             const Node& node = nodes_[idx];
             if (!node.aabb.overlaps(bounds)) continue;
             if (is_leaf_(node)) {
                 fn(node.user_data);
             } else {
-                stack_.push_back(node.child1);
-                stack_.push_back(node.child2);
+                stack.push_back(node.child1);
+                stack.push_back(node.child2);
             }
         }
     }
 
-    /** @brief Invokes `fn(void* user_data)` for every leaf whose fat AABB the ray intersects. */
+    /** @brief Invokes `fn(void* user_data)` for every leaf whose fat AABB the ray intersects.
+     *         See query()'s doc -- same thread_local traversal stack, same reason. */
     template <typename Fn>
     void raycast(const geometry::Ray& ray, Fn&& fn) const {
         if (root_ == k_null_node) return;
-        stack_.clear();
-        stack_.push_back(root_);
-        while (!stack_.empty()) {
-            int32_t idx = stack_.back();
-            stack_.pop_back();
+        thread_local std::vector<int32_t> stack;
+        stack.clear();
+        stack.push_back(root_);
+        while (!stack.empty()) {
+            int32_t idx = stack.back();
+            stack.pop_back();
             const Node& node = nodes_[idx];
             float t;
             if (!ray.intersect(node.aabb, t)) continue;
             if (is_leaf_(node)) {
                 fn(node.user_data);
             } else {
-                stack_.push_back(node.child1);
-                stack_.push_back(node.child2);
+                stack.push_back(node.child1);
+                stack.push_back(node.child2);
+            }
+        }
+    }
+
+    /**
+     * @brief Invokes `fn(void* user_data)` for every leaf whose fat AABB the ray intersects, IN
+     *        TRAVERSAL ORDER, stopping as soon as `fn` returns true -- for an "is anything in
+     *        the way" query that doesn't need the closest hit, just any hit. A new method
+     *        (rather than changing raycast()'s `fn` to return bool) so every existing void-
+     *        returning `raycast()` caller is completely untouched. See raycast()'s doc for the
+     *        shared traversal-stack rationale.
+     */
+    template <typename Fn>
+    void raycast_until(const geometry::Ray& ray, Fn&& fn) const {
+        if (root_ == k_null_node) return;
+        thread_local std::vector<int32_t> stack;
+        stack.clear();
+        stack.push_back(root_);
+        while (!stack.empty()) {
+            int32_t idx = stack.back();
+            stack.pop_back();
+            const Node& node = nodes_[idx];
+            float t;
+            if (!ray.intersect(node.aabb, t)) continue;
+            if (is_leaf_(node)) {
+                if (fn(node.user_data)) return;
+            } else {
+                stack.push_back(node.child1);
+                stack.push_back(node.child2);
             }
         }
     }
@@ -257,7 +306,6 @@ private:
     std::vector<Node> nodes_;
     int32_t root_ = k_null_node;
     int32_t free_list_ = k_null_node;
-    mutable std::vector<int32_t> stack_; /**< Reused query/raycast scratch, avoids per-call allocation. */
 };
 
 } // namespace broadphase

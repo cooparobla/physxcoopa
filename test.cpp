@@ -24,15 +24,23 @@
 #include <physxcoopa/components/box_collider.h>
 #include <physxcoopa/components/sphere_collider.h>
 #include <physxcoopa/components/rigidbody.h>
+#include <physxcoopa/loaders/physics_material_loader.h>
+#include <physxcoopa/util/physics_settings.h>
 
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_object.h>
 #include <coopa/scene/components/transform_component.h>
+#include <coopa/asset/asset_manager.h>
+#include <coopa/job/engine.h>
 
 #include <glm/gtc/quaternion.hpp>
 
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <random>
 #include <set>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -401,6 +409,124 @@ static void test_kinematic_wake_rule_wakes_sleeping_body_on_moving_platform() {
     ASSERT_TRUE(s->awake);
 }
 
+/**
+ * The kinematic wake rule's linear check (exercised above) misses a kinematic body that only
+ * ROTATES in place -- e.g. physics_test's spinner, hinged at its own Transform origin, whose
+ * position never changes. Before dynamics/solver.h's wake_if_kinematic_moving also checked
+ * angular_velocity, a sleeping body such a paddle sweeps into would never wake, and
+ * solve_velocity_pass()'s "skip unless at least one side is an awake dynamic body" gate would
+ * then skip that contact forever -- the paddle visually passing straight through it.
+ */
+static void test_kinematic_spin_wakes_sleeping_body_it_sweeps_into() {
+    PhysicsWorld world;
+    add_static_ground(world);
+    dynamics::BodyId sphere_id = add_dynamic_sphere(world, glm::vec3(3.0f, 0.0f, 1.0f), 0.5f);
+
+    // Let it settle onto the ground and fall asleep before the paddle appears.
+    for (int i = 0; i < 120; ++i) world.step_fixed(util::k_default_fixed_dt);
+    ASSERT_TRUE(!world.get_body(sphere_id)->awake);
+    glm::vec3 rest_pos = world.get_body(sphere_id)->position;
+
+    // A kinematic "paddle" already overlapping the sleeping sphere, spinning in place -- zero
+    // linear_velocity, nonzero angular_velocity only.
+    dynamics::Body paddle;
+    paddle.type = dynamics::BodyType::Kinematic;
+    paddle.position = rest_pos;
+    paddle.angular_velocity = glm::vec3(0.0f, 0.0f, 2.0f);
+    world.add_body(paddle, collision::Shape::make_box(glm::vec3(1.0f, 1.0f, 1.0f)));
+
+    world.step_fixed(util::k_default_fixed_dt);
+    ASSERT_TRUE(world.get_body(sphere_id)->awake);
+}
+
+/**
+ * dynamics/solver.h's apply_impulse_pair() used to apply a computed impulse to any body with
+ * type == Dynamic, regardless of `awake` -- inconsistent with warm_start()/solve_velocity_pass()
+ * themselves, which already zero a sleeping body's inv_mass/inv_inertia (correctly treating it
+ * as immovable) before deriving that impulse's magnitude. The bug: a sleeping body touched by an
+ * awake neighbor ended up with a nonzero velocity baked in while still marked asleep --
+ * integrate_velocities() skips a sleeping body, so nothing visibly moved yet, but the very next
+ * time the body woke (by any means) it would pop with this stale, unaccounted-for velocity
+ * already in it. Three flush-stacked boxes, where the bottom one sleeps before its neighbors
+ * finish settling, is exactly this shape.
+ */
+static void test_sleeping_body_unaffected_by_awake_neighbors_impulse() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f)); // isolate the impulse effect from gravity/settling
+
+    dynamics::BodyId sleeper_id = add_dynamic_sphere(world, glm::vec3(0.0f, 0.0f, 0.0f), 0.5f);
+    dynamics::Body* sleeper = world.get_body(sleeper_id);
+    sleeper->awake = false;
+    sleeper->linear_velocity = glm::vec3(0.0f);
+    sleeper->angular_velocity = glm::vec3(0.0f);
+
+    // Overlapping at spawn (radii sum to 1.0, centers 0.9 apart) so a manifold exists from the
+    // very first step, approaching further still.
+    dynamics::BodyId mover_id = add_dynamic_sphere(world, glm::vec3(0.9f, 0.0f, 0.0f), 0.5f);
+    world.get_body(mover_id)->linear_velocity = glm::vec3(-2.0f, 0.0f, 0.0f);
+
+    world.step_fixed(util::k_default_fixed_dt);
+
+    const dynamics::Body* s = world.get_body(sleeper_id);
+    ASSERT_TRUE(!s->awake);
+    ASSERT_VEC3_NEAR(s->linear_velocity, glm::vec3(0.0f), 1e-6f);
+    ASSERT_VEC3_NEAR(s->angular_velocity, glm::vec3(0.0f), 1e-6f);
+}
+
+/**
+ * Body::apply_impulse()/apply_angular_impulse() change velocity IMMEDIATELY (unlike
+ * add_force()/add_torque(), which only take effect on the next integrate_forces() call) --
+ * confirmed here with no step_fixed() call at all, so the change can only have come from the
+ * impulse methods themselves, not the solver/integrator.
+ */
+static void test_body_impulse_and_angular_impulse_change_velocity_immediately() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f));
+    dynamics::BodyId id = add_dynamic_sphere(world, glm::vec3(0.0f), 0.5f); // mass 1, inv_mass 1
+    dynamics::Body* b = world.get_body(id);
+
+    b->apply_impulse(glm::vec3(4.0f, 0.0f, 0.0f));
+    ASSERT_VEC3_NEAR(b->linear_velocity, glm::vec3(4.0f, 0.0f, 0.0f), 1e-6f); // impulse * inv_mass
+
+    glm::vec3 inv_i = b->inv_inertia_local; // sphere: isotropic, so world == local here (identity orientation)
+    b->apply_angular_impulse(glm::vec3(0.0f, 0.0f, 2.0f));
+    ASSERT_VEC3_NEAR(b->angular_velocity, glm::vec3(0.0f, 0.0f, 2.0f * inv_i.z), 1e-6f);
+}
+
+/**
+ * add_force()/add_torque()/add_force_at_position()/apply_impulse()/apply_angular_impulse() all
+ * wake a sleeping Dynamic body (matching Unity's AddForce) -- previously they silently
+ * accumulated into a sleeping body's force_accum/torque_accum or wrote velocity directly, with
+ * no effect until something ELSE woke the body (integrate_forces()/integrate_velocities() both
+ * early-out on `!awake`). Confirmed two ways: the flag itself, and that a subsequent step
+ * actually integrates the change (not just that `awake` reads true).
+ */
+static void test_body_force_and_impulse_apis_wake_a_sleeping_body() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f));
+
+    auto sleeping_sphere = [&]() {
+        dynamics::BodyId id = add_dynamic_sphere(world, glm::vec3(0.0f), 0.5f);
+        dynamics::Body* b = world.get_body(id);
+        b->awake = false;
+        b->sleep_timer = 0.0f;
+        return id;
+    };
+
+    dynamics::BodyId force_id = sleeping_sphere();
+    world.get_body(force_id)->add_force(glm::vec3(1.0f, 0.0f, 0.0f));
+    ASSERT_TRUE(world.get_body(force_id)->awake);
+
+    dynamics::BodyId impulse_id = sleeping_sphere();
+    world.get_body(impulse_id)->apply_impulse(glm::vec3(1.0f, 0.0f, 0.0f));
+    ASSERT_TRUE(world.get_body(impulse_id)->awake);
+    ASSERT_VEC3_NEAR(world.get_body(impulse_id)->linear_velocity, glm::vec3(1.0f, 0.0f, 0.0f), 1e-6f);
+
+    // Functional check, not just the flag: a woken body actually integrates on the next step.
+    world.step_fixed(util::k_default_fixed_dt);
+    ASSERT_TRUE(world.get_body(impulse_id)->position.x > 0.0f);
+}
+
 static void test_on_substep_signal_and_deferred_destroy() {
     PhysicsWorld world;
     dynamics::BodyId id = add_dynamic_sphere(world, glm::vec3(0.0f, 0.0f, 5.0f), 0.5f);
@@ -487,6 +613,158 @@ static void test_sat_box_box_edge_contact_single_point() {
     ASSERT_TRUE(collision::generate_box_box_contacts(a, b, m));
     ASSERT_TRUE(m.count == 1);
     ASSERT_TRUE(m.points[0].feature_id >= 0x1000u); // edge-edge feature-id range
+}
+
+/**
+ * A box dropped at an oblique seed orientation must tumble on landing, then come fully to rest
+ * flat on a face -- not freeze mid-topple, balanced on an edge/corner. Written while chasing a
+ * report of exactly that in physics_test's stack; this single-box-on-flat-ground case passes
+ * even without any fix (see test_three_box_concrete_stack_settles_flat's doc for how that
+ * investigation actually concluded), but it's still a legitimate general regression to keep.
+ */
+static void test_tumbled_box_settles_flat_not_balanced_on_edge() {
+    PhysicsWorld world;
+    add_static_ground(world);
+
+    // Tilted ~25 degrees about a horizontal axis so it lands corner/edge-first and must tumble,
+    // rather than settling straight down already aligned with a face.
+    glm::quat tilt = glm::angleAxis(glm::radians(25.0f), glm::normalize(glm::vec3(1.0f, 0.3f, 0.0f)));
+    dynamics::BodyId id = add_dynamic_box(world, glm::vec3(0.0f, 0.0f, 2.0f), glm::vec3(0.5f), tilt);
+
+    for (int i = 0; i < 600; ++i) world.step_fixed(util::k_default_fixed_dt); // 10s -- generous settle budget
+
+    const dynamics::Body* b = world.get_body(id);
+    bool settled = !b->awake || (glm::length(b->linear_velocity) < 0.02f && glm::length(b->angular_velocity) < 0.02f);
+    ASSERT_TRUE(settled);
+
+    // "Flat" means one of the box's local axes ends up within ~2 degrees of world +Z.
+    glm::vec3 local_axes[3] = {
+        b->orientation * glm::vec3(1.0f, 0.0f, 0.0f),
+        b->orientation * glm::vec3(0.0f, 1.0f, 0.0f),
+        b->orientation * glm::vec3(0.0f, 0.0f, 1.0f),
+    };
+    float best_alignment = 0.0f;
+    for (const auto& axis : local_axes) best_alignment = std::max(best_alignment, std::abs(axis.z));
+    ASSERT_TRUE(best_alignment > 0.999f); // cos(2 degrees) ~= 0.99939
+}
+
+/**
+ * CCD (Phase 4 -- speculative contacts): a genuine tunneling reproduction. A small box (half-
+ * extent 0.1) starts entirely clear of a thin static wall (half-extent 0.05, so 0.1 thick) and
+ * moves at 50 m/s toward it -- one substep's displacement (50/60 ~= 0.833) is roughly 2.5x the
+ * combined "skip zone" (box's own 0.2 full width + wall's 0.1 thickness = 0.3), so BEFORE this
+ * substep integrates, the box's PRE-step pose ([4.4,4.6] on the approach axis) doesn't overlap
+ * the wall ([4.95,5.05]), and its naive POST-step pose ([5.233,5.433]) doesn't either -- the box
+ * would cross from entirely-before to entirely-after the wall within one substep with no
+ * ordinary (non-speculative) contact ever generated to stop it. This is confirmed by hand
+ * computation, not assumed: the ordinary narrowphase test at the pre-step pose provably finds no
+ * overlap (4.6 < 4.95), so without the speculative path this substep produces zero manifolds and
+ * the box would simply integrate straight through. The fast-pair gate must fire here (box's own
+ * displacement 0.833 >> its own extent 0.1) and produce a speculative contact that clamps the
+ * closing velocity before integration, stopping the box on the near side.
+ */
+static void test_fast_box_does_not_tunnel_through_thin_wall() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f)); // isolate the CCD effect from gravity
+
+    dynamics::Body wall;
+    wall.type = dynamics::BodyType::Static;
+    wall.position = glm::vec3(5.0f, 0.0f, 0.0f);
+    dynamics::BodyId wall_id = world.add_body(wall, collision::Shape::make_box(glm::vec3(0.05f, 2.0f, 2.0f)));
+
+    dynamics::BodyId box_id = add_dynamic_box(world, glm::vec3(4.5f, 0.0f, 0.0f), glm::vec3(0.1f));
+    world.get_body(box_id)->linear_velocity = glm::vec3(50.0f, 0.0f, 0.0f);
+
+    world.step_fixed(util::k_default_fixed_dt);
+
+    const dynamics::Body* box = world.get_body(box_id);
+    // Naive (no-collision-response) integration would have put it at x ~= 5.333, past the
+    // wall's far face (5.05) -- must not have crossed even the wall's CENTER, let alone its far
+    // side, and must be markedly slower than the un-constrained 50 m/s it started with.
+    ASSERT_TRUE(box->position.x < 5.0f);
+    ASSERT_TRUE(box->linear_velocity.x < 50.0f);
+
+    // Let it settle fully and confirm a physically sane final state: resting against the wall's
+    // near face (4.95), not embedded past it, and eventually at rest.
+    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt);
+    const dynamics::Body* settled = world.get_body(box_id);
+    ASSERT_TRUE(settled->position.x < 4.951f); // near face at 4.95; small slop tolerance
+    ASSERT_TRUE(glm::length(settled->linear_velocity) < 0.05f);
+    (void)wall_id;
+}
+
+/**
+ * The exact 3-box, "concrete"-material configuration physics_test's stack uses (scale 0.8 ->
+ * half_extents 0.4, flush-stacked, dynamic/static friction 0.6/0.7, restitution 0.05), driven
+ * directly at the headless PhysicsWorld level. Added while diagnosing a report that the stack
+ * tumbles and then never fully settles (floats/balances on an edge) in the actual toyengine
+ * scene: this isolated case settles perfectly flat and stays asleep, with full 4-point face
+ * manifolds throughout -- which rules out physxcoopa's core solver/narrowphase as the cause and
+ * points at the Scene/PhysicsSystem integration layer above it instead (see the plan this test
+ * landed with for the investigation that led here).
+ */
+static void test_three_box_concrete_stack_settles_flat() {
+    PhysicsWorld world;
+    dynamics::PhysicsMaterial concrete;
+    concrete.dynamic_friction = 0.6f;
+    concrete.static_friction = 0.7f;
+    concrete.restitution = 0.05f;
+    add_static_box(world, glm::vec3(0.0f, 0.0f, -0.5f), glm::vec3(10.0f, 10.0f, 0.5f), glm::quat(1, 0, 0, 0), &concrete);
+
+    const float half = 0.4f;
+    std::vector<dynamics::BodyId> ids;
+    for (int i = 0; i < 3; ++i) {
+        glm::vec3 pos(0.0f, 0.0f, half * (2 * i + 1));
+        ids.push_back(add_dynamic_box(world, pos, glm::vec3(half), glm::quat(1, 0, 0, 0), &concrete));
+    }
+
+    for (int i = 0; i < 600; ++i) world.step_fixed(util::k_default_fixed_dt); // 10s
+
+    for (auto id : ids) {
+        const dynamics::Body* b = world.get_body(id);
+        ASSERT_TRUE(!b->awake);
+        glm::vec3 up = b->orientation * glm::vec3(0.0f, 0.0f, 1.0f);
+        ASSERT_TRUE(up.z > 0.999f); // flat, not balanced on an edge/corner
+        ASSERT_TRUE(std::abs(b->position.x) < 0.01f);
+        ASSERT_TRUE(std::abs(b->position.y) < 0.01f);
+    }
+}
+
+static void test_diag_transform_roundtrip_noise() {
+    coopa::util::Transform t;
+    t.set_position(glm::vec3(9.4f, 6.4f, 0.79f));
+    // An arbitrary oblique quaternion, representative of a tumbled box's resting orientation --
+    // not axis-aligned, not a "nice" angle.
+    glm::quat original = glm::normalize(glm::quat(0.8123f, 0.31f, -0.44f, 0.192f));
+    t.set_rotation_quat(original);
+
+    util::Trs trs = util::world_trs(t);
+
+    glm::quat rot_diff = trs.rotation * glm::inverse(original);
+    float rot_delta = 1.0f - std::abs(std::clamp(rot_diff.w, -1.0f, 1.0f));
+    float pos_delta = glm::length(trs.position - glm::vec3(9.4f, 6.4f, 0.79f));
+
+    std::cerr << "[DIAG] roundtrip pos_delta=" << pos_delta << " rot_delta=" << rot_delta << "\n";
+    std::cerr << "[DIAG] original=(" << original.w << "," << original.x << "," << original.y << "," << original.z << ")\n";
+    std::cerr << "[DIAG] roundtrip=(" << trs.rotation.w << "," << trs.rotation.x << "," << trs.rotation.y << "," << trs.rotation.z << ")\n";
+
+    // Now simulate repeated per-frame round-trips through set_world_trs -> world_trs, as
+    // sync_transforms_in_/write_transforms_back_ would do every frame for a body at rest,
+    // to see whether the noise compounds or stays bounded.
+    glm::vec3 pos = trs.position;
+    glm::quat rot = trs.rotation;
+    for (int i = 0; i < 300; ++i) {
+        util::set_world_trs(t, pos, rot);
+        util::Trs next = util::world_trs(t);
+        glm::quat diff = next.rotation * glm::inverse(rot);
+        float step_rot_delta = 1.0f - std::abs(std::clamp(diff.w, -1.0f, 1.0f));
+        float step_pos_delta = glm::length(next.position - pos);
+        if (i < 5 || step_rot_delta > 1e-5f || step_pos_delta > 1e-4f) {
+            std::cerr << "[DIAG] step=" << i << " pos_delta=" << step_pos_delta << " rot_delta=" << step_rot_delta << "\n";
+        }
+        pos = next.position;
+        rot = next.rotation;
+    }
 }
 
 static void test_ten_box_stack_stable() {
@@ -758,6 +1036,84 @@ static void test_overlap_sphere_and_overlap_box_find_expected_bodies() {
     ASSERT_TRUE(box_hits[0].index == near_id.index);
 }
 
+static void test_overlap_capsule_finds_expected_bodies() {
+    PhysicsWorld world;
+    dynamics::BodyId near_id = add_static_box(world, glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+    add_static_box(world, glm::vec3(20.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+
+    geometry::Capsule query_capsule;
+    query_capsule.a = glm::vec3(0.0f, 0.0f, -0.4f);
+    query_capsule.b = glm::vec3(0.0f, 0.0f, 0.4f);
+    query_capsule.radius = 0.3f;
+    std::vector<dynamics::BodyId> hits = world.overlap_capsule(query_capsule);
+    ASSERT_TRUE(hits.size() == 1);
+    ASSERT_TRUE(hits[0].index == near_id.index);
+}
+
+static void test_raycast_any_finds_a_hit_without_necessarily_the_closest() {
+    PhysicsWorld world;
+    add_static_box(world, glm::vec3(3.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+    add_static_box(world, glm::vec3(6.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+
+    geometry::Ray hit_ray;
+    hit_ray.origin = glm::vec3(0.0f, 0.0f, 0.0f);
+    hit_ray.direction = glm::vec3(1.0f, 0.0f, 0.0f);
+    hit_ray.max_distance = 100.0f;
+    ASSERT_TRUE(world.raycast_any(hit_ray)); // correctness of the boolean, not traversal order
+
+    geometry::Ray miss_ray;
+    miss_ray.origin = glm::vec3(0.0f, 0.0f, 0.0f);
+    miss_ray.direction = glm::vec3(-1.0f, 0.0f, 0.0f); // nothing behind the origin
+    miss_ray.max_distance = 100.0f;
+    ASSERT_TRUE(!world.raycast_any(miss_ray));
+}
+
+/**
+ * `include_triggers` (default true, matching every query's behavior before this parameter
+ * existed) lets a caller exclude trigger colliders -- previously impossible, every query always
+ * saw every enabled shape regardless of is_trigger.
+ */
+static void test_query_include_triggers_flag_excludes_trigger_colliders() {
+    PhysicsWorld world;
+    dynamics::BodyId trigger_id = add_static_box(world, glm::vec3(0.0f), glm::vec3(0.5f));
+    world.get_shape(trigger_id)->is_trigger = true;
+
+    std::vector<dynamics::BodyId> with_triggers = world.overlap_sphere(glm::vec3(0.0f), 1.0f, ~0u, true);
+    ASSERT_TRUE(with_triggers.size() == 1);
+
+    std::vector<dynamics::BodyId> without_triggers = world.overlap_sphere(glm::vec3(0.0f), 1.0f, ~0u, false);
+    ASSERT_TRUE(without_triggers.empty());
+}
+
+/**
+ * box_cast()/capsule_cast()'s discretized-stepped-sweep approximation against a simple,
+ * axis-aligned known target -- exact geometry, so the expected hit distance is hand-computed
+ * (see each assertion's comment), not just "found something."
+ */
+static void test_box_cast_and_capsule_cast_hit_known_target() {
+    PhysicsWorld world;
+    dynamics::BodyId target_id = add_static_box(world, glm::vec3(5.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+
+    query::RaycastHit box_hit;
+    bool box_found = world.box_cast(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.4f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                     glm::vec3(1.0f, 0.0f, 0.0f), 100.0f, box_hit);
+    ASSERT_TRUE(box_found);
+    // Casting box (half-extent 0.4, centered at origin+d) touches the target's near face (x=4.5)
+    // when its own leading face reaches it: d + 0.4 == 4.5 -> d == 4.1.
+    ASSERT_NEAR(box_hit.distance, 4.1f, 0.05f);
+    ASSERT_TRUE(box_hit.body.index == target_id.index);
+
+    query::RaycastHit capsule_hit;
+    bool capsule_found = world.capsule_cast(glm::vec3(0.0f, 0.0f, 0.0f), 0.3f, 0.3f, /*direction_axis=*/2,
+                                             glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(1.0f, 0.0f, 0.0f),
+                                             100.0f, capsule_hit);
+    ASSERT_TRUE(capsule_found);
+    // Capsule's long axis is Z, so its extent along the +X cast direction is exactly `radius`:
+    // touches the target's near face when d + 0.3 == 4.5 -> d == 4.2.
+    ASSERT_NEAR(capsule_hit.distance, 4.2f, 0.05f);
+    ASSERT_TRUE(capsule_hit.body.index == target_id.index);
+}
+
 // --- Phase 9: triggers ---
 
 static void test_trigger_enter_stay_exit_fires_correct_sequence() {
@@ -816,6 +1172,71 @@ static void test_debug_draw_emits_collider_bvh_and_contact_lines() {
     world.debug_draw(colliders_only, debug::DebugDrawFlags::Colliders);
     ASSERT_TRUE(!colliders_only.lines.empty());
     ASSERT_TRUE(colliders_only.lines.size() < draw.lines.size()); // strictly fewer without BVH/contacts
+}
+
+/**
+ * Shape::local_rotation -- a single (non-compound) collider's shape posed at an angle relative
+ * to its own body, previously impossible (every world_*() helper applied the body's rotation
+ * only). A capsule authored along local Z, rotated 90 degrees about X, actually points along
+ * world -Y once instanced -- confirmed three independent ways (raycast, overlap, debug draw) so
+ * a bug that only fixed one of the four world_*()/raycast_shape() call sites this touched would
+ * still be caught.
+ */
+static void test_shape_local_rotation_reorients_capsule_consistently() {
+    PhysicsWorld world;
+    dynamics::Body body;
+    body.type = dynamics::BodyType::Static;
+    body.position = glm::vec3(0.0f);
+    collision::Shape shape = collision::Shape::make_capsule(0.3f, 1.0f); // default axis Z, local_center 0
+    shape.local_rotation = glm::angleAxis(glm::radians(90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+    dynamics::BodyId id = world.add_body(body, shape);
+
+    // Rotating local Z (0,0,1) by +90 degrees about X maps it to world (0,-1,0) -- so the
+    // capsule's actual endpoints are (0,1,0) and (0,-1,0), radius 0.3, entirely off the Z axis
+    // it would occupy without local_rotation.
+    const glm::vec3 expected_a(0.0f, 1.0f, 0.0f);
+    const glm::vec3 expected_b(0.0f, -1.0f, 0.0f);
+
+    // 1. Raycast: a ray straight down world -Y should hit the capsule's near end cap.
+    geometry::Ray ray;
+    ray.origin = glm::vec3(0.0f, 3.0f, 0.0f);
+    ray.direction = glm::vec3(0.0f, -1.0f, 0.0f);
+    ray.max_distance = 100.0f;
+    query::RaycastHit hit;
+    ASSERT_TRUE(world.raycast(ray, hit));
+    ASSERT_NEAR(hit.distance, 3.0f - 1.3f, 1e-3f); // end cap surface at y = 1.0 + radius 0.3
+
+    // A ray held at z=1.3 throughout (sweeping along Y, well clear of the origin) must miss --
+    // the ACTUAL segment lies entirely in the z=0 plane (radius 0.3 << 1.3), so this only hits
+    // if the shape were still sitting at its un-rotated Z-axis position (whose end cap sits
+    // right around z=1.3). Deliberately not a ray straight down world -Z through the origin:
+    // the rotated segment ALSO passes through the origin (it's centered there), so that ray
+    // would hit either orientation and wouldn't distinguish them.
+    geometry::Ray miss_ray;
+    miss_ray.origin = glm::vec3(0.0f, 3.0f, 1.3f);
+    miss_ray.direction = glm::vec3(0.0f, -1.0f, 0.0f);
+    miss_ray.max_distance = 100.0f;
+    query::RaycastHit miss_hit;
+    ASSERT_TRUE(!world.raycast(miss_ray, miss_hit));
+
+    // 2. Overlap: a small sphere at the actual (rotated) capsule center overlaps; the same
+    // sphere at the UN-rotated capsule's would-be center (0,0,0.9) does not.
+    ASSERT_TRUE(!world.overlap_sphere(glm::vec3(0.0f), 0.1f).empty());
+    ASSERT_TRUE(world.overlap_sphere(glm::vec3(0.0f, 0.0f, 0.9f), 0.1f).empty());
+
+    // 3. Debug draw: every emitted line endpoint for this capsule must lie within `radius` (plus
+    // a small tolerance for the ring/cap approximation) of the ACTUAL rotated segment, not the
+    // un-rotated one.
+    debug::DebugDraw draw;
+    world.debug_draw(draw, debug::DebugDrawFlags::Colliders);
+    ASSERT_TRUE(!draw.lines.empty());
+    for (const auto& line : draw.lines) {
+        float dist_a = glm::length(line.a - geometry::closest_point_on_segment(line.a, expected_a, expected_b));
+        float dist_b = glm::length(line.b - geometry::closest_point_on_segment(line.b, expected_a, expected_b));
+        ASSERT_TRUE(dist_a < 0.35f);
+        ASSERT_TRUE(dist_b < 0.35f);
+    }
+    (void)id;
 }
 
 // --- Phase 6: broadphase ---
@@ -983,6 +1404,770 @@ static void test_scene_binding_runtime_parameter_change_rides_revision() {
     ASSERT_TRUE(collider->body_id() == id); // same body, shape updated in place -- not rebuilt
 }
 
+/**
+ * RigidbodyComponent's fields used to be read only once, at bind time (create_body_for_()) --
+ * a runtime `rb->mass = 5.0f` or `rb->is_kinematic = true` after that had no effect, unlike
+ * Collider's own parameters (the previous test), which already rode the per-frame revision
+ * check. update_changed_rigidbodies_() closes that gap; this drives mass, use_gravity, and an
+ * is_kinematic round-trip through the actual Scene/PhysicsSystem binding path.
+ */
+static void test_scene_binding_rigidbody_runtime_property_changes_take_effect() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsRigidbodyReconcileTest");
+    auto obj = std::make_unique<SceneObject>("sphere");
+    obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 5.0f));
+    obj->add_component<components::SphereCollider>()->set_radius(0.5f);
+    auto* rb = obj->add_component<components::RigidbodyComponent>();
+    scene.add_root_object(std::move(obj));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    scene.update(util::k_default_fixed_dt); // first execute() binds the body
+
+    SceneObject* sphere_obj = scene.find_object("sphere");
+    dynamics::BodyId id = sphere_obj->get_component<components::SphereCollider>()->body_id();
+    ASSERT_TRUE(id.is_valid());
+    const dynamics::Body* body = sys->world().get_body(id);
+    ASSERT_NEAR(body->mass, 1.0f, 1e-5f);
+    glm::vec3 inertia_at_mass_1 = body->inv_inertia_local;
+    ASSERT_TRUE(body->use_gravity);
+    ASSERT_TRUE(body->type == dynamics::BodyType::Dynamic);
+
+    // Mass: inv_mass and inv_inertia_local must both be recomputed from the new value, not just
+    // the mass field itself.
+    rb->mass = 4.0f;
+    rb->use_gravity = false;
+    scene.update(util::k_default_fixed_dt);
+    body = sys->world().get_body(id);
+    ASSERT_NEAR(body->mass, 4.0f, 1e-5f);
+    ASSERT_NEAR(body->inv_mass, 0.25f, 1e-5f);
+    ASSERT_TRUE(body->inv_inertia_local.x < inertia_at_mass_1.x); // heavier -> smaller inverse inertia
+    ASSERT_TRUE(!body->use_gravity);
+
+    // is_kinematic: a BodyType flip, not just a scalar -- round-trip it and confirm mass/inertia
+    // come back correctly on the way back to Dynamic (set_body_type()'s own responsibility).
+    rb->is_kinematic = true;
+    scene.update(util::k_default_fixed_dt);
+    ASSERT_TRUE(sys->world().get_body(id)->type == dynamics::BodyType::Kinematic);
+
+    rb->is_kinematic = false;
+    scene.update(util::k_default_fixed_dt);
+    body = sys->world().get_body(id);
+    ASSERT_TRUE(body->type == dynamics::BodyType::Dynamic);
+    ASSERT_NEAR(body->mass, 4.0f, 1e-5f);
+    ASSERT_NEAR(body->inv_mass, 0.25f, 1e-5f);
+}
+
+/**
+ * RigidbodyComponent::center_of_mass_override/inertia_tensor_override -- Unity's
+ * Rigidbody.centerOfMass/Rigidbody.inertiaTensor. Checked directly against the bound Body right
+ * after bind (no simulation needed): the override composes with any collider `center` (here
+ * zero) via center_offset_for_(), and body.position/inv_inertia_local should reflect it exactly.
+ */
+static void test_rigidbody_center_of_mass_and_inertia_override_fold_into_body() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsComOverrideTest");
+    auto obj = std::make_unique<SceneObject>("box");
+    obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 5.0f));
+    obj->add_component<components::BoxCollider>()->set_size(glm::vec3(1.0f)); // centered box, no `center` offset
+    auto* rb = obj->add_component<components::RigidbodyComponent>();
+    rb->center_of_mass_override = glm::vec3(0.3f, 0.0f, 0.0f);
+    rb->inertia_tensor_override = glm::vec3(9.0f, 9.0f, 9.0f); // deliberately far from the box's natural value
+    scene.add_root_object(std::move(obj));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    sys->world().set_gravity(glm::vec3(0.0f)); // isolate the fold-in check from one substep of fall
+    scene.update(util::k_default_fixed_dt);
+
+    SceneObject* box_obj = scene.find_object("box");
+    dynamics::BodyId id = box_obj->get_component<components::BoxCollider>()->body_id();
+    ASSERT_TRUE(id.is_valid());
+    const dynamics::Body* body = sys->world().get_body(id);
+
+    // Pivot was (0,0,5), identity rotation -- true center should be pivot + override exactly.
+    ASSERT_VEC3_NEAR(body->position, glm::vec3(0.3f, 0.0f, 5.0f), 1e-5f);
+    ASSERT_VEC3_NEAR(body->inv_inertia_local, glm::vec3(9.0f, 9.0f, 9.0f), 1e-5f);
+}
+
+/**
+ * RigidbodyComponent::sleep()/wake()/is_sleeping() and set_velocity()'s wake-on-write, exercised
+ * through the component API (not Body directly, unlike the two headless tests earlier) --
+ * confirms the delegation actually reaches the bound Body.
+ */
+static void test_rigidbody_component_sleep_wake_and_set_velocity_wakes() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsRigidbodySleepWakeTest");
+    auto obj = std::make_unique<SceneObject>("sphere");
+    obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 5.0f));
+    obj->add_component<components::SphereCollider>()->set_radius(0.5f);
+    auto* rb = obj->add_component<components::RigidbodyComponent>();
+    scene.add_root_object(std::move(obj));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    scene.update(util::k_default_fixed_dt);
+    (void)sys;
+
+    ASSERT_TRUE(!rb->is_sleeping()); // freshly bound bodies start awake
+
+    rb->sleep();
+    ASSERT_TRUE(rb->is_sleeping());
+    ASSERT_VEC3_NEAR(rb->velocity(), glm::vec3(0.0f), 1e-6f);
+
+    rb->wake();
+    ASSERT_TRUE(!rb->is_sleeping());
+
+    rb->sleep();
+    ASSERT_TRUE(rb->is_sleeping());
+    rb->set_velocity(glm::vec3(1.0f, 0.0f, 0.0f)); // must wake the body, not just set velocity
+    ASSERT_TRUE(!rb->is_sleeping());
+    ASSERT_VEC3_NEAR(rb->velocity(), glm::vec3(1.0f, 0.0f, 0.0f), 1e-6f);
+}
+
+/**
+ * The exact scenario that caused physics_test's stack to tumble and never settle: a
+ * corner-origin mesh (cube.000's [0,1]^3 local vertices) compensated for via
+ * `BoxCollider center: {0.5,0.5,0.5}` on a dynamic Rigidbody. PhysicsSystem::create_body_for_()
+ * used to leave body.position pinned to the Transform's raw pivot while the shape (and mass/
+ * inertia) actually sat 0.5 units away in each axis -- every dynamics formula silently assumed
+ * body.position WAS the center of mass, so gravity produced a persistent spurious torque about
+ * the wrong point. Fixed by folding the collider's center offset into body.position as the true
+ * center of mass (see create_body_for_()'s doc) and converting back to the pivot every frame in
+ * write_transforms_back_(). Unlike test_tumbled_box_settles_flat_not_balanced_on_edge (which
+ * passes even without any fix -- it has no center offset) and
+ * test_three_box_concrete_stack_settles_flat (headless PhysicsWorld, no Scene/Collider::center()
+ * involved), this test drives the bug through the actual Scene/PhysicsSystem binding path with a
+ * nonzero collider center, which is the only place the bug ever lived.
+ */
+static void test_scene_binding_box_collider_center_offset_settles_flat() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsCenterOffsetTest");
+
+    auto ground = std::make_unique<SceneObject>("ground");
+    ground->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, -0.5f));
+    ground->add_component<components::BoxCollider>()->set_size(glm::vec3(8.0f, 8.0f, 1.0f));
+    scene.add_root_object(std::move(ground));
+
+    // Pivot ("Transform position") is the box's corner, matching cube.000's convention; the
+    // collider's center offset re-centers the 1x1x1 shape onto that pivot exactly like
+    // physics_test's stack_1/2/3 objects (BoxCollider size:{1,1,1} center:{0.5,0.5,0.5}).
+    auto box = std::make_unique<SceneObject>("box");
+    auto* transform = box->add_component<TransformComponent>();
+    transform->transform().set_position(glm::vec3(0.0f, 0.0f, 2.5f));
+    glm::quat tilt = glm::angleAxis(glm::radians(25.0f), glm::normalize(glm::vec3(1.0f, 0.3f, 0.0f)));
+    transform->transform().set_rotation_quat(tilt);
+    auto* box_collider = box->add_component<components::BoxCollider>();
+    box_collider->set_size(glm::vec3(1.0f));
+    box_collider->set_center(glm::vec3(0.5f));
+    box->add_component<components::RigidbodyComponent>();
+    scene.add_root_object(std::move(box));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+
+    for (int i = 0; i < 600; ++i) { // 10s -- generous settle budget, matching the headless tests
+        scene.update(util::k_default_fixed_dt);
+        scene.late_update(util::k_default_fixed_dt);
+    }
+
+    SceneObject* box_obj = scene.find_object("box");
+    ASSERT_TRUE(box_obj != nullptr);
+    dynamics::BodyId id = box_obj->get_component<components::BoxCollider>()->body_id();
+    const dynamics::Body* b = sys->world().get_body(id);
+    ASSERT_TRUE(b != nullptr);
+
+    bool settled = !b->awake || (glm::length(b->linear_velocity) < 0.02f && glm::length(b->angular_velocity) < 0.02f);
+    ASSERT_TRUE(settled);
+
+    // "Flat" means one of the box's local axes ends up within ~2 degrees of world +Z.
+    glm::vec3 local_axes[3] = {
+        b->orientation * glm::vec3(1.0f, 0.0f, 0.0f),
+        b->orientation * glm::vec3(0.0f, 1.0f, 0.0f),
+        b->orientation * glm::vec3(0.0f, 0.0f, 1.0f),
+    };
+    float best_alignment = 0.0f;
+    for (const auto& axis : local_axes) best_alignment = std::max(best_alignment, std::abs(axis.z));
+    ASSERT_TRUE(best_alignment > 0.999f); // cos(2 degrees) ~= 0.99939
+
+    // Ground top at z=0; resting flat, the pivot (Transform position, NOT the center of mass)
+    // must land back at z~=0 -- exactly cube.000's corner-origin convention -- confirming
+    // write_transforms_back_() correctly converts true-center space back to the authored pivot.
+    float pivot_z = box_obj->get_transform()->transform().position().z;
+    ASSERT_NEAR(pivot_z, 0.0f, 0.05f);
+}
+
+/**
+ * Phase 5 -- compound colliders: one Rigidbody (on the ROOT object, which deliberately has NO
+ * Collider of its own -- exercises Binding::sync_owner's edge case) owning two CHILD
+ * SceneObjects' BoxColliders, one bigger than the other, offset so they genuinely overlap in
+ * one region. Verifies every piece create_compound_body_() is responsible for: composite mass
+ * (volume-weighted split of the authored total), composite center of mass (hand-computed, not
+ * just "some value"), individual raycast attribution to the correct CHILD collider (not just
+ * the body), and that the two children's genuine geometric overlap never produces a
+ * self-collision manifold.
+ *
+ * Geometry (root at world (0,0,5), no rotation):
+ * - child_a: BoxCollider size {2,1,1} (half-extents 1,0.5,0.5), local offset (0,0,0) -- volume
+ *   2.0, world center (0,0,5), spans x[-1,1] y[-0.5,0.5] z[4.5,5.5].
+ * - child_b: BoxCollider size {1,1,1} (half-extents 0.5,0.5,0.5), local offset (0,0.7,0) --
+ *   volume 1.0, world center (0,0.7,5), spans x[-0.5,0.5] y[0.2,1.2] z[4.5,5.5].
+ * - Overlap region: x[-0.5,0.5] y[0.2,0.5] z[4.5,5.5] -- genuinely overlapping.
+ * - Rigidbody mass = 3.0 -> volume-split masses 2.0/1.0 -> composite center of mass (local) =
+ *   (2*(0,0,0) + 1*(0,0.7,0)) / 3 = (0, 0.23333, 0) -> world true center (0, 0.23333, 5).
+ */
+static void test_compound_collider_two_children_one_rigidbody() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsCompoundColliderTest");
+
+    auto root = std::make_unique<SceneObject>("compound_root");
+    root->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 5.0f));
+    auto* rb = root->add_component<components::RigidbodyComponent>();
+    rb->mass = 3.0f;
+    SceneObject* root_ptr = root.get();
+
+    auto child_a = std::make_unique<SceneObject>("child_a");
+    auto* child_a_tc = child_a->add_component<TransformComponent>();
+    child_a_tc->set_parent_transform(&root_ptr->get_transform()->transform());
+    child_a_tc->transform().set_position(glm::vec3(0.0f, 0.0f, 0.0f));
+    auto* collider_a = child_a->add_component<components::BoxCollider>();
+    collider_a->set_size(glm::vec3(2.0f, 1.0f, 1.0f));
+    SceneObject* child_a_ptr = root_ptr->add_child(std::move(child_a));
+    (void)child_a_ptr;
+
+    auto child_b = std::make_unique<SceneObject>("child_b");
+    auto* child_b_tc = child_b->add_component<TransformComponent>();
+    child_b_tc->set_parent_transform(&root_ptr->get_transform()->transform());
+    child_b_tc->transform().set_position(glm::vec3(0.0f, 0.7f, 0.0f));
+    auto* collider_b = child_b->add_component<components::BoxCollider>();
+    collider_b->set_size(glm::vec3(1.0f, 1.0f, 1.0f));
+    root_ptr->add_child(std::move(child_b));
+
+    scene.add_root_object(std::move(root));
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    sys->world().set_gravity(glm::vec3(0.0f)); // isolate bind-time correctness from any fall
+    scene.update(util::k_default_fixed_dt);
+
+    // Both children share the SAME body, resolved via the primary collider (whichever one
+    // regather_() picked -- root has no Collider of its own, so it's whichever child was
+    // gathered first; either is fine, this test only needs them to AGREE).
+    dynamics::BodyId id = collider_a->body_id();
+    ASSERT_TRUE(id.is_valid());
+    ASSERT_TRUE(collider_b->body_id() == id); // same compound body
+
+    const dynamics::Body* body = sys->world().get_body(id);
+    ASSERT_TRUE(body != nullptr);
+    ASSERT_TRUE(body->type == dynamics::BodyType::Dynamic);
+
+    // Composite mass: total, not just one child's.
+    ASSERT_NEAR(body->mass, 3.0f, 1e-4f);
+    ASSERT_NEAR(body->inv_mass, 1.0f / 3.0f, 1e-4f);
+
+    // Composite center of mass -- hand-computed above, not a placeholder check.
+    ASSERT_VEC3_NEAR(body->position, glm::vec3(0.0f, 0.23333f, 5.0f), 1e-3f);
+
+    // Inertia composition produced something sane (positive, finite) on all three axes --
+    // exact values aren't hand-verified here (see compose_mass_properties()'s own doc for the
+    // diagonal-only approximation), just that composition didn't degenerate to zero/garbage.
+    ASSERT_TRUE(body->inv_inertia_local.x > 0.0f && body->inv_inertia_local.y > 0.0f &&
+                body->inv_inertia_local.z > 0.0f);
+
+    // Raycast attribution: a point unambiguously inside ONLY child_a, and one unambiguously
+    // inside ONLY child_b (see the geometry comment above) -- each must resolve to the
+    // correct, DISTINCT Collider*, not just "the compound body somehow got hit."
+    system::PhysicsSystem::RaycastHit hit_a;
+    geometry::Ray ray_a;
+    ray_a.origin = glm::vec3(0.8f, 0.0f, 10.0f);
+    ray_a.direction = glm::vec3(0.0f, 0.0f, -1.0f);
+    ray_a.max_distance = 100.0f;
+    ASSERT_TRUE(sys->raycast(ray_a, hit_a));
+    ASSERT_TRUE(hit_a.collider == collider_a);
+
+    system::PhysicsSystem::RaycastHit hit_b;
+    geometry::Ray ray_b;
+    ray_b.origin = glm::vec3(0.0f, 1.0f, 10.0f);
+    ray_b.direction = glm::vec3(0.0f, 0.0f, -1.0f);
+    ray_b.max_distance = 100.0f;
+    ASSERT_TRUE(sys->raycast(ray_b, hit_b));
+    ASSERT_TRUE(hit_b.collider == collider_b);
+
+    // No self-collision: child_a and child_b genuinely overlap geometrically, but they're
+    // siblings of the SAME body -- narrowphase must never produce a manifold with both sides
+    // resolving to this body (discover_pairs_()'s owner-based self-rejection, see its doc).
+    for (int i = 0; i < 5; ++i) scene.update(util::k_default_fixed_dt);
+    for (const auto& m : sys->world().manifolds()) {
+        ASSERT_TRUE(!(m.a == id && m.b == id));
+    }
+}
+
+/**
+ * The full YAML-authoring-equivalent path: a HingeJointComponent on a "door" object, naming a
+ * static "frame" object via `connected_object`, with only ONE anchor/axis authored (in the
+ * door's own local frame) -- regather_joints_()/create_hinge_joint_for_() must resolve the
+ * frame side automatically (Unity's autoConfigureConnectedAnchor default, see
+ * HingeJointComponent's own doc) and produce the same physically correct swing-to-limit
+ * behavior the headless test_hinge_joint_door_swings_and_stops_at_limit() already verified
+ * directly against PhysicsWorld -- this test instead exercises the Scene/PhysicsSystem binding
+ * layer on top of it (component gather, connected_object name resolution, Collider->BodyId
+ * lookup), the part a hand-built PhysicsWorld test can't reach at all.
+ */
+static void test_scene_binding_hinge_joint_door_resolves_and_swings_to_limit() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsHingeJointTest");
+
+    auto frame = std::make_unique<SceneObject>("frame");
+    frame->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 0.0f));
+    frame->add_component<components::BoxCollider>()->set_size(glm::vec3(0.2f, 2.0f, 2.0f));
+    scene.add_root_object(std::move(frame));
+
+    auto door = std::make_unique<SceneObject>("door");
+    door->add_component<TransformComponent>()->transform().set_position(glm::vec3(1.0f, 0.0f, 0.0f));
+    door->add_component<components::BoxCollider>()->set_size(glm::vec3(2.0f, 1.0f, 0.2f));
+    auto* rb = door->add_component<components::RigidbodyComponent>();
+    rb->initial_angular_velocity = glm::vec3(0.0f, 0.0f, 5.0f); // fast push, well past the limit if unconstrained
+    auto* hinge = door->add_component<components::HingeJointComponent>();
+    hinge->connected_object = "frame";
+    hinge->anchor = glm::vec3(-1.0f, 0.0f, 0.0f); // door's own hinge edge, in the door's local frame
+    hinge->axis = glm::vec3(0.0f, 0.0f, 1.0f);
+    hinge->use_limits = true;
+    hinge->min_angle_deg = 0.0f;
+    hinge->max_angle_deg = 90.0f;
+    scene.add_root_object(std::move(door));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    sys->world().set_gravity(glm::vec3(0.0f));
+
+    for (int i = 0; i < 300; ++i) { // 5s -- generous settle budget, matching the headless version
+        scene.update(util::k_default_fixed_dt);
+        scene.late_update(util::k_default_fixed_dt);
+    }
+
+    SceneObject* door_obj = scene.find_object("door");
+    ASSERT_TRUE(door_obj != nullptr);
+    auto* hinge_comp = door_obj->get_component<components::HingeJointComponent>();
+    ASSERT_TRUE(hinge_comp != nullptr);
+    dynamics::JointId joint_id = hinge_comp->joint_id();
+    ASSERT_TRUE(joint_id.is_valid());
+
+    const dynamics::HingeJoint* j = sys->world().get_joint(joint_id);
+    ASSERT_TRUE(j != nullptr && j->valid);
+    const dynamics::Body* frame_body = sys->world().get_body(j->a);
+    const dynamics::Body* door_body = sys->world().get_body(j->b);
+    ASSERT_TRUE(frame_body != nullptr && door_body != nullptr);
+
+    float angle = dynamics::hinge_current_angle(frame_body->orientation, door_body->orientation, j->local_axis_a,
+                                                 j->rest_relative_rotation);
+    ASSERT_NEAR(angle, glm::radians(90.0f), glm::radians(3.0f));
+    ASSERT_TRUE(glm::length(door_body->angular_velocity) < 0.05f);
+
+    glm::vec3 world_anchor_a = frame_body->position + frame_body->orientation * j->local_anchor_a;
+    glm::vec3 world_anchor_b = door_body->position + door_body->orientation * j->local_anchor_b;
+    ASSERT_NEAR(glm::length(world_anchor_b - world_anchor_a), 0.0f, 0.05f);
+}
+
+static void test_collision_event_carries_contact_payload_and_clears_on_exit() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsCollisionPayloadTest");
+
+    auto ground = std::make_unique<SceneObject>("ground");
+    ground->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, -0.5f));
+    ground->add_component<components::BoxCollider>()->set_size(glm::vec3(8.0f, 8.0f, 1.0f));
+    scene.add_root_object(std::move(ground));
+
+    auto sphere_obj = std::make_unique<SceneObject>("sphere");
+    sphere_obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 3.0f));
+    auto* sphere_collider = sphere_obj->add_component<components::SphereCollider>();
+    sphere_collider->set_radius(0.5f);
+    auto bouncy = std::make_shared<dynamics::PhysicsMaterial>();
+    bouncy->restitution = 0.9f;
+    sphere_collider->set_material(bouncy);
+    sphere_obj->add_component<components::RigidbodyComponent>();
+    scene.add_root_object(std::move(sphere_obj));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+
+    int enter_count = 0, exit_count = 0;
+    bool enter_had_contacts = false, enter_had_impulse = false;
+    float enter_normal_z = 0.0f;
+    bool exit_had_zero_contacts = true;
+
+    sphere_collider->on_collision_enter.connect([&](components::Collider&, const components::Collision& c) {
+        ++enter_count;
+        enter_had_contacts = c.contact_count > 0;
+        enter_had_impulse = glm::length(c.impulse) > 0.0f;
+        enter_normal_z = c.normal.z;
+        ASSERT_TRUE(c.collider != nullptr);
+        ASSERT_TRUE(c.object != nullptr && c.object->name() == "ground");
+    });
+    sphere_collider->on_collision_exit.connect([&](components::Collider&, const components::Collision& c) {
+        ++exit_count;
+        if (c.contact_count != 0) exit_had_zero_contacts = false;
+    });
+
+    for (int i = 0; i < 300; ++i) {
+        scene.update(util::k_default_fixed_dt);
+        scene.late_update(util::k_default_fixed_dt);
+    }
+
+    ASSERT_TRUE(enter_count >= 1);
+    ASSERT_TRUE(exit_count >= 1); // combined restitution ~0.45 must separate at least once
+    ASSERT_TRUE(enter_had_contacts);
+    ASSERT_TRUE(enter_had_impulse);
+    ASSERT_TRUE(enter_normal_z < 0.0f); // points from sphere (self) down toward the ground (other)
+    ASSERT_TRUE(exit_had_zero_contacts);
+    (void)sys;
+}
+
+static void test_scene_query_wrappers_resolve_collider_and_object() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsQueryTest");
+    auto obj = std::make_unique<SceneObject>("target");
+    obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 0.0f));
+    obj->add_component<components::SphereCollider>()->set_radius(1.0f);
+    scene.add_root_object(std::move(obj));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    scene.update(util::k_default_fixed_dt); // first execute() binds the body
+
+    geometry::Ray ray;
+    ray.origin = glm::vec3(0.0f, 0.0f, 5.0f);
+    ray.direction = glm::vec3(0.0f, 0.0f, -1.0f);
+    ray.max_distance = 100.0f;
+
+    system::PhysicsSystem::RaycastHit hit;
+    ASSERT_TRUE(sys->raycast(ray, hit));
+    ASSERT_TRUE(hit.collider != nullptr);
+    ASSERT_TRUE(hit.object != nullptr && hit.object->name() == "target");
+    ASSERT_NEAR(hit.point.z, 1.0f, 1e-4f);
+
+    auto overlapping = sys->overlap_sphere(glm::vec3(0.0f), 1.5f);
+    ASSERT_TRUE(overlapping.size() == 1);
+    ASSERT_TRUE(overlapping[0] == hit.collider);
+}
+
+// --- Materials, settings, job-parallel determinism ---
+
+static void test_physics_material_combine_modes() {
+    dynamics::PhysicsMaterial a;
+    a.dynamic_friction = 0.2f;
+    a.restitution = 0.1f;
+    dynamics::PhysicsMaterial b;
+    b.dynamic_friction = 0.8f;
+    b.restitution = 0.9f;
+
+    // Priority order is Multiply > Maximum > Minimum > Average -- the higher-priority mode of
+    // the two wins, regardless of which side (a or b) specified it.
+    ASSERT_NEAR(dynamics::combine(a.dynamic_friction, b.dynamic_friction,
+                                   dynamics::CombineMode::Average, dynamics::CombineMode::Average), 0.5f, 1e-5f);
+    ASSERT_NEAR(dynamics::combine(a.dynamic_friction, b.dynamic_friction,
+                                   dynamics::CombineMode::Minimum, dynamics::CombineMode::Average), 0.2f, 1e-5f);
+    ASSERT_NEAR(dynamics::combine(a.restitution, b.restitution,
+                                   dynamics::CombineMode::Maximum, dynamics::CombineMode::Average), 0.9f, 1e-5f);
+    ASSERT_NEAR(dynamics::combine(a.restitution, b.restitution,
+                                   dynamics::CombineMode::Multiply, dynamics::CombineMode::Maximum), 0.1f * 0.9f, 1e-5f);
+}
+
+static void test_collider_material_resolution_prefers_asset_over_inline() {
+    components::BoxCollider collider;
+    ASSERT_TRUE(collider.material() == nullptr); // unset -> caller falls back to default_material()
+
+    auto inline_mat = std::make_shared<dynamics::PhysicsMaterial>();
+    inline_mat->restitution = 0.42f;
+    collider.set_material(inline_mat);
+    ASSERT_TRUE(collider.material() == inline_mat.get());
+
+    // An asset handle, once loaded, takes priority over the inline material -- set up a real
+    // AssetManager + PhysicsMaterialLoader + on-disk material so this exercises the actual
+    // scene-authoring path (`material: <name>`), not just the accessor logic.
+    namespace fs = std::filesystem;
+    fs::path dir = fs::temp_directory_path() / "physxcoopa_test_materials";
+    fs::create_directories(dir);
+    fs::path file = dir / "ice.yaml";
+    {
+        std::ofstream out(file);
+        out << "dynamic_friction: 0.02\n"
+               "static_friction: 0.03\n"
+               "restitution: 0.0\n"
+               "friction_combine: Minimum\n"
+               "restitution_combine: Average\n";
+    }
+
+    coopa::asset::AssetManager assets;
+    assets.register_loader<dynamics::PhysicsMaterial>(std::make_unique<loaders::PhysicsMaterialLoader>());
+    assets.add_search_root(dir.string());
+
+    auto handle = assets.load<dynamics::PhysicsMaterial>("ice.yaml");
+    ASSERT_TRUE(handle.is_loaded());
+    ASSERT_NEAR(handle->dynamic_friction, 0.02f, 1e-6f);
+    ASSERT_NEAR(handle->static_friction, 0.03f, 1e-6f);
+    ASSERT_TRUE(handle->friction_combine == dynamics::CombineMode::Minimum);
+    ASSERT_TRUE(handle->restitution_combine == dynamics::CombineMode::Average);
+
+    collider.set_material_asset(handle);
+    ASSERT_TRUE(collider.material() == handle.get());        // asset now wins over the inline material
+    ASSERT_NEAR(collider.material()->dynamic_friction, 0.02f, 1e-6f);
+
+    fs::remove_all(dir);
+}
+
+static void test_parse_physics_settings_and_apply_to_world() {
+    std::istringstream iss(
+        "gravity: { x: 0.0, y: 0.0, z: -3.0 }\n"
+        "fixed_timestep: 0.02\n"
+        "solver:\n"
+        "  velocity_iterations: 4\n"
+        "layers: [\"Default\", \"Ground\", \"Triggers\"]\n"
+        "ignore_layer_collisions:\n"
+        "  - [Triggers, Triggers]\n"
+        "parallel_threshold: 8\n");
+    fkyaml::node node = fkyaml::node::deserialize(iss);
+    util::PhysicsSettings settings = util::parse_physics_settings(node);
+
+    ASSERT_NEAR(settings.gravity.z, -3.0f, 1e-6f);
+    ASSERT_NEAR(settings.solver.fixed_dt, 0.02f, 1e-6f);
+    ASSERT_TRUE(settings.solver.velocity_iterations == 4);
+    ASSERT_TRUE(settings.layer_names.size() == 3);
+    ASSERT_TRUE(settings.parallel_threshold == 8);
+    ASSERT_TRUE(settings.ignore_pairs.size() == 1);
+    ASSERT_TRUE(settings.ignore_pairs[0].first == 2 && settings.ignore_pairs[0].second == 2); // "Triggers" == index 2
+
+    PhysicsWorld world;
+    apply_physics_settings(world, settings);
+    ASSERT_NEAR(world.gravity().z, -3.0f, 1e-6f);
+    ASSERT_TRUE(world.config().velocity_iterations == 4);
+    ASSERT_TRUE(!world.layers().should_collide(2, 2));  // Triggers vs Triggers turned off
+    ASSERT_TRUE(world.layers().should_collide(1, 2));   // untouched pair still collides
+}
+
+// --- Joints ---
+
+/**
+ * A door: a static frame (world.add_body() with no shape -- Shape::enabled's default, "no
+ * collision, just a fixed anchor") hinged to a dynamic panel via a vertical (Z) axis, with a
+ * 90-degree swing limit. Given a fast initial spin (not gravity -- a vertical-axis door has no
+ * gravity torque about its own hinge, matching real doors), it must swing and come to rest AT
+ * the limit, not past it, while the point and axis constraints hold throughout the fast swing.
+ */
+static void test_hinge_joint_door_swings_and_stops_at_limit() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f));
+
+    dynamics::Body frame_body;
+    frame_body.type = dynamics::BodyType::Static;
+    frame_body.position = glm::vec3(0.0f);
+    dynamics::BodyId frame_id = world.add_body(frame_body);
+
+    dynamics::Body door_body;
+    door_body.position = glm::vec3(1.0f, 0.0f, 0.0f); // door's own center, 1 unit from the hinge
+    door_body.angular_velocity = glm::vec3(0.0f, 0.0f, 5.0f); // fast push, well past the limit if unconstrained
+    dynamics::BodyId door_id = world.add_body(door_body);
+
+    // local_anchor_b = (-1,0,0): offset from the door's own center back to the hinge point, so
+    // world_anchor_b starts exactly at world_anchor_a (0,0,0), matching the frame's anchor.
+    dynamics::JointId joint = world.add_hinge_joint(
+        frame_id, door_id, glm::vec3(0.0f), glm::vec3(-1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f),
+        glm::vec3(0.0f, 0.0f, 1.0f), /*use_limits=*/true, /*min_angle=*/0.0f, /*max_angle=*/glm::radians(90.0f));
+    ASSERT_TRUE(joint.is_valid());
+
+    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt); // 5s -- generous settle budget
+
+    const dynamics::Body* frame = world.get_body(frame_id);
+    const dynamics::Body* door = world.get_body(door_id);
+    const dynamics::HingeJoint* j = world.get_joint(joint);
+    ASSERT_TRUE(j != nullptr);
+
+    // Point constraint held: the door's hinge edge is still at the frame's anchor.
+    glm::vec3 world_anchor_a = frame->position + frame->orientation * j->local_anchor_a;
+    glm::vec3 world_anchor_b = door->position + door->orientation * j->local_anchor_b;
+    ASSERT_NEAR(glm::length(world_anchor_b - world_anchor_a), 0.0f, 0.02f);
+
+    // Axis constraint held: the door didn't tip out of its horizontal swing plane.
+    glm::vec3 world_axis_b = glm::normalize(door->orientation * j->local_axis_b);
+    ASSERT_NEAR(world_axis_b.z, 1.0f, 0.02f);
+
+    // Stopped AT the limit, not past it, and settled (not still spinning against the stop).
+    float angle = dynamics::hinge_current_angle(frame->orientation, door->orientation, j->local_axis_a, j->rest_relative_rotation);
+    ASSERT_NEAR(angle, glm::radians(90.0f), glm::radians(3.0f));
+    ASSERT_TRUE(glm::length(door->angular_velocity) < 0.05f);
+}
+
+/**
+ * A free (no limits) hinge -- a pendulum hanging from a static ceiling anchor, swinging under
+ * gravity about a horizontal (Y) axis. Confirms the point stays anchored and the axis stays
+ * aligned throughout real, sustained swinging motion (not just at rest), and that it actually
+ * DOES swing (gravity produces real torque through the joint, not a rigid lock).
+ */
+static void test_hinge_joint_free_pendulum_swings_without_drift() {
+    PhysicsWorld world; // default gravity -Z
+
+    dynamics::Body ceiling_body;
+    ceiling_body.type = dynamics::BodyType::Static;
+    ceiling_body.position = glm::vec3(0.0f);
+    dynamics::BodyId ceiling_id = world.add_body(ceiling_body);
+
+    dynamics::Body pendulum_body;
+    pendulum_body.position = glm::vec3(1.0f, 0.0f, 0.0f); // hangs out horizontally at first
+    dynamics::BodyId pendulum_id = world.add_body(pendulum_body);
+
+    dynamics::JointId joint = world.add_hinge_joint(ceiling_id, pendulum_id, glm::vec3(0.0f),
+                                                      glm::vec3(-1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f),
+                                                      glm::vec3(0.0f, 1.0f, 0.0f), /*use_limits=*/false);
+    ASSERT_TRUE(joint.is_valid());
+
+    float start_z = world.get_body(pendulum_id)->position.z;
+    float max_drift = 0.0f;
+    float min_axis_alignment = 1.0f;
+    for (int i = 0; i < 120; ++i) { // 2s -- enough to swing well away from the horizontal start
+        world.step_fixed(util::k_default_fixed_dt);
+        const dynamics::Body* ceiling = world.get_body(ceiling_id);
+        const dynamics::Body* pendulum = world.get_body(pendulum_id);
+        const dynamics::HingeJoint* j = world.get_joint(joint);
+        glm::vec3 world_anchor_a = ceiling->position + ceiling->orientation * j->local_anchor_a;
+        glm::vec3 world_anchor_b = pendulum->position + pendulum->orientation * j->local_anchor_b;
+        max_drift = std::max(max_drift, glm::length(world_anchor_b - world_anchor_a));
+
+        glm::vec3 world_axis_a = glm::normalize(ceiling->orientation * j->local_axis_a);
+        glm::vec3 world_axis_b = glm::normalize(pendulum->orientation * j->local_axis_b);
+        min_axis_alignment = std::min(min_axis_alignment, glm::dot(world_axis_a, world_axis_b));
+    }
+
+    ASSERT_TRUE(max_drift < 0.05f); // point constraint never drifted meaningfully, even mid-swing
+    ASSERT_TRUE(min_axis_alignment > 0.98f); // axes stayed close to parallel throughout (cos ~11 degrees)
+
+    // Actually swung: gravity pulled it down and away from its purely-horizontal start.
+    float end_z = world.get_body(pendulum_id)->position.z;
+    ASSERT_TRUE(end_z < start_z - 0.3f);
+}
+
+/**
+ * `min_angle == max_angle == 0` locks the hinge's one remaining DOF entirely -- a fully rigid
+ * attachment with no separate "fixed joint" implementation (see joint.h's file doc). A hard
+ * spin plus gravity torque (both trying to rotate the panel) must produce ~zero net rotation.
+ */
+static void test_hinge_joint_zero_range_limit_acts_rigid() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f, 0.0f, -9.81f));
+
+    dynamics::Body frame_body;
+    frame_body.type = dynamics::BodyType::Static;
+    frame_body.position = glm::vec3(0.0f);
+    dynamics::BodyId frame_id = world.add_body(frame_body);
+
+    dynamics::Body panel_body;
+    panel_body.position = glm::vec3(1.0f, 0.0f, 0.0f);
+    panel_body.angular_velocity = glm::vec3(0.0f, 0.0f, 5.0f); // hard spin about the (rigidly locked) hinge axis
+    dynamics::BodyId panel_id = world.add_body(panel_body);
+
+    // Hinge axis Z (spin is about the locked axis); gravity (-Z) has no torque about a
+    // vertical axis here either, so this specifically isolates whether the ANGULAR SPIN gets
+    // absorbed -- gravity is still on to confirm the point constraint holds a hanging weight too.
+    dynamics::JointId joint = world.add_hinge_joint(
+        frame_id, panel_id, glm::vec3(0.0f), glm::vec3(-1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f),
+        glm::vec3(0.0f, 0.0f, 1.0f), /*use_limits=*/true, /*min_angle=*/0.0f, /*max_angle=*/0.0f);
+    ASSERT_TRUE(joint.is_valid());
+
+    for (int i = 0; i < 120; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    const dynamics::Body* frame = world.get_body(frame_id);
+    const dynamics::Body* panel = world.get_body(panel_id);
+    const dynamics::HingeJoint* j = world.get_joint(joint);
+    float angle = dynamics::hinge_current_angle(frame->orientation, panel->orientation, j->local_axis_a, j->rest_relative_rotation);
+    ASSERT_NEAR(angle, 0.0f, glm::radians(3.0f));
+
+    // Point constraint still holds the panel up against gravity.
+    glm::vec3 world_anchor_a = frame->position + frame->orientation * j->local_anchor_a;
+    glm::vec3 world_anchor_b = panel->position + panel->orientation * j->local_anchor_b;
+    ASSERT_NEAR(glm::length(world_anchor_b - world_anchor_a), 0.0f, 0.05f);
+}
+
+/**
+ * Two DYNAMIC bodies joined only by a hinge (no contact between them) must island-unite for
+ * sleep purposes, same as two bodies touching via a contact manifold already do -- see
+ * update_islands_and_sleep()'s doc. Body A starts completely at rest (would satisfy its OWN
+ * sleep_timer within sleep_time on its own if NOT unioned with B); body B starts with a fast
+ * spin that easily outlasts sleep_time. If the union-find correctly includes joint pairs, A
+ * must NOT have gone to sleep by the time B is still clearly moving.
+ */
+static void test_hinge_joint_islands_dynamic_pair_for_sleep() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f));
+
+    dynamics::Body a_body;
+    a_body.position = glm::vec3(0.0f);
+    dynamics::BodyId a_id = world.add_body(a_body); // completely at rest from frame 0
+
+    dynamics::Body b_body;
+    b_body.position = glm::vec3(1.0f, 0.0f, 0.0f);
+    b_body.angular_velocity = glm::vec3(0.0f, 0.0f, 2.0f); // spins about the hinge axis, only
+                                                             // damped by angular_drag -- stays
+                                                             // well above sleep_angular for a
+                                                             // long time (slow exponential decay)
+    dynamics::BodyId b_id = world.add_body(b_body);
+
+    dynamics::JointId joint = world.add_hinge_joint(a_id, b_id, glm::vec3(0.0f), glm::vec3(-1.0f, 0.0f, 0.0f),
+                                                      glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 0.0f, 1.0f),
+                                                      /*use_limits=*/false);
+    ASSERT_TRUE(joint.is_valid());
+
+    // sleep_time defaults to 0.5s (30 steps) -- run well past that. B is still clearly moving
+    // (angular_drag's exponential decay from 2.0 rad/s takes far longer than this to reach
+    // sleep_angular=0.02), so if A were sleeping independently it would have slept by now.
+    for (int i = 0; i < 90; ++i) world.step_fixed(util::k_default_fixed_dt); // 1.5s
+    ASSERT_TRUE(glm::length(world.get_body(b_id)->angular_velocity) > 0.5f); // confirm B really is still moving
+    ASSERT_TRUE(world.get_body(a_id)->awake); // A must still be awake -- gated by B via the shared island
+}
+
+/**
+ * @brief The determinism argument PhysicsWorld::discover_pairs_()/narrowphase_()'s docs make:
+ *        a job-parallel run must produce a bit-identical world_state_hash() to a fully serial
+ *        run of the same scene. Forces the parallel path on every stage (parallel_threshold(1))
+ *        so even this modest body count exercises it, rather than silently falling back serial.
+ */
+static void test_job_parallel_stepping_matches_serial_determinism() {
+    auto build_and_run = [](coopa::job::JobEngine* jobs) {
+        PhysicsWorld world;
+        world.set_parallel_threshold(1);
+        world.set_job_engine(jobs);
+
+        add_static_ground(world);
+
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> xy(-3.0f, 3.0f);
+        std::uniform_real_distribution<float> zh(2.0f, 8.0f);
+        for (int i = 0; i < 80; ++i) {
+            dynamics::Body b;
+            b.type = dynamics::BodyType::Dynamic;
+            b.position = glm::vec3(xy(rng), xy(rng), zh(rng));
+            b.mass = 1.0f;
+            b.inv_mass = 1.0f;
+            b.inv_inertia_local = dynamics::sphere_inverse_inertia(0.4f, 1.0f);
+            world.add_body(b, collision::Shape::make_sphere(0.4f));
+        }
+
+        for (int i = 0; i < 240; ++i) world.step_fixed(util::k_default_fixed_dt);
+        return world.world_state_hash();
+    };
+
+    uint64_t serial_hash = build_and_run(nullptr);
+
+    coopa::job::JobEngine jobs(4);
+    uint64_t parallel_hash = build_and_run(&jobs);
+
+    ASSERT_TRUE(serial_hash == parallel_hash);
+}
+
 int main() {
     RUN_TEST(test_ray_aabb_hand_computed);
     RUN_TEST(test_closest_points_segment_segment_parallel);
@@ -1001,10 +2186,18 @@ int main() {
     RUN_TEST(test_static_and_kinematic_pairs_generate_no_manifolds);
     RUN_TEST(test_kinematic_platform_pushes_resting_body);
     RUN_TEST(test_kinematic_wake_rule_wakes_sleeping_body_on_moving_platform);
+    RUN_TEST(test_kinematic_spin_wakes_sleeping_body_it_sweeps_into);
+    RUN_TEST(test_sleeping_body_unaffected_by_awake_neighbors_impulse);
+    RUN_TEST(test_body_impulse_and_angular_impulse_change_velocity_immediately);
+    RUN_TEST(test_body_force_and_impulse_apis_wake_a_sleeping_body);
     RUN_TEST(test_on_substep_signal_and_deferred_destroy);
 
     RUN_TEST(test_sat_box_box_face_contact_known_penetration);
     RUN_TEST(test_sat_box_box_edge_contact_single_point);
+    RUN_TEST(test_tumbled_box_settles_flat_not_balanced_on_edge);
+    RUN_TEST(test_fast_box_does_not_tunnel_through_thin_wall);
+    RUN_TEST(test_diag_transform_roundtrip_noise);
+    RUN_TEST(test_three_box_concrete_stack_settles_flat);
     RUN_TEST(test_ten_box_stack_stable);
     RUN_TEST(test_friction_slope_static_vs_sliding);
     RUN_TEST(test_mass_ratio_100_to_1_stable);
@@ -1017,14 +2210,36 @@ int main() {
     RUN_TEST(test_raycast_hits_box_with_exact_t_point_and_normal);
     RUN_TEST(test_raycast_all_returns_hits_sorted_by_distance);
     RUN_TEST(test_overlap_sphere_and_overlap_box_find_expected_bodies);
+    RUN_TEST(test_overlap_capsule_finds_expected_bodies);
+    RUN_TEST(test_raycast_any_finds_a_hit_without_necessarily_the_closest);
+    RUN_TEST(test_query_include_triggers_flag_excludes_trigger_colliders);
+    RUN_TEST(test_box_cast_and_capsule_cast_hit_known_target);
     RUN_TEST(test_trigger_enter_stay_exit_fires_correct_sequence);
     RUN_TEST(test_debug_draw_emits_collider_bvh_and_contact_lines);
+    RUN_TEST(test_shape_local_rotation_reorients_capsule_consistently);
 
     RUN_TEST(test_aabb_tree_matches_brute_force);
     RUN_TEST(test_layer_matrix_blocks_pair_before_narrowphase);
 
     RUN_TEST(test_headless_scene_binding_creates_bodies_and_settles);
     RUN_TEST(test_scene_binding_runtime_parameter_change_rides_revision);
+    RUN_TEST(test_scene_binding_rigidbody_runtime_property_changes_take_effect);
+    RUN_TEST(test_rigidbody_center_of_mass_and_inertia_override_fold_into_body);
+    RUN_TEST(test_rigidbody_component_sleep_wake_and_set_velocity_wakes);
+    RUN_TEST(test_scene_binding_box_collider_center_offset_settles_flat);
+    RUN_TEST(test_compound_collider_two_children_one_rigidbody);
+    RUN_TEST(test_scene_binding_hinge_joint_door_resolves_and_swings_to_limit);
+    RUN_TEST(test_collision_event_carries_contact_payload_and_clears_on_exit);
+    RUN_TEST(test_scene_query_wrappers_resolve_collider_and_object);
+
+    RUN_TEST(test_physics_material_combine_modes);
+    RUN_TEST(test_collider_material_resolution_prefers_asset_over_inline);
+    RUN_TEST(test_parse_physics_settings_and_apply_to_world);
+    RUN_TEST(test_hinge_joint_door_swings_and_stops_at_limit);
+    RUN_TEST(test_hinge_joint_free_pendulum_swings_without_drift);
+    RUN_TEST(test_hinge_joint_zero_range_limit_acts_rigid);
+    RUN_TEST(test_hinge_joint_islands_dynamic_pair_for_sleep);
+    RUN_TEST(test_job_parallel_stepping_matches_serial_determinism);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Tests run: " << g_tests_run << ", Failed: " << g_tests_failed << std::endl;

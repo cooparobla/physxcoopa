@@ -27,8 +27,10 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/constants.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace coopa {
@@ -44,6 +46,11 @@ struct RaycastHit {
     glm::vec3 normal{0.0f, 0.0f, 1.0f};
     float distance = 0.0f;
     dynamics::BodyId body;
+    /** @brief Which of `body`'s shape slots was actually hit (PhysicsWorld::shape_at()'s
+     *         return type -- a raw slot index, k_invalid_shape by default). For a compound
+     *         body (more than one shape), this is what lets a caller resolve the exact CHILD
+     *         collider touched, not just the body -- see PhysicsSystem::collider_for_shape_(). */
+    uint32_t shape_index = 0xFFFFFFFFu;
 };
 
 /**
@@ -65,11 +72,16 @@ inline bool raycast_shape(const geometry::Ray& ray, const collision::Shape& shap
         case collision::ShapeType::TriangleMesh: {
             if (!shape.mesh) return false;
             glm::vec3 mesh_center = pos + rot * shape.local_center;
-            glm::quat inv_rot = glm::inverse(rot);
+            glm::quat mesh_rot = rot * shape.local_rotation;
+            glm::quat inv_rot = glm::inverse(mesh_rot);
+            // Dividing both origin and direction by mesh_scale keeps the local-space `t`
+            // parameter numerically equal to the world-space one -- see shape.h's mesh_scale
+            // doc -- so best_t below needs no further rescaling.
+            float inv_scale = shape.mesh_scale > 1e-8f ? 1.0f / shape.mesh_scale : 1.0f;
 
             geometry::Ray local_ray;
-            local_ray.origin = inv_rot * (ray.origin - mesh_center);
-            local_ray.direction = inv_rot * ray.direction;
+            local_ray.origin = inv_rot * (ray.origin - mesh_center) * inv_scale;
+            local_ray.direction = inv_rot * ray.direction * inv_scale;
             local_ray.max_distance = ray.max_distance;
 
             bool found = false;
@@ -87,7 +99,7 @@ inline bool raycast_shape(const geometry::Ray& ray, const collision::Shape& shap
             });
             if (!found) return false;
             t = best_t;
-            normal = glm::normalize(rot * shape.mesh->normals()[best_tri]);
+            normal = glm::normalize(mesh_rot * shape.mesh->normals()[best_tri]);
             return true;
         }
     }
@@ -136,6 +148,54 @@ inline bool shape_overlaps_obb(const collision::Shape& shape, const glm::vec3& p
             collision::Shape box_shape = collision::Shape::make_box(query.half_extents);
             collision::ContactManifold m;
             return collision::generate_mesh_contacts(box_shape, query.center, query.orientation, shape, pos, rot, m);
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Rotation mapping world +Z onto unit vector `dir` -- the shortest arc between them.
+ *        Used only to pose a capsule::make_capsule() Shape (always local-Z-axis, see
+ *        shape.h's capsule_axis doc) along an arbitrary world-space direction via the `rot`
+ *        parameter every world_*() helper and generate_mesh_contacts() already take, rather
+ *        than needing a per-shape local rotation field (see shape_overlaps_capsule()'s
+ *        TriangleMesh case, the only caller).
+ */
+inline glm::quat quat_from_z_to(const glm::vec3& dir) {
+    const glm::vec3 z(0.0f, 0.0f, 1.0f);
+    float d = glm::dot(z, dir);
+    if (d > 1.0f - 1e-6f) return glm::quat(1.0f, 0.0f, 0.0f, 0.0f); // already aligned
+    if (d < -1.0f + 1e-6f) { // exactly opposite -- any perpendicular axis gives a valid 180 flip
+        glm::vec3 axis = std::abs(z.x) < 0.9f ? glm::cross(z, glm::vec3(1.0f, 0.0f, 0.0f))
+                                               : glm::cross(z, glm::vec3(0.0f, 1.0f, 0.0f));
+        return glm::angleAxis(glm::pi<float>(), glm::normalize(axis));
+    }
+    glm::vec3 axis = glm::normalize(glm::cross(z, dir));
+    return glm::angleAxis(std::acos(glm::clamp(d, -1.0f, 1.0f)), axis);
+}
+
+/** @brief True if `shape` (at `pos`/`rot`) overlaps `query`, a world-space capsule. */
+inline bool shape_overlaps_capsule(const collision::Shape& shape, const glm::vec3& pos, const glm::quat& rot,
+                                    const geometry::Capsule& query) {
+    glm::vec3 n, p;
+    float pen;
+    switch (shape.type) {
+        case collision::ShapeType::Sphere:
+            return collision::capsule_vs_sphere(query, collision::world_sphere(shape, pos, rot), n, pen, p);
+        case collision::ShapeType::Box: {
+            collision::ContactManifold m;
+            return collision::capsule_vs_box(query, collision::world_obb(shape, pos, rot), m);
+        }
+        case collision::ShapeType::Capsule:
+            return collision::capsule_vs_capsule(query, collision::world_capsule(shape, pos, rot), n, pen, p);
+        case collision::ShapeType::TriangleMesh: {
+            glm::vec3 seg = query.b - query.a;
+            float len = glm::length(seg);
+            glm::quat cap_rot = len > 1e-8f ? quat_from_z_to(seg / len) : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            glm::vec3 cap_pos = (query.a + query.b) * 0.5f;
+            collision::Shape capsule_shape = collision::Shape::make_capsule(query.radius, len * 0.5f);
+            collision::ContactManifold m;
+            return collision::generate_mesh_contacts(capsule_shape, cap_pos, cap_rot, shape, pos, rot, m);
         }
     }
     return false;

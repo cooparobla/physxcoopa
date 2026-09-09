@@ -16,6 +16,7 @@
 
 #include <coopa/asset/asset_handle.h>
 
+#include <algorithm>
 #include <string>
 
 namespace coopa {
@@ -42,9 +43,13 @@ public:
     void set_convex(bool v) { convex_ = v; bump_revision_(); }
 
     collision::Shape make_shape(const glm::vec3& world_scale) const override {
-        (void)world_scale; // mesh scaling is a Phase 8 concern -- see file doc
         if (!mesh_.is_loaded()) return collision::Shape{};
-        return collision::Shape::make_mesh(mesh_.get(), center());
+        // Max component of world scale, same rule as Sphere/Capsule -- see Shape::mesh_scale's
+        // doc for why v1 supports uniform mesh scale only.
+        float scale = std::max({world_scale.x, world_scale.y, world_scale.z});
+        collision::Shape s = collision::Shape::make_mesh(mesh_.get(), center() * world_scale);
+        s.mesh_scale = scale;
+        return s;
     }
 
 private:

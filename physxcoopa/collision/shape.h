@@ -49,8 +49,21 @@ struct Shape {
     bool enabled = false;
     ShapeType type = ShapeType::Sphere;
 
-    /** @brief Local offset from the body's origin (Unity's collider `center`), pre-rotation. */
+    /** @brief Local offset from the body's origin (Unity's collider `center`), pre-rotation:
+     *         `local_center` is positioned by the BODY's own rotation alone (standard
+     *         hierarchical-transform convention -- world_pos = pos + rot * local_center), same
+     *         as before this field's sibling below existed. */
     glm::vec3 local_center{0.0f};
+
+    /** @brief The shape's own orientation relative to the body, composed ON TOP of the body's
+     *         rotation for anything that orients the shape itself (world_rot = rot *
+     *         local_rotation) -- but never for local_center's placement above, which uses `rot`
+     *         alone. Identity by default, a no-op for every shape that existed before this field
+     *         did (in particular Sphere, which is rotation-invariant and never reads this at
+     *         all). Lets a single non-compound collider's shape sit at an angle relative to its
+     *         own Transform (e.g. a capsule authored diagonally), and is the primitive compound
+     *         colliders need for each child shape's own local orientation. */
+    glm::quat local_rotation{1.0f, 0.0f, 0.0f, 0.0f};
 
     // --- Sphere ---
     float radius = 0.5f;
@@ -66,8 +79,13 @@ struct Shape {
     // --- TriangleMesh ---
     const geometry::TriangleMesh* mesh = nullptr; /**< Non-owning; lifetime owned by the
                                                         MeshCollider's AssetHandle (Phase 8). */
+    /** @brief Uniform scale applied to the mesh's local-space vertices (MeshCollider takes the
+     *         max component of the owning object's world scale, matching Sphere/Capsule's
+     *         rule -- a mesh authored for one scale doesn't stay proportionally correct under
+     *         non-uniform scale without per-vertex scaling, which v1 doesn't support). */
+    float mesh_scale = 1.0f;
 
-    dynamics::PhysicsMaterial* material = nullptr; /**< nullptr -> PhysicsMaterial::default_material(). */
+    const dynamics::PhysicsMaterial* material = nullptr; /**< nullptr -> PhysicsMaterial::default_material(). */
     bool is_trigger = false;
     uint32_t layer = 0;
 
@@ -128,7 +146,7 @@ inline geometry::OBB world_obb(const Shape& s, const glm::vec3& pos, const glm::
     geometry::OBB out;
     out.center = pos + rot * s.local_center;
     out.half_extents = s.half_extents;
-    out.orientation = rot;
+    out.orientation = rot * s.local_rotation;
     return out;
 }
 
@@ -136,7 +154,7 @@ inline geometry::OBB world_obb(const Shape& s, const glm::vec3& pos, const glm::
 inline geometry::Capsule world_capsule(const Shape& s, const glm::vec3& pos, const glm::quat& rot) {
     glm::vec3 axis_local(0.0f);
     axis_local[s.capsule_axis] = 1.0f;
-    glm::vec3 axis_world = rot * axis_local;
+    glm::vec3 axis_world = (rot * s.local_rotation) * axis_local;
     glm::vec3 center = pos + rot * s.local_center;
 
     geometry::Capsule out;
@@ -174,7 +192,7 @@ inline geometry::AABB world_bounds(const Shape& s, const glm::vec3& pos, const g
         }
         case ShapeType::TriangleMesh: {
             if (!s.mesh) return geometry::AABB{};
-            glm::mat4 m = glm::mat4_cast(rot);
+            glm::mat4 m(glm::mat3_cast(rot * s.local_rotation) * s.mesh_scale);
             m[3] = glm::vec4(pos + rot * s.local_center, 1.0f);
             return s.mesh->bounds().transform(m);
         }

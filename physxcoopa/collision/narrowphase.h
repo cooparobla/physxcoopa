@@ -100,15 +100,82 @@ inline bool sphere_vs_box(const geometry::Sphere& sphere, const geometry::OBB& b
 }
 
 /**
+ * @brief Sphere-vs-sphere signed-separation query for the CCD speculative-contact path --
+ *        companion to sphere_vs_sphere() above, which only ever reports an overlapping pair.
+ *        Trivial for spheres (their surfaces ARE their distance field), unlike Box-Box's SAT
+ *        extension in collision/sat.h.
+ *
+ * @return False if the spheres are already overlapping (that's sphere_vs_sphere()'s case) or
+ *         degenerate (coincident centers).
+ */
+inline bool sphere_vs_sphere_separation(const geometry::Sphere& a, const geometry::Sphere& b,
+                                         glm::vec3& normal, float& separation, glm::vec3& point) {
+    glm::vec3 delta = b.center - a.center;
+    float dist = glm::length(delta);
+    float radius_sum = a.radius + b.radius;
+    if (dist <= radius_sum || dist < util::k_epsilon) return false;
+    normal = delta / dist;
+    separation = dist - radius_sum;
+    point = a.center + normal * a.radius;
+    return true;
+}
+
+/**
+ * @brief Sphere-vs-box signed-separation query for the CCD speculative-contact path --
+ *        companion to sphere_vs_box() above. Only handles the sphere-center-outside-the-box
+ *        case (sphere_vs_box()'s own `!inside` branch) -- the inside case always means
+ *        overlapping already, never speculative.
+ *
+ * @return False if the sphere is already overlapping the box (inside, or within `radius` of the
+ *         surface -- that's sphere_vs_box()'s case).
+ */
+inline bool sphere_vs_box_separation(const geometry::Sphere& sphere, const geometry::OBB& box,
+                                      glm::vec3& normal, float& separation, glm::vec3& point) {
+    glm::vec3 ax, ay, az;
+    box.axes(ax, ay, az);
+    glm::vec3 d = sphere.center - box.center;
+    glm::vec3 local(glm::dot(d, ax), glm::dot(d, ay), glm::dot(d, az));
+
+    bool inside = std::abs(local.x) <= box.half_extents.x && std::abs(local.y) <= box.half_extents.y &&
+                  std::abs(local.z) <= box.half_extents.z;
+    if (inside) return false;
+
+    glm::vec3 closest_local = glm::clamp(local, -box.half_extents, box.half_extents);
+    glm::vec3 diff = local - closest_local;
+    float dist = glm::length(diff);
+    if (dist <= sphere.radius) return false;
+
+    separation = dist - sphere.radius;
+    glm::vec3 normal_local = diff / dist;
+    normal = ax * normal_local.x + ay * normal_local.y + az * normal_local.z;
+    point = box.center + ax * closest_local.x + ay * closest_local.y + az * closest_local.z;
+    return true;
+}
+
+/**
  * @brief Generates (or refuses) a contact manifold for one pair of bodies, dispatching on
  *        shape type. `out` is fully overwritten; `out.a`/`out.b` are set even on failure.
  *
- * @return True if the shapes overlap and `out` now holds a valid manifold.
+ * @param allow_speculative When true, a not-yet-touching-but-close pair still produces a
+ *        SINGLE-point speculative manifold (ContactManifold::add_speculative_point(), see its
+ *        doc) instead of returning false, for Sphere-Sphere, Sphere-Box, Box-Sphere, and Box-Box
+ *        pairs -- the pairs cheap enough to extend for v1 (Box-Box already needed a real
+ *        extension to collision/sat.h; the sphere ones are near-trivial distance math on top of
+ *        what sphere_vs_sphere()/sphere_vs_box() above already compute). Capsule-involving and
+ *        TriangleMesh pairs are NOT extended (default false is unaffected either way) -- meshes
+ *        are static-only already and a genuine mesh CCD lift is deferred (same precedent as
+ *        sphere_cast()'s own documented mesh-inflation gap in world.h); capsule speculative
+ *        support is a reasonable, tractable follow-up (closest_points_segment_obb/
+ *        closest_points_segment_segment in collision/segment.h are already distance-based) but
+ *        wasn't done in this pass. Default false: every pre-existing call site is unaffected.
+ *
+ * @return True if the shapes overlap (or, with `allow_speculative`, are merely close and
+ *         closing fast for a supported pair) and `out` now holds a valid manifold.
  */
 inline bool generate_contacts(
     dynamics::BodyId id_a, const Shape& shape_a, const glm::vec3& pos_a, const glm::quat& rot_a,
     dynamics::BodyId id_b, const Shape& shape_b, const glm::vec3& pos_b, const glm::quat& rot_b,
-    ContactManifold& out) {
+    ContactManifold& out, bool allow_speculative = false) {
 
     out = ContactManifold{};
     out.a = id_a;
@@ -125,6 +192,10 @@ inline bool generate_contacts(
             out.normal = n;
             out.add_point(p, pen, 0);
             hit = true;
+        } else if (allow_speculative && sphere_vs_sphere_separation(A, B, n, pen, p)) {
+            out.normal = n;
+            out.add_speculative_point(p, pen, 0);
+            hit = true;
         }
     } else if (shape_a.type == ShapeType::Sphere && shape_b.type == ShapeType::Box) {
         geometry::Sphere A = world_sphere(shape_a, pos_a, rot_a);
@@ -134,6 +205,10 @@ inline bool generate_contacts(
         if (sphere_vs_box(A, B, n_box_to_sphere, pen, p)) {
             out.normal = -n_box_to_sphere; // A(sphere) -> B(box) is the opposite of box->sphere
             out.add_point(p, pen, 0);
+            hit = true;
+        } else if (allow_speculative && sphere_vs_box_separation(A, B, n_box_to_sphere, pen, p)) {
+            out.normal = -n_box_to_sphere;
+            out.add_speculative_point(p, pen, 0);
             hit = true;
         }
     } else if (shape_a.type == ShapeType::Box && shape_b.type == ShapeType::Sphere) {
@@ -145,11 +220,15 @@ inline bool generate_contacts(
             out.normal = n_box_to_sphere; // A(box) -> B(sphere) is box->sphere directly
             out.add_point(p, pen, 0);
             hit = true;
+        } else if (allow_speculative && sphere_vs_box_separation(B, A, n_box_to_sphere, pen, p)) {
+            out.normal = n_box_to_sphere;
+            out.add_speculative_point(p, pen, 0);
+            hit = true;
         }
     } else if (shape_a.type == ShapeType::Box && shape_b.type == ShapeType::Box) {
         geometry::OBB A = world_obb(shape_a, pos_a, rot_a);
         geometry::OBB B = world_obb(shape_b, pos_b, rot_b);
-        hit = generate_box_box_contacts(A, B, out); // fills normal + points; a/b set below
+        hit = generate_box_box_contacts(A, B, out, allow_speculative); // fills normal + points; a/b set below
     } else if (shape_a.type == ShapeType::Capsule && shape_b.type == ShapeType::Capsule) {
         geometry::Capsule A = world_capsule(shape_a, pos_a, rot_a);
         geometry::Capsule B = world_capsule(shape_b, pos_b, rot_b);

@@ -26,6 +26,7 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace coopa {
@@ -53,6 +54,32 @@ public:
     dynamics::Interpolation interpolation = dynamics::Interpolation::Interpolate;
     uint32_t constraints = dynamics::kConstraintNone;
 
+    /** @brief Initial linear/angular velocity, applied once when PhysicsSystem's reconcile
+     *         pass creates this Rigidbody's body (Dynamic bodies only -- a Kinematic body's
+     *         velocity is always derived from its transform's frame-to-frame delta instead,
+     *         see PhysicsSystem::sync_transforms_in_()). Ignored after bind; use set_velocity()
+     *         for runtime changes. */
+    glm::vec3 initial_velocity{0.0f};
+    glm::vec3 initial_angular_velocity{0.0f};
+
+    /** @brief Local-space offset from the collider's own center (Collider::center(), already
+     *         folded into body.position -- see PhysicsSystem::create_body_for_()'s doc) to the
+     *         body's true center of mass, applied ON TOP of that folding at bind time. Unset by
+     *         default (no override -- the body's center of mass is exactly the collider's
+     *         center, as it always was before this field existed). Matches Unity's
+     *         Rigidbody.centerOfMass. Creation-time only, like initial_velocity above -- not
+     *         reconciled by PhysicsSystem's per-frame runtime-property pass. */
+    std::optional<glm::vec3> center_of_mass_override;
+
+    /** @brief Diagonal local-space inverse inertia tensor to use instead of the one
+     *         PhysicsSystem::create_body_for_() would otherwise derive analytically from the
+     *         collider's shape (dynamics::inertia_for_shape()). Matches Unity's
+     *         Rigidbody.inertiaTensor, with the same INVERSE convention Body::inv_inertia_local
+     *         already uses everywhere else in this engine (not Unity's own non-inverse
+     *         convention -- invert a value copied from Unity before setting this). Creation-time
+     *         only, like center_of_mass_override above. */
+    std::optional<glm::vec3> inertia_tensor_override;
+
     /** @brief Called only by PhysicsSystem's reconcile pass. */
     void set_body_binding(PhysicsWorld* world, dynamics::BodyId id) {
         world_ = world;
@@ -71,20 +98,58 @@ public:
         if (dynamics::Body* b = body_()) b->add_force_at_position(f, world_point);
     }
 
+    /** @brief Instantaneous world-space impulse at the center of mass -- see
+     *         Body::apply_impulse()'s doc for how this differs from add_force(). */
+    void add_impulse(const glm::vec3& impulse) {
+        if (dynamics::Body* b = body_()) b->apply_impulse(impulse);
+    }
+    /** @brief Instantaneous world-space angular impulse -- see Body::apply_angular_impulse(). */
+    void add_torque_impulse(const glm::vec3& angular_impulse) {
+        if (dynamics::Body* b = body_()) b->apply_angular_impulse(angular_impulse);
+    }
+
     glm::vec3 velocity() const {
         const dynamics::Body* b = body_();
         return b ? b->linear_velocity : glm::vec3(0.0f);
     }
+    /** @brief Wakes a sleeping Dynamic body, same reasoning as Body::add_force()'s doc -- an
+     *         explicit velocity write is exactly the kind of script-driven change a sleeping
+     *         body should react to, not silently ignore. */
     void set_velocity(const glm::vec3& v) {
-        if (dynamics::Body* b = body_()) b->linear_velocity = v;
+        if (dynamics::Body* b = body_()) {
+            b->linear_velocity = v;
+            if (b->type == dynamics::BodyType::Dynamic) b->wake();
+        }
     }
 
     glm::vec3 angular_velocity() const {
         const dynamics::Body* b = body_();
         return b ? b->angular_velocity : glm::vec3(0.0f);
     }
+    /** @brief See set_velocity()'s doc. */
     void set_angular_velocity(const glm::vec3& w) {
-        if (dynamics::Body* b = body_()) b->angular_velocity = w;
+        if (dynamics::Body* b = body_()) {
+            b->angular_velocity = w;
+            if (b->type == dynamics::BodyType::Dynamic) b->wake();
+        }
+    }
+
+    /** @brief True if this Rigidbody's body is currently asleep (skipped by the solver/
+     *         integrator until woken -- see Body::awake's doc). False if unbound. */
+    bool is_sleeping() const {
+        const dynamics::Body* b = body_();
+        return b && !b->awake;
+    }
+    /** @brief Wakes the body immediately -- see Body::wake(). No-op if unbound. */
+    void wake() {
+        if (dynamics::Body* b = body_()) b->wake();
+    }
+    /** @brief Puts the body to sleep immediately -- see Body::sleep(). No-op if unbound. Note
+     *         this can be immediately undone the next substep if the body's island still has an
+     *         awake member touching it (same as every other sleep/wake rule in this engine --
+     *         see update_islands_and_sleep()'s doc in dynamics/solver.h). */
+    void sleep() {
+        if (dynamics::Body* b = body_()) b->sleep();
     }
 
     /**

@@ -14,14 +14,18 @@
 
 #include <coopa/scene/component.h>
 #include <coopa/event/signal.h>
+#include <coopa/asset/asset_handle.h>
 
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <memory>
 
 namespace coopa {
 namespace physx {
 namespace components {
+
+struct Collision; // collision.h -- only ever named by reference in a Signal below.
 
 /**
  * @class Collider
@@ -40,12 +44,13 @@ namespace components {
  */
 class Collider : public coopa::scene::Component {
 public:
-    /** @brief Fired when this trigger-collider-free collider starts touching another. */
-    coopa::event::Signal<Collider&, Collider&> on_collision_enter;
+    /** @brief Fired when this trigger-collider-free collider starts touching another --
+     *         carries contact geometry/impulse (see components/collision.h's Collision). */
+    coopa::event::Signal<Collider&, const Collision&> on_collision_enter;
     /** @brief Fired every step this collider remains touching another. */
-    coopa::event::Signal<Collider&, Collider&> on_collision_stay;
-    /** @brief Fired when this collider stops touching another. */
-    coopa::event::Signal<Collider&, Collider&> on_collision_exit;
+    coopa::event::Signal<Collider&, const Collision&> on_collision_stay;
+    /** @brief Fired when this collider stops touching another -- Collision::contact_count == 0. */
+    coopa::event::Signal<Collider&, const Collision&> on_collision_exit;
     /** @brief Fired when a trigger collider starts overlapping another. */
     coopa::event::Signal<Collider&, Collider&> on_trigger_enter;
     /** @brief Fired every step a trigger collider remains overlapping another. */
@@ -58,14 +63,44 @@ public:
     bool is_trigger() const { return is_trigger_; }
     void set_is_trigger(bool v) { is_trigger_ = v; ++revision_; }
 
+    /** @brief Unity's Collider.enabled -- false makes PhysicsSystem hand the body a disabled
+     *         Shape (participates in dynamics, never in collision) without destroying the
+     *         body/binding the way removing the Collider component entirely would. */
+    bool is_enabled() const { return enabled_; }
+    void set_enabled(bool v) { enabled_ = v; ++revision_; }
+
     uint32_t layer() const { return layer_; }
     void set_layer(uint32_t v) { layer_ = v; ++revision_; }
 
     const glm::vec3& center() const { return center_; }
     void set_center(const glm::vec3& v) { center_ = v; ++revision_; }
 
-    dynamics::PhysicsMaterial* material() const { return material_; }
-    void set_material(dynamics::PhysicsMaterial* m) { material_ = m; ++revision_; }
+    /**
+     * @brief The effective material for this collider, resolved asset-first: an
+     *        AssetManager-backed material set via set_material_asset() (YAML `material: <name>`)
+     *        takes priority over one set via set_material() (YAML inline `material: {...}` or a
+     *        direct C++ call); nullptr (PhysicsMaterial::default_material()) if neither is set,
+     *        or the asset handle hasn't finished loading yet.
+     */
+    const dynamics::PhysicsMaterial* material() const {
+        if (material_asset_.is_valid() && material_asset_.is_loaded()) return material_asset_.get();
+        if (inline_material_) return inline_material_.get();
+        return nullptr;
+    }
+
+    /** @brief Points this collider at an AssetManager-owned, shareable PhysicsMaterial. */
+    void set_material_asset(coopa::asset::AssetHandle<dynamics::PhysicsMaterial> handle) {
+        material_asset_ = std::move(handle);
+        ++revision_;
+    }
+    const coopa::asset::AssetHandle<dynamics::PhysicsMaterial>& material_asset() const { return material_asset_; }
+
+    /** @brief Sets an inline (not AssetManager-tracked) material -- from a YAML inline mapping
+     *         or direct C++ code. Ignored while a valid material_asset() is set. */
+    void set_material(std::shared_ptr<const dynamics::PhysicsMaterial> m) {
+        inline_material_ = std::move(m);
+        ++revision_;
+    }
 
     /** @brief Bumped by every setter above (and by a subclass's own shape-parameter setters). */
     uint32_t revision() const { return revision_; }
@@ -93,9 +128,11 @@ protected:
 
 private:
     bool is_trigger_ = false;
+    bool enabled_ = true;
     uint32_t layer_ = 0;
     glm::vec3 center_{0.0f};
-    dynamics::PhysicsMaterial* material_ = nullptr;
+    coopa::asset::AssetHandle<dynamics::PhysicsMaterial> material_asset_;
+    std::shared_ptr<const dynamics::PhysicsMaterial> inline_material_;
 
     uint32_t revision_ = 0;
     dynamics::BodyId body_id_;
