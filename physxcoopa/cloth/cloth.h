@@ -142,20 +142,20 @@ struct ClothAnchor {
     dynamics::BodyId body;              /**< Body to follow; invalid/stale means a static pin. */
     glm::vec3 local_position{0.0f};     /**< Pin point in `body`'s local frame. */
 
-    /** @brief This substep's resolved world target, written by PhysicsWorld before the solve.
+    /** @brief This frame's resolved world target, written by PhysicsWorld before the solve.
      *
      *  Resolving the body pose OUTSIDE the solver is what keeps cloth_solver.h free of any
-     *  PhysicsWorld dependency -- and it is resolved once per physics substep rather than once
-     *  per cloth substep because the rigid state is frozen for the whole of it anyway (cloth runs
-     *  after the rigid integration; see PhysicsWorld::step_fixed). Doubles as the static-pin
-     *  position when `body` is invalid. */
+     *  PhysicsWorld dependency -- and it is resolved once per FRAME rather than once per cloth
+     *  substep because the rigid state is frozen for the whole of it anyway (cloth runs after the
+     *  frame's rigid substeps; see PhysicsWorld::step_cloths_). Doubles as the static-pin position
+     *  when `body` is invalid. */
     glm::vec3 world_position{0.0f};
 
-    /** @brief The previous substep's target, which the solver lerps FROM across its cloth
-     *         substeps. Without it a fast-moving anchor body would yank its particles in one
-     *         1/60 s jump at the top of the first cloth substep and then hold still for the other
-     *         three, which the distance constraints turn into a visible whip-crack down the
-     *         sheet. Lerping spreads that motion evenly, at no cost. */
+    /** @brief The previous frame's target, which the solver lerps FROM across its cloth substeps.
+     *         Without it a fast-moving anchor body would yank its particles in one whole-frame
+     *         jump at the top of the first cloth substep and then hold still for the rest, which
+     *         the distance constraints turn into a visible whip-crack down the sheet. Lerping
+     *         spreads that motion evenly, at no cost. */
     glm::vec3 prev_world_position{0.0f};
 };
 
@@ -277,8 +277,9 @@ struct ConstraintBatch {
  * @brief A complete cloth sheet: particles, constraints, anchors, render topology and tunables.
  *
  * Owned by PhysicsWorld in a generational slot array (see PhysicsWorld::add_cloth) and stepped by
- * PhysicsWorld::step_fixed() after the rigid solve, so each substep's collisions are resolved
- * against the bodies' FINAL poses for that substep rather than their poses one substep stale.
+ * PhysicsWorld::step() once per FRAME, after that frame's rigid substeps -- so collisions are
+ * resolved against the bodies' final poses for the frame, which are also the poses that frame
+ * draws. See PhysicsWorld::step_cloths_() for why the frame clock rather than the substep grid.
  */
 struct Cloth {
     std::vector<ClothParticle> particles;  /**< Point masses, row-major for a grid sheet. */

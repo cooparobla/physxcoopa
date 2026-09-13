@@ -41,14 +41,29 @@ interpenetration costs far more than a fraction of a millimetre of constraint vi
 collision is the sharp case -- it can displace a particle by up to half of `self_distance`, which
 would otherwise wipe out the entire `thickness` standoff with nothing left to re-project it.
 
-Colliders are projected out of the volume they **sweep** before the cloth is next solved, not just
-the pose they start at. The sweep length is `max(0, h - frame_dt)`, i.e. the collider motion the
-renderer will show *without* a fresh solve -- zero at 60 Hz (every solve is drawn exactly once) and
-zero below 60 Hz (several substeps per frame), non-zero only above it. Getting that to vanish in the
-common case is the point: a sweep applied when no un-solved frame will be drawn holds the sheet off
-a moving body for nothing, which reads as a gap and is just as wrong as clipping. A swept sphere is
-modelled exactly (it is a capsule); a swept box or capsule is probed at its start and end pose with
-the deeper correction winning; meshes are never swept, being static-only here.
+## One clock
+
+Cloth is advanced **once per frame, by that frame's `dt`** -- from `PhysicsWorld::step()`, after the
+rigid substep loop, never from inside `step_fixed()`. One-way coupling is what makes that legal: no
+rigid body ever reads a cloth, so nothing in the substep loop needs the result.
+
+It is also what keeps a sheet from jittering. A cloth is drawn straight from its particle
+positions, with none of the render interpolation a dynamic rigid body gets, while the kinematic
+bodies sheets are actually pinned to are drawn wherever the wall clock put them this frame. Solving
+on the 1/60 s grid put those two on different clocks: every time the accumulator crossed a substep
+boundary a frame ran zero substeps -- sheet frozen in world space while the body travelled a full
+frame -- and the next ran two and caught up in a jump. On the frame clock the sheet is always
+solved against the poses that frame draws, at any refresh rate.
+
+The substep *count* per frame is sized to hold the internal substep length at `fixed_dt /
+cloth_substeps` (1/240 s), so cloth cost per second and cloth feel are both frame-rate independent:
+4 substeps at 60 Hz, 2 at 144 Hz, 8 at 30 Hz.
+
+This also retired the collider **sweep** -- inflating a moving collider into the volume it would be
+drawn sweeping before the next solve. It existed only to paper over the clock mismatch above, and
+its length came from the previous frame's wall-clock `dt`, so it made the standoff on a moving
+body's leading side pulse with frame-time noise. `ClothCollider::sweep` and its exact swept-sphere
+projection remain available for a direct caller, but the engine leaves them at zero.
 
 Velocities are re-derived from positions at stage 8 rather than tracked through the projections.
 That is the defining property of PBD — every correction automatically becomes a velocity change,

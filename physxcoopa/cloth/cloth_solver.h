@@ -147,9 +147,11 @@ inline void project_distance(std::vector<ClothParticle>& particles, ClothConstra
  *                     `world_position`/`prev_world_position` resolved for this step.
  * @param colliders    Rigid shapes to collide against, snapshotted at this step's poses.
  * @param gravity      World gravity vector (m/s^2), before ClothParams::gravity_scale.
- * @param substeps     Cloth substeps within `h`; clamped to at least 1.
+ * @param substeps     Cloth substeps within `h`; clamped to at least 1. PhysicsWorld sizes this
+ *                     per call so the resulting substep length stays constant as the frame rate
+ *                     varies -- see PhysicsWorld::step_cloths_().
  * @param iterations   Constraint iterations per substep; clamped to at least 1.
- * @param h            Step length in seconds (one PhysicsWorld fixed substep).
+ * @param h            Step length in seconds (one rendered frame, as passed to PhysicsWorld::step).
  * @param scratch      Reusable working memory, resized on demand.
  * @param dispatch     Work dispatcher for the parallelisable per-particle and per-batch stages.
  */

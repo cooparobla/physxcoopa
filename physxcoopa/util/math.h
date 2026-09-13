@@ -9,6 +9,7 @@
 #include <glm/glm.hpp>
 
 #include <cmath>
+#include <cstdint>
 
 namespace coopa {
 namespace physx {
@@ -25,6 +26,15 @@ inline constexpr float k_default_fixed_dt = 1.0f / 60.0f;
 
 /** @brief Accumulator input clamp -- caps a single frame's contribution to the substep loop. */
 inline constexpr float k_max_frame_time = 0.25f;
+
+/** @brief Hard cap on the XPBD substeps one cloth frame step may run.
+ *
+ *  PhysicsWorld::step_cloths_() sizes its substep count to hold the INTERNAL substep length
+ *  constant as the frame dt varies (see its doc), so a long hitch would otherwise ask for
+ *  arbitrarily many. Past this cap the internal substep simply grows with the hitch -- the same
+ *  trade PhysicsConfig::max_substeps makes for the rigid loop, and for the same reason: a frame
+ *  that is already late must not be made later by the catch-up work. */
+inline constexpr uint32_t k_max_cloth_substeps = 16;
 
 /**
  * @brief Normalizes a vector, returning a zero vector instead of NaN when the input is

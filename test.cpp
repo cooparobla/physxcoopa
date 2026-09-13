@@ -2254,7 +2254,7 @@ static void test_cloth_free_fall_matches_analytic() {
 
     const float h = util::k_default_fixed_dt;
     const int steps = 60;
-    for (int i = 0; i < steps; ++i) world.step_fixed(h);
+    for (int i = 0; i < steps; ++i) world.step(h);
 
     const cloth::Cloth* sim = world.get_cloth(id);
     const float t = static_cast<float>(steps) * h;
@@ -2276,7 +2276,7 @@ static void test_cloth_static_anchors_hold_and_sheet_hangs() {
     cloth::build_tethers(c);
     cloth::ClothId id = world.add_cloth(std::move(c));
 
-    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt);
+    for (int i = 0; i < 300; ++i) world.step(util::k_default_fixed_dt);
 
     const cloth::Cloth* sim = world.get_cloth(id);
     for (const cloth::ClothAnchor& a : sim->anchors) {
@@ -2312,7 +2312,7 @@ static void test_cloth_drapes_over_static_sphere_without_penetrating() {
     cloth::build_tethers(c);
     cloth::ClothId id = world.add_cloth(std::move(c));
 
-    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt);
+    for (int i = 0; i < 300; ++i) world.step(util::k_default_fixed_dt);
 
     const cloth::Cloth* sim = world.get_cloth(id);
     for (const cloth::ClothParticle& p : sim->particles) {
@@ -2348,7 +2348,7 @@ static void test_cloth_tethers_cap_distance_to_anchor() {
     ASSERT_TRUE(!c.tethers.empty());
     cloth::ClothId id = world.add_cloth(std::move(c));
 
-    for (int i = 0; i < 180; ++i) world.step_fixed(util::k_default_fixed_dt);
+    for (int i = 0; i < 180; ++i) world.step(util::k_default_fixed_dt);
 
     const cloth::Cloth* sim = world.get_cloth(id);
     for (const cloth::ClothTether& t : sim->tethers) {
@@ -2377,7 +2377,7 @@ static void test_cloth_anchors_follow_moving_kinematic_body() {
     cloth::build_tethers(c);
     cloth::ClothId id = world.add_cloth(std::move(c));
 
-    for (int i = 0; i < 120; ++i) world.step_fixed(util::k_default_fixed_dt);
+    for (int i = 0; i < 120; ++i) world.step(util::k_default_fixed_dt);
 
     const float h = util::k_default_fixed_dt;
     const float speed = 2.0f;
@@ -2385,7 +2385,7 @@ static void test_cloth_anchors_follow_moving_kinematic_body() {
         dynamics::Body* b = world.get_body(ball_id);
         b->position.x += speed * h;
         b->linear_velocity = glm::vec3(speed, 0.0f, 0.0f);
-        world.step_fixed(h);
+        world.step(h);
     }
 
     const dynamics::Body* b = world.get_body(ball_id);
@@ -2399,6 +2399,100 @@ static void test_cloth_anchors_follow_moving_kinematic_body() {
     for (const cloth::ClothParticle& p : sim->particles) mean_x += p.position.x;
     mean_x /= static_cast<float>(sim->particles.size());
     ASSERT_TRUE(mean_x > b->position.x - 0.5f && mean_x <= b->position.x + 0.5f);
+}
+
+/**
+ * @brief The sheet keeps its grip on a kinematic body across UNEVEN frames -- the regression test
+ *        for the cloth/ball jitter.
+ *
+ * The bug this pins down: cloth used to be solved inside step_fixed(), on the 1/60 s grid, while
+ * a kinematic body is posed on the wall clock every frame. Whenever a frame's dt fell short of
+ * the substep length the accumulator ran ZERO substeps, so the sheet stood perfectly still in
+ * world space while the body travelled a whole frame -- and the next frame ran two substeps and
+ * snapped it back. Rendered, that beat is the jitter.
+ *
+ * The dt sequence below alternates 0.9h/1.1h precisely to drive the accumulator across that
+ * boundary repeatedly (the pattern a vsynced display beating against a 60 Hz fixed step produces
+ * for real). The anchored particles are written outright from the body's pose, so "did the cloth
+ * get stepped this frame" is measurable to the micrometre at the anchor: the offset from the body
+ * centre must not move. Pre-fix this drifts by up to speed*dt (~6 cm) on every zero-substep frame.
+ */
+static void test_cloth_anchor_tracks_kinematic_body_across_uneven_frames() {
+    PhysicsWorld world;
+
+    dynamics::Body ball;
+    ball.type = dynamics::BodyType::Kinematic;
+    ball.position = glm::vec3(0.0f, 0.0f, 3.0f);
+    ball.inv_mass = 0.0f;
+    ball.use_gravity = false;
+    dynamics::BodyId ball_id = world.add_body(ball, collision::Shape::make_sphere(1.0f));
+
+    cloth::Cloth c = make_test_sheet(15, glm::vec3(0.0f, 0.0f, 4.05f));
+    ASSERT_TRUE(cloth::pin_to_body(c, ball_id, *world.get_body(ball_id),
+                                   glm::vec3(0.0f, 0.0f, 4.0f), 0.4f) > 0);
+    cloth::build_tethers(c);
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    const float h = util::k_default_fixed_dt;
+    for (int i = 0; i < 120; ++i) world.step(h); // let it drape first
+
+    // Offsets the anchors hold while the ball is still -- exactly what must survive the drive.
+    const cloth::Cloth* sim = world.get_cloth(id);
+    std::vector<glm::vec3> rest_offsets;
+    for (const cloth::ClothAnchor& a : sim->anchors) {
+        rest_offsets.push_back(sim->particles[a.particle].position - world.get_body(ball_id)->position);
+    }
+
+    const float speed = 4.0f; // assets/scenes/cloth_test's KinematicController move_speed
+    for (int frame = 0; frame < 240; ++frame) {
+        const float dt = (frame % 2 == 0) ? h * 0.9f : h * 1.1f;
+        // What PhysicsSystem::sync_transforms_in_() does for a kinematic body: hard-set the pose
+        // the wall clock asks for, derive the velocity from the delta.
+        dynamics::Body* b = world.get_body(ball_id);
+        b->position.x += speed * dt;
+        b->linear_velocity = glm::vec3(speed, 0.0f, 0.0f);
+        world.step(dt);
+
+        const cloth::Cloth* live = world.get_cloth(id);
+        for (std::size_t i = 0; i < live->anchors.size(); ++i) {
+            const glm::vec3 offset =
+                live->particles[live->anchors[i].particle].position - world.get_body(ball_id)->position;
+            ASSERT_VEC3_NEAR(offset, rest_offsets[i], 1e-3f);
+        }
+    }
+}
+
+/** @brief A frame too short to run a rigid substep still advances the cloth.
+ *
+ *  The other half of the same rule: cloth is on the frame clock, so it moves whenever a frame
+ *  does, not only when the accumulator happens to clear fixed_dt. Two half-substeps -- the first
+ *  runs no substep at all -- and the sheet must have fallen by both of them. */
+static void test_cloth_advances_when_no_rigid_substep_runs() {
+    PhysicsWorld world;
+    cloth::ClothParams params;
+    params.damping = 0.0f;
+    params.air_drag = 0.0f;
+    params.air_lift = 0.0f;
+    cloth::Cloth c = make_test_sheet(5, glm::vec3(0.0f, 0.0f, 10.0f), params);
+    const float start_z = c.particles[0].position.z;
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    const float half = util::k_default_fixed_dt * 0.5f;
+    world.step(half); // accumulator below fixed_dt: zero rigid substeps
+    const float after_one = world.get_cloth(id)->particles[0].position.z;
+    ASSERT_TRUE(start_z - after_one > 1e-4f);
+
+    world.step(half);
+    ASSERT_TRUE(after_one - world.get_cloth(id)->particles[0].position.z > 1e-4f);
+    // Two half-frames of free fall land exactly where one whole frame would: the sheet advances on
+    // wall-clock time, not on substep count. Same analytic form test_cloth_free_fall_matches_
+    // analytic() uses (semi-implicit Euler carries a 0.5*g*t*hs term), and `hs` is unchanged at
+    // 1/240 s because step_cloths_() sizes the substep count to hold that length -- each half
+    // frame runs 2 substeps where a whole one runs 4.
+    const float t = util::k_default_fixed_dt;
+    const float hs = t / static_cast<float>(world.config().cloth_substeps);
+    const float drop = start_z - world.get_cloth(id)->particles[0].position.z;
+    ASSERT_NEAR(drop, 0.5f * 9.81f * t * t + 0.5f * 9.81f * t * hs, 1e-5f);
 }
 
 /**
@@ -2442,7 +2536,7 @@ static void test_cloth_self_collision_separates_non_neighbour_particles() {
 
         const uint32_t cols = c.columns;
         cloth::ClothId id = world.add_cloth(std::move(c));
-        for (int i = 0; i < 60; ++i) world.step_fixed(util::k_default_fixed_dt);
+        for (int i = 0; i < 60; ++i) world.step(util::k_default_fixed_dt);
 
         const cloth::Cloth* sim = world.get_cloth(id);
         std::size_t violations = 0;
@@ -2483,16 +2577,16 @@ static void test_cloth_sleeps_when_settled_and_wakes_on_anchor_motion() {
     cloth::pin_to_body(c, post_id, *world.get_body(post_id), glm::vec3(0.0f, 0.0f, 5.0f), 3.0f);
     cloth::ClothId id = world.add_cloth(std::move(c));
 
-    for (int i = 0; i < 600; ++i) world.step_fixed(util::k_default_fixed_dt);
+    for (int i = 0; i < 600; ++i) world.step(util::k_default_fixed_dt);
     ASSERT_TRUE(!world.get_cloth(id)->awake);
 
     // A sleeping cloth must be perfectly frozen, not merely slow.
     const glm::vec3 before = world.get_cloth(id)->particles.back().position;
-    for (int i = 0; i < 60; ++i) world.step_fixed(util::k_default_fixed_dt);
+    for (int i = 0; i < 60; ++i) world.step(util::k_default_fixed_dt);
     ASSERT_VEC3_NEAR(world.get_cloth(id)->particles.back().position, before, 1e-6f);
 
     world.get_body(post_id)->position.x += 0.5f;
-    world.step_fixed(util::k_default_fixed_dt);
+    world.step(util::k_default_fixed_dt);
     ASSERT_TRUE(world.get_cloth(id)->awake);
 }
 
@@ -2522,7 +2616,7 @@ static void test_cloth_stepping_is_deterministic_serial_and_parallel() {
         cloth::build_tethers(c);
         world.add_cloth(std::move(c));
 
-        for (int i = 0; i < 180; ++i) world.step_fixed(util::k_default_fixed_dt);
+        for (int i = 0; i < 180; ++i) world.step(util::k_default_fixed_dt);
         return world.world_state_hash();
     };
 
@@ -2681,7 +2775,7 @@ static void test_cloth_self_collision_cannot_push_a_particle_into_a_collider() {
     }
 
     cloth::ClothId id = world.add_cloth(std::move(c));
-    world.step_fixed(util::k_default_fixed_dt);
+    world.step(util::k_default_fixed_dt);
 
     const cloth::Cloth* sim = world.get_cloth(id);
     // They must have been separated -- otherwise the test proves nothing about ordering.
@@ -2851,7 +2945,7 @@ static void test_cloth_mesh_collider_stops_tunnelling_through_the_solver() {
     for (cloth::ClothParticle& particle : c.particles) particle.velocity = glm::vec3(0.0f, 0.0f, -60.0f);
     cloth::ClothId id = world.add_cloth(std::move(c));
 
-    for (int i = 0; i < 120; ++i) world.step_fixed(util::k_default_fixed_dt);
+    for (int i = 0; i < 120; ++i) world.step(util::k_default_fixed_dt);
 
     const cloth::Cloth* sim = world.get_cloth(id);
     for (const cloth::ClothParticle& particle : sim->particles) {
@@ -2988,7 +3082,7 @@ static void test_cloth_settles_on_mesh_floor_at_thickness() {
     desc.params = params;
     cloth::ClothId id = world.add_cloth(cloth::make_grid_cloth(desc));
 
-    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt);
+    for (int i = 0; i < 300; ++i) world.step(util::k_default_fixed_dt);
 
     const cloth::Cloth* sim = world.get_cloth(id);
     float lowest = 1e9f;
@@ -3076,6 +3170,8 @@ int main() {
     RUN_TEST(test_cloth_drapes_over_static_sphere_without_penetrating);
     RUN_TEST(test_cloth_tethers_cap_distance_to_anchor);
     RUN_TEST(test_cloth_anchors_follow_moving_kinematic_body);
+    RUN_TEST(test_cloth_anchor_tracks_kinematic_body_across_uneven_frames);
+    RUN_TEST(test_cloth_advances_when_no_rigid_substep_runs);
     RUN_TEST(test_cloth_self_collision_separates_non_neighbour_particles);
     RUN_TEST(test_cloth_sleeps_when_settled_and_wakes_on_anchor_motion);
     RUN_TEST(test_cloth_stepping_is_deterministic_serial_and_parallel);

@@ -96,8 +96,14 @@ struct PhysicsConfig {
      *         default first-order form, which visibly gains energy on fast spinners. */
     bool use_exact_quaternion_integration = false;
 
-    /** @brief XPBD substeps run per fixed substep for every cloth, unless a cloth overrides it
-     *         via ClothParams::substeps.
+    /** @brief XPBD substeps every cloth runs per 1/60 s, unless a cloth overrides it via
+     *         ClothParams::substeps.
+     *
+     *  Cloth is stepped once per FRAME, not per fixed substep (see PhysicsWorld::step_cloths_),
+     *  so what this field really pins down is the INTERNAL substep length, `fixed_dt /
+     *  cloth_substeps` -- 1/240 s by default. step_cloths_() sizes each frame's count to hold that
+     *  length as the frame rate varies, which keeps both the sheet's behaviour and its cost per
+     *  second frame-rate independent; at 60 Hz the count is exactly this value.
      *
      *  4 (i.e. an effective 240 Hz for cloth) is where a mid-weight sheet stops showing visible
      *  stretch as its anchor body moves, and is still under 0.15 ms for a 25x25 sheet. This is
