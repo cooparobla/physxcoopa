@@ -14,6 +14,7 @@
 #include <physxcoopa/components/mesh_collider.h>
 #include <physxcoopa/components/rigidbody.h>
 #include <physxcoopa/components/hinge_joint.h>
+#include <physxcoopa/components/cloth.h>
 #include <physxcoopa/dynamics/physics_material.h>
 #include <physxcoopa/dynamics/body.h>
 #include <physxcoopa/geometry/triangle_mesh.h>
@@ -230,6 +231,62 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
                 jc->use_limits = true;
                 if (limits.contains("min")) jc->min_angle_deg = limits.at("min").get_value<float>();
                 if (limits.contains("max")) jc->max_angle_deg = limits.at("max").get_value<float>();
+            }
+        });
+
+    // Every ClothParams field is authorable, flat, under the component's own mapping rather than
+    // a nested `params:` block -- the component IS the cloth's parameter set, and a scene author
+    // reading `friction: 0.5` next to `thickness: 0.03` should not have to know which of the two
+    // the C++ side happens to keep in a sub-struct. `anchors` is the only sequence; each entry's
+    // `object` is resolved later by PhysicsSystem::regather_cloths_(), never here (the named
+    // sibling may not exist yet while this parser runs -- see ClothComponent's doc).
+    SceneLoader::register_component_parser("Cloth",
+        [](const fkyaml::node& node, SceneObject& obj, const SceneLoader::ParseContext&) {
+            auto* cc = obj.add_component<components::ClothComponent>();
+
+            if (node.contains("resolution")) {
+                const auto& r = node.at("resolution");
+                if (r.contains("x")) cc->columns = r.at("x").get_value<uint32_t>();
+                if (r.contains("y")) cc->rows = r.at("y").get_value<uint32_t>();
+            }
+            if (node.contains("size")) {
+                const auto& sz = node.at("size");
+                if (sz.contains("x")) cc->width = sz.at("x").get_value<float>();
+                if (sz.contains("y")) cc->height = sz.at("y").get_value<float>();
+            }
+            if (node.contains("mass")) cc->mass = node.at("mass").get_value<float>();
+            if (node.contains("shear")) cc->shear = node.at("shear").get_value<bool>();
+
+            cloth::ClothParams& p = cc->params;
+            if (node.contains("stretch_compliance")) p.stretch_compliance = node.at("stretch_compliance").get_value<float>();
+            if (node.contains("bend_compliance")) p.bend_compliance = node.at("bend_compliance").get_value<float>();
+            if (node.contains("damping")) p.damping = node.at("damping").get_value<float>();
+            if (node.contains("thickness")) p.thickness = node.at("thickness").get_value<float>();
+            if (node.contains("friction")) p.friction = node.at("friction").get_value<float>();
+            if (node.contains("gravity_scale")) p.gravity_scale = node.at("gravity_scale").get_value<float>();
+            if (node.contains("max_velocity")) p.max_velocity = node.at("max_velocity").get_value<float>();
+            p.external_acceleration = detail::read_vec3_(node, "external_acceleration", p.external_acceleration);
+            p.wind = detail::read_vec3_(node, "wind", p.wind);
+            if (node.contains("wind_turbulence")) p.wind_turbulence = node.at("wind_turbulence").get_value<float>();
+            if (node.contains("air_drag")) p.air_drag = node.at("air_drag").get_value<float>();
+            if (node.contains("air_lift")) p.air_lift = node.at("air_lift").get_value<float>();
+            if (node.contains("self_collision")) p.self_collision = node.at("self_collision").get_value<bool>();
+            if (node.contains("self_distance")) p.self_distance = node.at("self_distance").get_value<float>();
+            if (node.contains("tether_scale")) p.tether_scale = node.at("tether_scale").get_value<float>();
+            if (node.contains("substeps")) p.substeps = node.at("substeps").get_value<uint32_t>();
+            if (node.contains("iterations")) p.iterations = node.at("iterations").get_value<uint32_t>();
+            if (node.contains("sleep_threshold")) p.sleep_threshold = node.at("sleep_threshold").get_value<float>();
+            if (node.contains("sleep_time")) p.sleep_time = node.at("sleep_time").get_value<float>();
+            p.layer = detail::read_layer_(node, "layer", p.layer);
+
+            if (node.contains("anchors")) {
+                for (const auto& a : node.at("anchors")) {
+                    components::ClothAnchorSpec spec;
+                    if (a.contains("object")) spec.object = a.at("object").get_value<std::string>();
+                    spec.point = detail::read_vec3_(a, "point", glm::vec3(0.0f));
+                    if (a.contains("radius")) spec.radius = a.at("radius").get_value<float>();
+                    cc->anchors.push_back(spec);
+                }
             }
         });
 }

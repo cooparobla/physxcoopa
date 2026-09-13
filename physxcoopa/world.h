@@ -15,6 +15,10 @@
 #include <physxcoopa/dynamics/inertia.h>
 #include <physxcoopa/dynamics/joint.h>
 #include <physxcoopa/dynamics/solver.h>
+#include <physxcoopa/cloth/cloth.h>
+#include <physxcoopa/cloth/cloth_builder.h>
+#include <physxcoopa/cloth/cloth_collision.h>
+#include <physxcoopa/cloth/cloth_solver.h>
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/collision/manifold.h>
 #include <physxcoopa/collision/contact_event.h>
@@ -442,6 +446,90 @@ public:
         return is_valid(id) ? &joints_[id.index] : nullptr;
     }
 
+    // --- Cloth -------------------------------------------------------------------------------
+
+    /**
+     * @brief Takes ownership of a cloth and starts simulating it.
+     *
+     * Build the sheet with cloth::make_grid_cloth(), pin it with cloth::pin_to_body() /
+     * cloth::pin_static(), then cloth::build_tethers(), and hand the finished Cloth here. That
+     * split is deliberate: construction allocates freely and runs Dijkstra, none of which belongs
+     * anywhere near step_fixed(), so it happens once up front against a plain value type that
+     * needs no world at all.
+     *
+     * @param c Cloth to move in. Its `valid` flag is set by this call.
+     * @return A generational handle, or an invalid one if `c` has no particles.
+     */
+    cloth::ClothId add_cloth(cloth::Cloth&& c) {
+        if (c.particles.empty()) return cloth::ClothId{};
+        c.valid = true;
+        c.bounds = cloth::compute_bounds(c);
+
+        uint32_t index;
+        if (!free_cloth_indices_.empty()) {
+            index = free_cloth_indices_.back();
+            free_cloth_indices_.pop_back();
+            cloths_[index] = std::move(c);
+        } else {
+            index = static_cast<uint32_t>(cloths_.size());
+            cloths_.push_back(std::move(c));
+            cloth_generations_.push_back(0);
+            cloth_alive_.push_back(false);
+        }
+        cloth_alive_[index] = true;
+        return cloth::ClothId{index, cloth_generations_[index]};
+    }
+
+    /** @brief True if `id` addresses a currently-alive cloth. */
+    bool is_valid(cloth::ClothId id) const {
+        return id.is_valid() && id.index < cloths_.size() && cloth_alive_[id.index] &&
+               cloth_generations_[id.index] == id.generation;
+    }
+
+    /** @brief Destroys a cloth immediately. A no-op if `id` is already invalid/stale. The slot's
+     *         particle/constraint vectors are cleared so their memory is released rather than
+     *         held until the slot is recycled by a differently-sized sheet. */
+    void remove_cloth(cloth::ClothId id) {
+        if (!is_valid(id)) return;
+        cloths_[id.index] = cloth::Cloth{};
+        cloth_alive_[id.index] = false;
+        ++cloth_generations_[id.index];
+        free_cloth_indices_.push_back(id.index);
+    }
+
+    /** @brief Returns the cloth `id` addresses, or nullptr if `id` is invalid/stale. Mutable
+     *         access is intentional -- retuning ClothParams at runtime (wind, friction) needs no
+     *         rebuild, and a renderer reads the particle array through the const overload. */
+    cloth::Cloth* get_cloth(cloth::ClothId id) {
+        return is_valid(id) ? &cloths_[id.index] : nullptr;
+    }
+    const cloth::Cloth* get_cloth(cloth::ClothId id) const {
+        return is_valid(id) ? &cloths_[id.index] : nullptr;
+    }
+
+    /** @brief Number of currently-alive cloths. */
+    std::size_t cloth_count() const {
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < cloths_.size(); ++i) if (cloth_alive_[i]) ++n;
+        return n;
+    }
+
+    /** @brief Invokes `fn(ClothId, Cloth&)` for every currently-alive cloth, in index order. */
+    template <typename Fn>
+    void for_each_cloth(Fn&& fn) {
+        for (uint32_t i = 0; i < cloths_.size(); ++i) {
+            if (!cloth_alive_[i]) continue;
+            fn(cloth::ClothId{i, cloth_generations_[i]}, cloths_[i]);
+        }
+    }
+    template <typename Fn>
+    void for_each_cloth(Fn&& fn) const {
+        for (uint32_t i = 0; i < cloths_.size(); ++i) {
+            if (!cloth_alive_[i]) continue;
+            fn(cloth::ClothId{i, cloth_generations_[i]}, cloths_[i]);
+        }
+    }
+
     /**
      * @brief Invokes `fn(BodyId, Body&)` for every currently-alive body, in index order.
      *
@@ -848,6 +936,9 @@ public:
      */
     void step(float dt) {
         events_.clear();
+        // Recorded for the cloth sweep only (see step_cloths_()). Clamped the same way the
+        // accumulator is, so a pathological first frame cannot turn into an enormous sweep.
+        last_frame_dt_ = std::min(dt, util::k_max_frame_time);
         accumulator_ += std::min(dt, util::k_max_frame_time);
         const float h = config_.fixed_dt;
         uint32_t n = 0;
@@ -902,6 +993,12 @@ public:
             dynamics::update_world_inertia(b);
         });
 
+        // Cloth runs LAST, against the rigid poses this substep just produced. Ordering it before
+        // the rigid solve would have every cloth collide against poses one substep stale, which
+        // shows up immediately as a sheet lagging a fast-moving body it is draped over. Nothing
+        // downstream consumes the cloth result within the substep, because coupling is one-way.
+        if (!cloths_.empty()) step_cloths_(h);
+
         in_step_ = false;
     }
 
@@ -933,6 +1030,15 @@ public:
             mix(&b.orientation, sizeof(b.orientation));
             mix(&b.linear_velocity, sizeof(b.linear_velocity));
             mix(&b.angular_velocity, sizeof(b.angular_velocity));
+        });
+        // Cloth particles are mixed in too, so the serial-vs-parallel determinism harness covers
+        // the cloth pass for free rather than needing a parallel oracle of its own. A world with
+        // no cloths hashes exactly as it did before cloth existed, so no existing test moves.
+        for_each_cloth([&](cloth::ClothId, const cloth::Cloth& c) {
+            for (const cloth::ClothParticle& p : c.particles) {
+                mix(&p.position, sizeof(p.position));
+                mix(&p.velocity, sizeof(p.velocity));
+            }
         });
         return h;
     }
@@ -1306,6 +1412,152 @@ private:
     }
 
     /**
+     * @brief Advances every alive cloth by one fixed substep.
+     *
+     * Per cloth: resolve anchors from their bodies, gather the rigid shapes the sheet could
+     * possibly touch, run the XPBD solve, then update sleep state.
+     *
+     * Collider gathering goes through the SAME two broadphase trees rigid pairs use, so a cloth
+     * automatically respects the layer matrix and never pays for shapes on the far side of the
+     * level. Two details make that safe here, after sync_broadphase_() ran earlier in the substep:
+     *
+     *   - The trees hold each proxy's FAT bounds from this substep's sync, while the bodies have
+     *     since been integrated. The query box therefore absorbs that staleness explicitly
+     *     (thickness + the sheet's own travel this substep + aabb_margin) instead of assuming the
+     *     tree is current. Candidate selection is the only thing affected -- the actual collision
+     *     math uses each body's live pose, not its proxy.
+     *   - AABBTree::query() keeps its traversal stack in thread_local storage and mutates nothing,
+     *     so it is safe to call here even though narrowphase_() has finished with the trees.
+     *
+     * The solve itself runs serially, via cloth::SerialDispatch. The constraint batches are
+     * provably particle-disjoint (see cloth::ConstraintBatch) so a job-parallel dispatcher would
+     * be both safe and bit-identical -- but at realistic sheet sizes it is a pessimization: a
+     * 25x25 sheet costs ~0.12 ms per substep serially, while the parallel path would pay
+     * JobEngine dispatch overhead 30+ times per substep (8 stretch batches + 8 bend batches, per
+     * iteration, per cloth substep). solve_cloth() is templated on the dispatcher precisely so
+     * that this stays a one-line change if sheets ever get large enough to justify it.
+     *
+     * @param h Substep length in seconds.
+     */
+    void step_cloths_(float h) {
+        for (uint32_t ci = 0; ci < cloths_.size(); ++ci) {
+            if (!cloth_alive_[ci]) continue;
+            cloth::Cloth& c = cloths_[ci];
+            if (!c.enabled || c.particles.empty()) continue;
+
+            // --- Anchors: resolve this substep's world target from each body's live pose ---
+            bool anchor_moved = false;
+            for (cloth::ClothAnchor& a : c.anchors) {
+                const dynamics::Body* body = get_body(a.body);
+                const glm::vec3 target = body ? (body->position + body->orientation * a.local_position)
+                                              : a.world_position;
+                const glm::vec3 delta = target - a.world_position;
+                if (glm::dot(delta, delta) > util::k_epsilon) anchor_moved = true;
+                a.world_position = target;
+            }
+
+            // --- Candidate colliders ---
+            cloth_colliders_.clear();
+            const float travel = cloth::max_particle_speed(c) * h;
+            const geometry::AABB query =
+                c.bounds.expand(c.params.thickness + travel + config_.aabb_margin);
+
+            // How far a moving collider will visibly travel before the cloth is solved again.
+            //
+            // NOT simply |v| * h. A cloth solve happens once per fixed substep, but frames are
+            // drawn on the wall clock -- so the question is how many frames get drawn between two
+            // solves, and how far the collider moves across them. The first of those frames shows
+            // the pose just solved against, so only the remainder needs covering:
+            //
+            //   frame_dt == h  (60 Hz)   -> 0         every solve is rendered exactly once
+            //   frame_dt <  h  (144 Hz)  -> h - dt    ~2 extra frames drawn per solve
+            //   frame_dt >  h  (30 Hz)   -> 0         several substeps run per render
+            //
+            // Getting this to fall to zero in the common case is the whole point: a sweep applied
+            // when no un-solved frame will be drawn holds the sheet off the leading side of a
+            // moving body for nothing, which reads as a gap and is just as wrong as clipping.
+            const float sweep_time = std::max(0.0f, h - std::min(last_frame_dt_, h));
+
+            bool collider_moving = false;
+            auto gather = [&](void* user_data) {
+                const uint32_t slot = user_data_to_index_(user_data);
+                if (slot >= shapes_.size() || !shape_alive_[slot]) return;
+                const collision::Shape& shape = shapes_[slot];
+                if (!shape.enabled || shape.is_trigger) return;
+                if (!layer_matrix_.should_collide(c.params.layer, shape.layer)) return;
+
+                const dynamics::BodyId owner = shape_owner_[slot];
+                if (!is_valid(owner)) return;
+                const dynamics::Body& body = bodies_[owner.index];
+
+                cloth::ClothCollider collider;
+                collider.shape = &shape;
+                collider.position = body.position;
+                collider.orientation = body.orientation;
+                collider.bounds = collision::world_bounds(shape, body.position, body.orientation);
+
+                if (sweep_time > 0.0f && body.type != dynamics::BodyType::Static) {
+                    collider.sweep = body.linear_velocity * sweep_time;
+                    // First-order orientation extrapolation, the same form integrate_velocities()
+                    // uses -- exact enough over a fraction of a substep, and only consumed by the
+                    // Box/Capsule two-pose path (a sphere's rotation cannot change its extent).
+                    const glm::quat spin(0.0f, body.angular_velocity * (0.5f * sweep_time));
+                    collider.end_orientation = glm::normalize(body.orientation + spin * body.orientation);
+                    // The reject box must cover BOTH poses, or a particle that only the end pose
+                    // would have caught gets skipped before project_particle() ever sees it.
+                    collider.bounds = geometry::AABB::merge(
+                        collider.bounds,
+                        collision::world_bounds(shape, body.position + collider.sweep,
+                                                 collider.end_orientation));
+                } else {
+                    collider.end_orientation = body.orientation;
+                }
+
+                if (!collider.bounds.overlaps(query)) return;
+                cloth_colliders_.push_back(collider);
+
+                // A kinematic platform sliding under a settled sheet must wake it. Same rule
+                // dynamics::wake_if_kinematic_moving() applies to rigid bodies, and for the same
+                // reason -- a spinner has near-zero linear velocity but is very much moving.
+                if (body.type != dynamics::BodyType::Static &&
+                    (glm::dot(body.linear_velocity, body.linear_velocity) > util::k_epsilon ||
+                     glm::dot(body.angular_velocity, body.angular_velocity) > util::k_epsilon)) {
+                    collider_moving = true;
+                }
+            };
+            static_tree_.query(query, gather);
+            dynamic_tree_.query(query, gather);
+
+            // --- Sleep gate ---
+            if (anchor_moved || collider_moving) {
+                c.awake = true;
+                c.sleep_timer = 0.0f;
+            }
+            if (!c.awake) {
+                // Keep the anchor lerp's start point pinned to where the sheet actually is, or the
+                // first substep after waking would interpolate from a position several seconds
+                // stale and snap the sheet across the gap.
+                for (cloth::ClothAnchor& a : c.anchors) a.prev_world_position = a.world_position;
+                continue;
+            }
+
+            cloth::solve_cloth(c, cloth_colliders_, gravity_, config_.cloth_substeps,
+                               config_.cloth_iterations, h, cloth_scratch_);
+
+            // --- Sleep bookkeeping ---
+            if (cloth::max_particle_speed(c) < c.params.sleep_threshold) {
+                c.sleep_timer += h;
+                if (c.sleep_timer >= c.params.sleep_time) {
+                    c.awake = false;
+                    for (cloth::ClothParticle& p : c.particles) p.velocity = glm::vec3(0.0f);
+                }
+            } else {
+                c.sleep_timer = 0.0f;
+            }
+        }
+    }
+
+    /**
      * @brief Broadphase (two-tree query, job-parallel) + narrowphase (job-parallel) over this
      *        step's overlapping pairs. See discover_pairs_()/narrowphase_()'s docs for the
      *        parallelization scheme and the determinism argument for each.
@@ -1446,11 +1698,32 @@ private:
     std::vector<bool> joint_alive_;
     std::vector<uint32_t> free_joint_indices_;
 
+    /** @brief Cloth storage -- the same generational-handle lifecycle as joints_ above, for the
+     *         same reason: a cloth is a persistent, independently-created object with no 1:1
+     *         relationship to any body. Kept separate from bodies_ entirely; see cloth/cloth.h's
+     *         file comment for why cloth particles are not bodies. */
+    std::vector<cloth::Cloth> cloths_;
+    std::vector<uint32_t> cloth_generations_;
+    std::vector<bool> cloth_alive_;
+    std::vector<uint32_t> free_cloth_indices_;
+
+    /** @brief Reused per-cloth solve workspace; see step_cloths_(). Both are cleared and refilled
+     *         per cloth rather than reallocated, matching bounds_scratch_/manifold_scratch_. */
+    cloth::ClothSolverScratch cloth_scratch_;
+    std::vector<cloth::ClothCollider> cloth_colliders_;
+
     std::vector<DeferredCommand> deferred_commands_;
     bool in_step_ = false;
 
     float accumulator_ = 0.0f;
     float interpolation_alpha_ = 0.0f;
+
+    /** @brief Last frame delta handed to step(), for the cloth collider sweep.
+     *
+     *  Defaults to the substep length so that a caller driving step_fixed() directly -- which is
+     *  every test in test.cpp, and the determinism harness -- computes a zero sweep and gets
+     *  bit-identical results to a world with no sweeping at all. */
+    float last_frame_dt_ = util::k_default_fixed_dt;
 
     coopa::job::JobEngine* jobs_ = nullptr;
     std::size_t parallel_threshold_ = 64;

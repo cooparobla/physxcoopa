@@ -16,6 +16,7 @@
 #include <physxcoopa/components/collider.h>
 #include <physxcoopa/components/collision.h>
 #include <physxcoopa/components/rigidbody.h>
+#include <physxcoopa/components/cloth.h>
 #include <physxcoopa/components/hinge_joint.h>
 #include <physxcoopa/query/queries.h>
 #include <physxcoopa/geometry/ray.h>
@@ -69,6 +70,8 @@ public:
             regather_(scene);
             regather_joints_(scene); // after regather_() -- every HingeJointComponent needs
                                       // BOTH connected objects already bound to a body.
+            regather_cloths_(scene);  // likewise: a ClothComponent's anchors name objects whose
+                                      // Rigidbody must already be bound.
             dirty_ = false;
         }
         prime_transforms_(); // serial -- see its own doc; makes every read below race-free.
@@ -371,6 +374,101 @@ private:
                                        connected_local_axis, jc->axis, jc->use_limits, glm::radians(jc->min_angle_deg),
                                        glm::radians(jc->max_angle_deg));
     }
+
+    /**
+     * @brief Creates a cloth::Cloth for every ClothComponent that does not have one yet, and
+     *        destroys the cloths of components that have gone away.
+     *
+     * Same identity-diff shape as regather_joints_(), and binding is likewise creation-time only
+     * (see ClothComponent's doc): rebuilding a sheet would throw away its simulated state, which
+     * is never what an author editing a wind vector wants, and the runtime-editable tunables are
+     * reachable through ClothComponent::cloth_mut() without a rebuild anyway.
+     *
+     * A ClothComponent whose anchor names an object with no bound Collider is not an error -- that
+     * anchor is simply skipped, and the rest of the sheet still simulates. An anchor with an empty
+     * `object` pins its particles in place with no body to follow.
+     */
+    void regather_cloths_(coopa::scene::Scene& scene) {
+        std::vector<components::ClothComponent*> current = scene.get_components<components::ClothComponent>();
+        std::unordered_set<components::ClothComponent*> current_set(current.begin(), current.end());
+
+        std::unordered_map<components::ClothComponent*, cloth::ClothId> old_by_component;
+        old_by_component.reserve(cloth_bindings_.size());
+        for (const auto& kv : cloth_bindings_) old_by_component.emplace(kv.first, kv.second);
+
+        for (const auto& kv : old_by_component) {
+            if (current_set.find(kv.first) != current_set.end()) continue;
+            world_.remove_cloth(kv.second);
+        }
+
+        std::vector<std::pair<components::ClothComponent*, cloth::ClothId>> new_bindings;
+        new_bindings.reserve(current.size());
+        for (components::ClothComponent* cc : current) {
+            auto it = old_by_component.find(cc);
+            if (it != old_by_component.end()) {
+                new_bindings.push_back(*it); // already bound -- creation-time-only, see the doc
+                continue;
+            }
+            cloth::ClothId id = create_cloth_for_(cc, scene);
+            cc->set_cloth_binding(&world_, id);
+            new_bindings.emplace_back(cc, id);
+        }
+        cloth_bindings_ = std::move(new_bindings);
+    }
+
+    /**
+     * @brief Builds one ClothComponent's sheet at its owner's current world pose, resolves and
+     *        applies its anchors, derives its tethers, and hands it to the world.
+     *
+     * The sheet's extent is scaled by the owner's world scale, matching how Collider::center() and
+     * every other authored local length in this codebase is treated -- a scene author scaling the
+     * cloth object expects a bigger sheet, not the same sheet with a stretched-looking material.
+     *
+     * @return An invalid ClothId if the owner has no Transform.
+     */
+    cloth::ClothId create_cloth_for_(components::ClothComponent* cc, coopa::scene::Scene& scene) {
+        coopa::scene::SceneObject* owner = cc->owner;
+        if (!owner || !owner->get_transform()) return cloth::ClothId{};
+        const util::Trs trs = util::world_trs(owner->get_transform()->transform());
+
+        cloth::GridClothDesc desc;
+        desc.columns = cc->columns;
+        desc.rows = cc->rows;
+        desc.width = cc->width * trs.scale.x;
+        desc.height = cc->height * trs.scale.y;
+        desc.center = trs.position;
+        desc.orientation = trs.rotation;
+        desc.total_mass = cc->mass;
+        desc.shear = cc->shear;
+        desc.params = cc->params;
+
+        cloth::Cloth sheet = cloth::make_grid_cloth(desc);
+
+        for (const components::ClothAnchorSpec& spec : cc->anchors) {
+            if (spec.object.empty()) {
+                // World-space pin with nothing to follow.
+                cloth::pin_static(sheet, spec.point, spec.radius);
+                continue;
+            }
+            coopa::scene::SceneObject* target = scene.find_object(spec.object);
+            if (!target) continue;
+            auto* col = target->get_component<components::Collider>();
+            if (!col) continue;
+            const dynamics::BodyId body_id = col->body_id();
+            const dynamics::Body* body = world_.get_body(body_id);
+            if (!body) continue;
+            // `point` is authored in the TARGET's local frame (see ClothAnchorSpec), which is the
+            // only frame in which "the top of the ball" stays the top of the ball as the ball
+            // moves. Resolved against the BODY's pose rather than the target's Transform, since
+            // those differ by the collider's own centre offset on a compound body.
+            const glm::vec3 world_point = body->position + body->orientation * spec.point;
+            cloth::pin_to_body(sheet, body_id, *body, world_point, spec.radius);
+        }
+
+        cloth::build_tethers(sheet);
+        return world_.add_cloth(std::move(sheet));
+    }
+
 
     /**
      * @brief Touches get_world_matrix() on every bound owner's Transform, serially, once --
@@ -1088,6 +1186,9 @@ private:
      *         full-scan diffing (same identity-diff pattern as bindings_'s own Collider set),
      *         never random lookup by component. */
     std::vector<std::pair<components::HingeJointComponent*, dynamics::JointId>> joint_bindings_;
+    /** @brief ClothComponent* -> the cloth::Cloth it's currently bound to; same flat-vector
+     *         identity-diff shape as joint_bindings_ above, for the same reason. */
+    std::vector<std::pair<components::ClothComponent*, cloth::ClothId>> cloth_bindings_;
     bool dirty_ = true;
     std::size_t parallel_threshold_ = 64;
 };

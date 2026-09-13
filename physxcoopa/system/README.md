@@ -15,7 +15,7 @@ PhysicsSystem::execute(scene, ctx)
 
 | File | Purpose |
 |---|---|
-| [`physics_system.h`](physics_system.h) | `PhysicsSystem : ISceneSystem` (registered at `UpdatePhase::Physics = 100` by default) and `install_physics_system(scene)`. Owns the `PhysicsWorld`; every method above is a private step of `execute()`. |
+| [`physics_system.h`](physics_system.h) | `PhysicsSystem : ISceneSystem` (registered at `UpdatePhase::Physics = 100` by default) and `install_physics_system(scene)`. Owns the `PhysicsWorld`; every method above is a private step of `execute()`. The reconcile pass runs `regather_()` → `regather_joints_()` → `regather_cloths_()` in that order: a joint needs both connected objects already bound to a body, and a `ClothComponent`'s anchors name objects whose `Rigidbody` must likewise already be bound. |
 
 **PhysicsSystem's transform reads/writes always use `Transform::get_world_matrix()`** (the
 lazy-recomputing accessor), never the newer non-recomputing `world_matrix()` — physics runs

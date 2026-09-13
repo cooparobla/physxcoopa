@@ -95,6 +95,23 @@ struct PhysicsConfig {
     /** @brief Use the exact exponential-map quaternion integration step instead of the
      *         default first-order form, which visibly gains energy on fast spinners. */
     bool use_exact_quaternion_integration = false;
+
+    /** @brief XPBD substeps run per fixed substep for every cloth, unless a cloth overrides it
+     *         via ClothParams::substeps.
+     *
+     *  4 (i.e. an effective 240 Hz for cloth) is where a mid-weight sheet stops showing visible
+     *  stretch as its anchor body moves, and is still under 0.15 ms for a 25x25 sheet. This is
+     *  the dominant quality knob for cloth: Macklin et al.'s central result is that for a fixed
+     *  budget, spending it on more SUBSTEPS converges strictly better than spending it on more
+     *  iterations within a substep -- which is why this defaults to 4 while cloth_iterations
+     *  defaults to 1, the reverse of the ratio the velocity/relax iterations use for rigid
+     *  contacts. */
+    uint32_t cloth_substeps = 4;
+
+    /** @brief Constraint iterations per cloth substep, unless a cloth overrides it via
+     *         ClothParams::iterations. See cloth_substeps for why 1 is the right default. Raise
+     *         only for a sheet that must be perfectly inextensible at very low substep counts. */
+    uint32_t cloth_iterations = 1;
 };
 
 } // namespace util

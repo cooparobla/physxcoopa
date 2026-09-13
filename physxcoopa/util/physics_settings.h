@@ -84,6 +84,9 @@ inline debug::DebugDrawFlags parse_debug_draw_flag_(const std::string& name) {
  *   solver:
  *     velocity_iterations: 16
  *     position_iterations: 4
+ *   cloth:
+ *     substeps: 4
+ *     iterations: 1
  *   layers: ["Default", "Ground", "Triggers"]
  *   ignore_layer_collisions:
  *     - [Triggers, Triggers]
@@ -118,6 +121,16 @@ inline PhysicsSettings parse_physics_settings(const fkyaml::node& node) {
         if (s.contains("sleep_time")) settings.solver.sleep_time = s.at("sleep_time").get_value<float>();
         if (s.contains("max_substeps")) settings.solver.max_substeps = s.at("max_substeps").get_value<uint32_t>();
         if (s.contains("max_linear_velocity")) settings.solver.max_linear_velocity = s.at("max_linear_velocity").get_value<float>();
+    }
+
+    // Cloth lives under its own key rather than inside `solver:` because its two knobs govern a
+    // completely separate solver (XPBD, cloth/cloth_solver.h) with its own convergence tradeoff --
+    // grouping them with the impulse solver's iteration counts would invite copying one set of
+    // numbers onto the other, where they mean something different. See PhysicsConfig::cloth_substeps.
+    if (node.contains("cloth")) {
+        const auto& cl = node.at("cloth");
+        if (cl.contains("substeps")) settings.solver.cloth_substeps = cl.at("substeps").get_value<uint32_t>();
+        if (cl.contains("iterations")) settings.solver.cloth_iterations = cl.at("iterations").get_value<uint32_t>();
     }
 
     if (node.contains("layers")) {
