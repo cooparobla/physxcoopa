@@ -85,13 +85,55 @@ would pay job-dispatch overhead 30+ times per substep. Measured, single-threaded
 
 Self-collision is ~4× the cost of everything else, which is why it is opt-in.
 
+Mesh colliders are the expensive shape: a 25×25 sheet resting on a 2048-triangle mesh floor costs
+0.52 ms/step against 0.12 ms on a sphere, dominated by the per-particle BVH proximity query. The
+swept crossing test is a small part of that — forcing it to run every substep instead of honouring
+its length gate costs only a further 0.07 ms — so the gate is worth keeping but the query is what
+sets the price. A resting sheet also sleeps (`ClothParams::sleep_time`), dropping to ~0.
+
+## Collider support
+
+| Collider | How a particle is resolved | Interior case | Swept (>60 Hz) |
+|---|---|---|---|
+| `SphereCollider` | analytic centre distance | yes | **exact** — a swept sphere is a capsule |
+| `BoxCollider` | `geometry::closest_point_on_obb` | yes, exits along the minimum-penetration axis | start/end pose probe |
+| `CapsuleCollider` | `geometry::closest_point_on_segment` | yes | start/end pose probe |
+| `MeshCollider` | `MeshBVH` + `collision::closest_point_on_triangle` | recovery only (see below) | no — static-only in this engine |
+
+Static, Kinematic and Dynamic bodies all collide with cloth (both broadphase trees are queried), and
+compound colliders work for free since the gather is per *shape slot*. A shape must be `enabled`,
+must not be a trigger, and must pass `layer_matrix_.should_collide(cloth.params.layer, shape.layer)`
+— so a scene's `ignore_layer_collisions` governs cloth too, via the `Cloth` component's `layer:`.
+
+**Mesh colliders** are the one shape with no cheap "inside" to test against, so they get two extra
+mechanisms instead:
+
+- A **swept crossing test**: the particle's motion over the substep (`prev_position` → `position`,
+  which covers integration, constraints, tethers *and* self-collision) is raycast against the BVH,
+  and a crossing puts the particle back on the side it came from. Which side that is comes from the
+  motion, not from a normal, so it carries none of the internal-edge ambiguity `mesh_contact.h`
+  needs `TriangleAdjacency` to resolve for rigid contacts. Gated on the particle having moved
+  further than `thickness` — it cannot have crossed a surface it is held that far clear of
+  otherwise.
+- **Penetration recovery**: a particle behind *every* triangle it is in contact range of is pushed
+  out through the nearest one's front face. Requiring *every* one is what stops a particle sitting
+  in a concave pocket — in front of one face, behind its neighbour — from being flipped across the
+  mesh.
+
+Still not handled for meshes: a particle that *starts* inside with no motion (an authoring error),
+and a mesh collider that moves onto a sheet (mesh colliders are static-only here).
+
+**Not supported at all**: cloth-vs-cloth (cloths have no broadphase proxy; self-collision *within* a
+sheet is supported), convex hulls (no such shape type exists in the engine), and triggers (skipped by
+design). Anchored particles skip collision entirely, so a pin authored inside a collider stays there.
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | [`cloth.h`](cloth.h) | `ClothId`, `ClothParticle`, `ClothConstraint` (lambda accumulator on the struct, as `HingeJoint` does), `ClothTether`, `ClothAnchor`, `ClothParams` (Unity-shaped tunables), `ConstraintBatch`, `Cloth`; `compute_bounds()`, `max_particle_speed()`. |
 | [`cloth_builder.h`](cloth_builder.h) | `GridClothDesc` + `make_grid_cloth()` (particles, structural/shear/bend constraints, disjoint batches, triangle list); `pin_to_body()`, `pin_static()`, `build_tethers()` (Dijkstra over the stretch graph — *geodesic* distance to the nearest anchor, not Euclidean). |
-| [`cloth_collision.h`](cloth_collision.h) | `ClothCollider` pose snapshot + `project_particle()` — sphere analytic, box via `geometry::closest_point_on_obb`, capsule via `closest_point_on_segment`, mesh via `MeshBVH` + `collision::closest_point_on_triangle`. Deliberately *not* through `narrowphase.h`: `ContactManifold` caps at 4 points, and a sheet on a sphere makes hundreds. |
+| [`cloth_collision.h`](cloth_collision.h) | `ClothCollider` pose snapshot + `project_particle()` — see the collider table above. Deliberately *not* through `narrowphase.h`: `ContactManifold` caps at 4 points, and a sheet on a sphere makes hundreds. |
 | [`cloth_solver.h`](cloth_solver.h) | `ClothSolverScratch` (allocate-once workspace), `SerialDispatch`, `solve_cloth()`. Allocates nothing per step. |
 
 ## Authoring

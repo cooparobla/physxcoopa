@@ -29,6 +29,7 @@
 #include <physxcoopa/geometry/aabb.h>
 #include <physxcoopa/geometry/capsule.h>
 #include <physxcoopa/geometry/obb.h>
+#include <physxcoopa/geometry/ray.h>
 #include <physxcoopa/util/math.h>
 
 namespace coopa {
@@ -96,6 +97,8 @@ namespace detail {
  * @param pose_pos      Owning body's world position at this pose.
  * @param pose_rot      Owning body's world orientation at this pose.
  * @param sweep         Swept displacement (Sphere only); pass a zero vector for a static test.
+ * @param motion_start  Particle position at the start of the substep (TriangleMesh only), or
+ *                      nullptr when no motion is known.
  * @param thickness    Standoff distance kept between the particle and the surface, metres.
  * @param p            [in,out] Particle position; written only when a correction is applied.
  * @param normal_out   [out] Unit outward surface normal at the contact; untouched on no-hit.
@@ -105,7 +108,7 @@ namespace detail {
 inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_pos,
                              const glm::quat& pose_rot, const glm::vec3& sweep,
                              float thickness, glm::vec3& p, glm::vec3& normal_out,
-                             float& depth_out) {
+                             float& depth_out, const glm::vec3* motion_start) {
     const bool swept = glm::dot(sweep, sweep) > util::k_epsilon * util::k_epsilon;
 
     switch (s.type) {
@@ -210,14 +213,81 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
             const glm::vec3 local_p = (inv_rot * (p - mesh_origin)) / scale;
             const float local_thickness = thickness / scale;
 
+            // --- Swept crossing test -------------------------------------------------------
+            // A triangle soup has no cheap "inside" to test against, so unlike the sphere, box and
+            // capsule branches this one cannot recover a particle that has ended up deep on the
+            // wrong side: it would be further than `thickness` from every triangle and the
+            // proximity query below would find nothing at all. The fix is to never let it get
+            // there -- catch the crossing itself, which is unambiguous and needs no watertight
+            // mesh (ray-parity inside tests do, and game meshes routinely are not).
+            //
+            // The length gate is what makes this affordable. A particle being held `thickness`
+            // clear of a surface cannot cross it without moving further than `thickness` in one
+            // substep, and a settled sheet moves microns per substep -- so the raycast never runs
+            // on resting cloth, only on particles genuinely fast enough to tunnel. Ungated this
+            // would be a BVH traversal per particle per substep (~2500 per frame for a 25x25
+            // sheet) for a case that almost never happens.
+            if (motion_start) {
+                const glm::vec3 local_start = (inv_rot * (*motion_start - mesh_origin)) / scale;
+                const glm::vec3 seg = local_p - local_start;
+                const float seg_len = glm::length(seg);
+                if (seg_len > local_thickness) {
+                    geometry::Ray ray;
+                    ray.origin = local_start;
+                    ray.direction = seg / seg_len;
+                    ray.max_distance = seg_len;
+
+                    float best_t = seg_len;
+                    uint32_t crossed_tri = 0;
+                    bool crossed = false;
+                    s.mesh->bvh().raycast(ray, [&](uint32_t tri) {
+                        glm::vec3 v0, v1, v2;
+                        s.mesh->triangle_vertices(tri, v0, v1, v2);
+                        float t = 0.0f;
+                        // ray_vs_triangle is single-sided (it only hits the face the winding normal
+                        // points toward), so the reversed winding is what catches a particle
+                        // arriving from the back. A collision surface is not a one-way gate.
+                        if ((geometry::ray_vs_triangle(ray, v0, v1, v2, t) ||
+                             geometry::ray_vs_triangle(ray, v0, v2, v1, t)) && t < best_t) {
+                            best_t = t;
+                            crossed_tri = tri;
+                            crossed = true;
+                        }
+                    });
+
+                    if (crossed) {
+                        const glm::vec3 local_hit = ray.origin + ray.direction * best_t;
+                        // Which side is "out" is READ FROM THE MOTION, not guessed from a normal --
+                        // so this carries none of the internal-edge ambiguity that forces
+                        // mesh_contact.h to consult TriangleAdjacency for rigid contacts.
+                        glm::vec3 face = util::safe_normalize(s.mesh->normals()[crossed_tri]);
+                        if (glm::dot(local_start - local_hit, face) < 0.0f) face = -face;
+
+                        const glm::vec3 local_fixed = local_hit + face * local_thickness;
+                        depth_out = glm::length(local_p - local_fixed) * scale;
+                        p = mesh_origin + rot * (local_fixed * scale);
+                        normal_out = rot * face;
+                        return true;
+                    }
+                }
+            }
+
+            // --- Proximity test ------------------------------------------------------------
             geometry::AABB query;
             query.min = local_p - glm::vec3(local_thickness);
             query.max = local_p + glm::vec3(local_thickness);
 
             float best_d2 = local_thickness * local_thickness;
             glm::vec3 best_point(0.0f);
-            glm::vec3 best_normal(0.0f);
+            glm::vec3 best_delta(0.0f);
+            uint32_t best_tri = 0;
             bool hit = false;
+            // Whether the particle is on the FRONT side of at least one triangle it is in contact
+            // range of. Behind every one of them means it has genuinely penetrated the surface;
+            // behind some but in front of others means it is sitting in a concave pocket and is
+            // perfectly fine where it is. Deciding from the single nearest triangle instead would
+            // teleport a particle in an inside corner straight through the wall.
+            bool any_front = false;
 
             s.mesh->bvh().query(query, [&](uint32_t tri) {
                 glm::vec3 v0, v1, v2;
@@ -225,26 +295,44 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
                 const glm::vec3 closest = collision::closest_point_on_triangle(local_p, v0, v1, v2);
                 const glm::vec3 delta = local_p - closest;
                 const float d2 = glm::dot(delta, delta);
+                if (d2 > local_thickness * local_thickness) return; // bounds overlapped, surface didn't
+
+                // >= 0 so a particle lying exactly ON the surface counts as outside, leaving the
+                // existing behaviour for that case untouched.
+                if (glm::dot(delta, s.mesh->normals()[tri]) >= 0.0f) any_front = true;
+
                 if (d2 > best_d2) return;
                 best_d2 = d2;
                 best_point = closest;
-                if (d2 > util::k_epsilon * util::k_epsilon) {
-                    // The separation direction itself, which is already correct on whichever side
-                    // the particle is on, and which -- unlike the face normal -- is also the right
-                    // exit direction in the triangle's edge and vertex regions.
-                    best_normal = delta / std::sqrt(d2);
-                } else {
-                    // Exactly on the surface: the separation direction is undefined, so fall back
-                    // to the face normal, signed to push the particle off the side it is on.
-                    const glm::vec3 face = util::safe_normalize(glm::cross(v1 - v0, v2 - v0));
-                    best_normal = (glm::dot(delta, face) < 0.0f) ? -face : face;
-                }
+                best_delta = delta;
+                best_tri = tri;
                 hit = true;
             });
 
             if (!hit) return false;
+
+            glm::vec3 best_normal;
+            if (!any_front) {
+                // Penetrating: exit through the nearest triangle's FRONT face. Deriving the
+                // direction from (particle - closest point) here -- which is what an outside
+                // particle uses -- would point back into the solid and cement the penetration at
+                // exactly `thickness` on the wrong side.
+                best_normal = util::safe_normalize(s.mesh->normals()[best_tri]);
+            } else if (best_d2 > util::k_epsilon * util::k_epsilon) {
+                // The separation direction itself, which -- unlike the face normal -- is also the
+                // right exit direction in the triangle's edge and vertex regions.
+                best_normal = best_delta / std::sqrt(best_d2);
+            } else {
+                // Exactly on the surface: the separation direction is undefined, so fall back to
+                // the face normal, signed to push the particle off the side it is on.
+                const glm::vec3 face = util::safe_normalize(s.mesh->normals()[best_tri]);
+                best_normal = (glm::dot(best_delta, face) < 0.0f) ? -face : face;
+            }
+
             const glm::vec3 local_fixed = best_point + best_normal * local_thickness;
-            depth_out = (local_thickness - std::sqrt(best_d2)) * scale;
+            // The distance actually travelled. Identical to (thickness - distance) for an outside
+            // particle, and correct for a penetrating one, where the correction spans the surface.
+            depth_out = glm::length(local_p - local_fixed) * scale;
             p = mesh_origin + rot * (local_fixed * scale);
             normal_out = rot * best_normal;
             return true;
@@ -269,15 +357,20 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
  *   - **TriangleMesh**: never swept (non-convex mesh colliders are static-only in this engine), so
  *     it falls through the single-call path with whatever sweep it was given ignored.
  *
- * @param collider   Shape snapshot to project out of, including its sweep.
- * @param thickness  Standoff distance kept between the particle and the surface, metres.
+ * @param collider     Shape snapshot to project out of, including its sweep.
+ * @param thickness    Standoff distance kept between the particle and the surface, metres.
+ * @param motion_start Particle position at the start of this substep, enabling the swept crossing
+ *                     test against a TriangleMesh (the one shape with no interior case of its own
+ *                     -- see project_at_pose_'s TriangleMesh branch). nullptr disables it, which is
+ *                     what a caller with no motion information should pass.
  * @param p          [in,out] Particle position; written only when a correction is applied.
  * @param normal_out [out] Unit outward surface normal at the contact; untouched on no-hit.
  * @param depth_out  [out] Correction distance actually applied, metres; untouched on no-hit.
  * @return True if the particle was inside the thickened (swept) surface and has been moved.
  */
 inline bool project_particle(const ClothCollider& collider, float thickness,
-                             glm::vec3& p, glm::vec3& normal_out, float& depth_out) {
+                             glm::vec3& p, glm::vec3& normal_out, float& depth_out,
+                             const glm::vec3* motion_start = nullptr) {
     if (!collider.shape || !collider.shape->enabled) return false;
     const collision::Shape& s = *collider.shape;
 
@@ -286,20 +379,21 @@ inline bool project_particle(const ClothCollider& collider, float thickness,
                            s.type == collision::ShapeType::Capsule);
     if (!two_pose) {
         return detail::project_at_pose_(s, collider.position, collider.orientation, collider.sweep,
-                                thickness, p, normal_out, depth_out);
+                                         thickness, p, normal_out, depth_out, motion_start);
     }
 
     // Probe both poses on copies, so the loser never perturbs the particle.
     glm::vec3 p_start = p, n_start(0.0f);
     float d_start = 0.0f;
     const bool hit_start = detail::project_at_pose_(s, collider.position, collider.orientation,
-                                            glm::vec3(0.0f), thickness, p_start, n_start, d_start);
+                                                    glm::vec3(0.0f), thickness, p_start, n_start,
+                                                    d_start, motion_start);
 
     glm::vec3 p_end = p, n_end(0.0f);
     float d_end = 0.0f;
     const bool hit_end = detail::project_at_pose_(s, collider.position + collider.sweep,
-                                          collider.end_orientation, glm::vec3(0.0f), thickness,
-                                          p_end, n_end, d_end);
+                                                  collider.end_orientation, glm::vec3(0.0f),
+                                                  thickness, p_end, n_end, d_end, motion_start);
 
     if (!hit_start && !hit_end) return false;
     if (hit_end && (!hit_start || d_end > d_start)) {

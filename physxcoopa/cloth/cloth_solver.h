@@ -393,7 +393,12 @@ inline void solve_cloth(Cloth& c, const std::vector<ClothCollider>& colliders,
                         }
                         glm::vec3 normal(0.0f);
                         float depth = 0.0f;
-                        if (!project_particle(collider, c.params.thickness, p.position, normal, depth)) {
+                        // prev_position is this substep's start, set at stage 2 -- so the swept
+                        // crossing test against a mesh covers every way the particle could have
+                        // ended up across the surface since: integration, constraints, tethers and
+                        // self-collision alike, not just its ballistic motion.
+                        if (!project_particle(collider, c.params.thickness, p.position, normal, depth,
+                                              &p.prev_position)) {
                             continue;
                         }
                         scratch.contact_normal[i] += normal;

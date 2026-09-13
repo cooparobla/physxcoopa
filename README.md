@@ -47,10 +47,11 @@ call sites to model against), but no consumer of physxcoopa currently installs a
 | [`collision/`](physxcoopa/collision/README.md) | `Shape`, `ContactManifold`/`ContactEvent`, and every shape-pair's contact generation (SAT, clipping, segment math, mesh internal-edge correction). |
 | [`broadphase/`](physxcoopa/broadphase/README.md) | Dynamic AABB tree, layer matrix, persistent pair cache. |
 | [`dynamics/`](physxcoopa/dynamics/README.md) | `Body`, inertia tensors, the integrator, islands, and the sequential-impulse solver. |
+| [`cloth/`](physxcoopa/cloth/README.md) | Small-substep XPBD cloth — sheets that drape over rigid colliders and follow bodies they are pinned to. One-way coupled, like Unity's `Cloth`. |
 | [`query/`](physxcoopa/query/README.md) | Raycast/sphere-cast/overlap shape-dispatch helpers behind `PhysicsWorld`'s query API. |
 | [`debug/`](physxcoopa/debug/README.md) | Pure-data debug line visualization. |
 | [`loaders/`](physxcoopa/loaders/README.md) | `TriangleMeshLoader` — `coopa::asset::AssetManager` integration for mesh colliders. |
-| [`components/`](physxcoopa/components/README.md) | `Collider`/`BoxCollider`/`SphereCollider`/`CapsuleCollider`/`MeshCollider`/`RigidbodyComponent`/`FixedUpdateBehaviour`. |
+| [`components/`](physxcoopa/components/README.md) | `Collider`/`BoxCollider`/`SphereCollider`/`CapsuleCollider`/`MeshCollider`/`RigidbodyComponent`/`HingeJointComponent`/`ClothComponent`/`FixedUpdateBehaviour`. |
 | [`system/`](physxcoopa/system/README.md) | `PhysicsSystem` — the only file depending on `coopa::scene`. |
 | [`world.h`](physxcoopa/world.h) | `PhysicsWorld` — the object `test.cpp` constructs directly. |
 | [`physx_yaml.h`](physxcoopa/physx_yaml.h) | `register_physics_components(AssetManager&)` + re-exports `install_physics_system()`. |

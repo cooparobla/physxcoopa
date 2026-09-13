@@ -21,6 +21,9 @@
 #include <physxcoopa/query/queries.h>
 #include <physxcoopa/debug/debug_draw.h>
 #include <physxcoopa/system/physics_system.h>
+#include <physxcoopa/cloth/cloth_builder.h>
+#include <physxcoopa/cloth/cloth_solver.h>
+#include <physxcoopa/components/cloth.h>
 #include <physxcoopa/components/box_collider.h>
 #include <physxcoopa/components/sphere_collider.h>
 #include <physxcoopa/components/rigidbody.h>
@@ -2168,6 +2171,832 @@ static void test_job_parallel_stepping_matches_serial_determinism() {
     ASSERT_TRUE(serial_hash == parallel_hash);
 }
 
+// --- Phase 11: cloth ---
+
+/** @brief Builds a 4x4 m sheet centred at `center`, with the given resolution and params. */
+static cloth::Cloth make_test_sheet(uint32_t res, const glm::vec3& center,
+                                    const cloth::ClothParams& params = {}) {
+    cloth::GridClothDesc desc;
+    desc.columns = res;
+    desc.rows = res;
+    desc.width = 4.0f;
+    desc.height = 4.0f;
+    desc.center = center;
+    desc.total_mass = 1.0f;
+    desc.params = params;
+    return cloth::make_grid_cloth(desc);
+}
+
+/**
+ * @brief Grid topology counts, plus the property the whole parallel story rests on: every
+ *        ConstraintBatch's particle set is pairwise disjoint. If that ever regresses, a
+ *        job-parallel dispatcher would silently produce nondeterministic results rather than
+ *        crashing, so it is asserted structurally here rather than being left to a race.
+ */
+static void test_cloth_grid_builder_topology_and_disjoint_batches() {
+    const uint32_t res = 9;
+    cloth::Cloth c = make_test_sheet(res, glm::vec3(0.0f, 0.0f, 2.0f));
+
+    ASSERT_TRUE(c.particles.size() == res * res);
+    ASSERT_TRUE(c.columns == res && c.rows == res);
+    // (res-1)*res horizontal + the same vertical + two diagonals per cell.
+    const std::size_t structural = 2u * (res - 1) * res;
+    const std::size_t shear = 2u * (res - 1) * (res - 1);
+    ASSERT_TRUE(c.stretch.size() == structural + shear);
+    ASSERT_TRUE(c.bend.size() == 2u * (res - 2) * res);
+    ASSERT_TRUE(c.triangles.size() == (res - 1) * (res - 1) * 6);
+
+    // Rest lengths must match the authored spacing exactly (4 m over res-1 gaps).
+    const float spacing = 4.0f / static_cast<float>(res - 1);
+    ASSERT_NEAR(c.stretch[0].rest_length, spacing, 1e-5f);
+
+    auto batches_disjoint = [](const std::vector<cloth::ClothConstraint>& list,
+                               const std::vector<cloth::ConstraintBatch>& batches,
+                               std::size_t particle_count) {
+        for (const cloth::ConstraintBatch& b : batches) {
+            std::vector<bool> seen(particle_count, false);
+            for (uint32_t i = b.begin; i < b.end; ++i) {
+                if (seen[list[i].a] || seen[list[i].b]) return false;
+                seen[list[i].a] = true;
+                seen[list[i].b] = true;
+            }
+        }
+        return true;
+    };
+    ASSERT_TRUE(batches_disjoint(c.stretch, c.stretch_batches, c.particles.size()));
+    ASSERT_TRUE(batches_disjoint(c.bend, c.bend_batches, c.particles.size()));
+
+    // Every constraint must land in exactly one batch -- a gap would silently stop solving part
+    // of the sheet, which no visual check would obviously catch.
+    std::size_t covered = 0;
+    for (const cloth::ConstraintBatch& b : c.stretch_batches) covered += b.end - b.begin;
+    ASSERT_TRUE(covered == c.stretch.size());
+    covered = 0;
+    for (const cloth::ConstraintBatch& b : c.bend_batches) covered += b.end - b.begin;
+    ASSERT_TRUE(covered == c.bend.size());
+}
+
+/** @brief An unpinned sheet in free space falls exactly 0.5*g*t^2 -- the integrator sanity check,
+ *         mirroring test_free_fall_matches_analytic() for rigid bodies. Constraints are all
+ *         satisfied at rest, so they contribute nothing and the analytic result holds exactly. */
+static void test_cloth_free_fall_matches_analytic() {
+    PhysicsWorld world;
+    // Zero the two things that would otherwise (correctly) break the analytic result: velocity
+    // damping, and the aerodynamic drag/lift that are on by default -- a horizontal sheet falling
+    // flat presents maximum area to the flow, so default air_drag alone slows this fall by ~27%.
+    cloth::ClothParams params;
+    params.damping = 0.0f;
+    params.air_drag = 0.0f;
+    params.air_lift = 0.0f;
+    cloth::Cloth c = make_test_sheet(5, glm::vec3(0.0f, 0.0f, 10.0f), params);
+    const glm::vec3 start = c.particles[0].position;
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    const float h = util::k_default_fixed_dt;
+    const int steps = 60;
+    for (int i = 0; i < steps; ++i) world.step_fixed(h);
+
+    const cloth::Cloth* sim = world.get_cloth(id);
+    const float t = static_cast<float>(steps) * h;
+    // Semi-implicit Euler over N substeps of hs accumulates 0.5*g*t^2 + 0.5*g*t*hs.
+    const float hs = h / static_cast<float>(world.config().cloth_substeps);
+    const float expected_drop = 0.5f * 9.81f * t * t + 0.5f * 9.81f * t * hs;
+    ASSERT_NEAR(start.z - sim->particles[0].position.z, expected_drop, 0.05f);
+    // Damping is the only thing acting laterally, and there is none: X/Y must not drift at all.
+    ASSERT_NEAR(sim->particles[0].position.x, start.x, 1e-4f);
+    ASSERT_NEAR(sim->particles[0].position.y, start.y, 1e-4f);
+}
+
+/** @brief Statically pinned particles never move, and the rest of the sheet hangs below them. */
+static void test_cloth_static_anchors_hold_and_sheet_hangs() {
+    PhysicsWorld world;
+    cloth::Cloth c = make_test_sheet(11, glm::vec3(0.0f, 0.0f, 5.0f));
+    const uint32_t pinned = cloth::pin_static(c, glm::vec3(0.0f, 0.0f, 5.0f), 0.5f);
+    ASSERT_TRUE(pinned > 0);
+    cloth::build_tethers(c);
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    const cloth::Cloth* sim = world.get_cloth(id);
+    for (const cloth::ClothAnchor& a : sim->anchors) {
+        ASSERT_VEC3_NEAR(sim->particles[a.particle].position, a.world_position, 1e-5f);
+        ASSERT_TRUE(sim->particles[a.particle].inv_mass == 0.0f);
+    }
+    // The free corners must have fallen well below the pinned centre.
+    ASSERT_TRUE(sim->bounds.min.z < 4.0f);
+}
+
+/**
+ * @brief A sheet dropped onto a static sphere ends up entirely OUTSIDE it, and stays taut.
+ *
+ * The headline correctness test: no particle inside radius + thickness after settling is exactly
+ * what "the cloth does not sink through the ball" means, and the stretch bound is what separates
+ * a draped sheet from one that has exploded.
+ */
+static void test_cloth_drapes_over_static_sphere_without_penetrating() {
+    PhysicsWorld world;
+
+    const float radius = 1.0f;
+    const glm::vec3 sphere_center(0.0f, 0.0f, 3.0f);
+    dynamics::Body ball;
+    ball.type = dynamics::BodyType::Static;
+    ball.position = sphere_center;
+    ball.inv_mass = 0.0f;
+    world.add_body(ball, collision::Shape::make_sphere(radius));
+
+    cloth::ClothParams params;
+    params.thickness = 0.03f;
+    cloth::Cloth c = make_test_sheet(21, sphere_center + glm::vec3(0.0f, 0.0f, radius + 0.05f), params);
+    cloth::pin_static(c, sphere_center + glm::vec3(0.0f, 0.0f, radius + 0.05f), 0.4f);
+    cloth::build_tethers(c);
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    const cloth::Cloth* sim = world.get_cloth(id);
+    for (const cloth::ClothParticle& p : sim->particles) {
+        // A small tolerance below `thickness`: a particle may sit slightly inside the standoff
+        // between the collision projection and the next substep's constraint pass. Inside the
+        // SPHERE itself is what must never happen.
+        ASSERT_TRUE(glm::length(p.position - sphere_center) >= radius);
+    }
+
+    float max_stretch = 0.0f;
+    for (const cloth::ClothConstraint& k : sim->stretch) {
+        const float len = glm::length(sim->particles[k.a].position - sim->particles[k.b].position);
+        max_stretch = std::max(max_stretch, len / k.rest_length);
+    }
+    ASSERT_TRUE(max_stretch < 1.25f);
+
+    // And the sheet must actually have wrapped the ball, not just hovered above it.
+    ASSERT_TRUE(sim->bounds.min.z < sphere_center.z);
+}
+
+/** @brief Tethers cap every particle's distance from its anchor at the geodesic rest length times
+ *         tether_scale, even under a hard sideways yank that distance constraints alone would need
+ *         far more iterations to resist. */
+static void test_cloth_tethers_cap_distance_to_anchor() {
+    PhysicsWorld world;
+
+    cloth::ClothParams params;
+    params.tether_scale = 1.02f;
+    params.external_acceleration = glm::vec3(200.0f, 0.0f, 0.0f); // a violent lateral yank
+    cloth::Cloth c = make_test_sheet(11, glm::vec3(0.0f, 0.0f, 5.0f), params);
+    cloth::pin_static(c, glm::vec3(0.0f, 0.0f, 5.0f), 0.5f);
+    cloth::build_tethers(c);
+    ASSERT_TRUE(!c.tethers.empty());
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    for (int i = 0; i < 180; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    const cloth::Cloth* sim = world.get_cloth(id);
+    for (const cloth::ClothTether& t : sim->tethers) {
+        const float d = glm::length(sim->particles[t.particle].position -
+                                    sim->particles[t.anchor].position);
+        ASSERT_TRUE(d <= t.max_length + 1e-3f);
+    }
+}
+
+/** @brief Particles anchored to a kinematic body track that body exactly as it moves, and the rest
+ *         of the sheet comes with it -- the "cape on a moving character" case. */
+static void test_cloth_anchors_follow_moving_kinematic_body() {
+    PhysicsWorld world;
+
+    dynamics::Body ball;
+    ball.type = dynamics::BodyType::Kinematic;
+    ball.position = glm::vec3(0.0f, 0.0f, 3.0f);
+    ball.inv_mass = 0.0f;
+    ball.use_gravity = false;
+    dynamics::BodyId ball_id = world.add_body(ball, collision::Shape::make_sphere(1.0f));
+
+    cloth::Cloth c = make_test_sheet(15, glm::vec3(0.0f, 0.0f, 4.05f));
+    const uint32_t pinned = cloth::pin_to_body(c, ball_id, *world.get_body(ball_id),
+                                               glm::vec3(0.0f, 0.0f, 4.0f), 0.4f);
+    ASSERT_TRUE(pinned > 0);
+    cloth::build_tethers(c);
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    for (int i = 0; i < 120; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    const float h = util::k_default_fixed_dt;
+    const float speed = 2.0f;
+    for (int i = 0; i < 120; ++i) {
+        dynamics::Body* b = world.get_body(ball_id);
+        b->position.x += speed * h;
+        b->linear_velocity = glm::vec3(speed, 0.0f, 0.0f);
+        world.step_fixed(h);
+    }
+
+    const dynamics::Body* b = world.get_body(ball_id);
+    const cloth::Cloth* sim = world.get_cloth(id);
+    for (const cloth::ClothAnchor& a : sim->anchors) {
+        const glm::vec3 expected = b->position + b->orientation * a.local_position;
+        ASSERT_VEC3_NEAR(sim->particles[a.particle].position, expected, 1e-4f);
+    }
+    // The sheet as a whole has travelled with the ball (it trails, so it lags -- but not by much).
+    float mean_x = 0.0f;
+    for (const cloth::ClothParticle& p : sim->particles) mean_x += p.position.x;
+    mean_x /= static_cast<float>(sim->particles.size());
+    ASSERT_TRUE(mean_x > b->position.x - 0.5f && mean_x <= b->position.x + 0.5f);
+}
+
+/**
+ * @brief Self-collision separates particles that are not topological neighbours, and does nothing
+ *        when disabled.
+ *
+ * Deliberately isolated from the constraint solve: the cloth's stretch/bend constraints are
+ * cleared, so the only thing that can move a particle is the self-collision stage itself. Testing
+ * it through a naturally-folding drape instead would make the assertion depend on whether that
+ * particular sheet happened to fold at all, which is exactly the sort of test that passes for the
+ * wrong reason. The real-drape path is still exercised (with self_collision on) by
+ * test_cloth_stepping_is_deterministic_serial_and_parallel().
+ */
+static void test_cloth_self_collision_separates_non_neighbour_particles() {
+    auto run = [](bool self_collision) {
+        PhysicsWorld world;
+
+        cloth::ClothParams params;
+        params.self_collision = self_collision;
+        params.gravity_scale = 0.0f;
+        params.air_drag = 0.0f;
+        params.air_lift = 0.0f;
+        cloth::Cloth c = make_test_sheet(9, glm::vec3(0.0f, 0.0f, 5.0f), params);
+        const float d_min = c.params.self_distance;
+        ASSERT_TRUE(d_min > 0.0f); // derived from the grid spacing at build time
+
+        c.stretch.clear();
+        c.bend.clear();
+        c.stretch_batches.clear();
+        c.bend_batches.clear();
+
+        // Collapse every particle into a ~1 cm blob, spread deterministically so no two start
+        // exactly coincident (a zero separation vector has no defined push direction).
+        for (std::size_t i = 0; i < c.particles.size(); ++i) {
+            const float f = static_cast<float>(i) * 0.013f;
+            c.particles[i].position = glm::vec3(std::sin(f) * 0.01f, std::cos(f) * 0.01f,
+                                                5.0f + std::sin(f * 2.0f) * 0.01f);
+            c.particles[i].prev_position = c.particles[i].position;
+            c.particles[i].velocity = glm::vec3(0.0f);
+        }
+
+        const uint32_t cols = c.columns;
+        cloth::ClothId id = world.add_cloth(std::move(c));
+        for (int i = 0; i < 60; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+        const cloth::Cloth* sim = world.get_cloth(id);
+        std::size_t violations = 0;
+        for (std::size_t i = 0; i < sim->particles.size(); ++i) {
+            for (std::size_t j = i + 1; j < sim->particles.size(); ++j) {
+                const int32_t xi = static_cast<int32_t>(i % cols), yi = static_cast<int32_t>(i / cols);
+                const int32_t xj = static_cast<int32_t>(j % cols), yj = static_cast<int32_t>(j / cols);
+                if (std::abs(xi - xj) <= 1 && std::abs(yi - yj) <= 1) continue; // 1-ring is exempt
+                if (glm::length(sim->particles[i].position - sim->particles[j].position) < d_min * 0.8f) {
+                    ++violations;
+                }
+            }
+        }
+        return violations;
+    };
+
+    ASSERT_TRUE(run(/*self_collision=*/true) == 0);
+    ASSERT_TRUE(run(/*self_collision=*/false) > 0); // the control: without it, they stay collapsed
+}
+
+/** @brief A settled cloth sleeps, and a moving anchor body wakes it again -- the cloth analogue of
+ *         the kinematic wake rule dynamics/solver.h applies to rigid bodies. */
+static void test_cloth_sleeps_when_settled_and_wakes_on_anchor_motion() {
+    PhysicsWorld world;
+
+    dynamics::Body post;
+    post.type = dynamics::BodyType::Kinematic;
+    post.position = glm::vec3(0.0f, 0.0f, 5.0f);
+    post.inv_mass = 0.0f;
+    post.use_gravity = false;
+    dynamics::BodyId post_id = world.add_body(post, collision::Shape{}); // no collider needed
+
+    cloth::ClothParams params;
+    params.damping = 4.0f;          // settle fast, so the test stays short
+    params.sleep_threshold = 0.25f;
+    params.sleep_time = 0.25f;
+    cloth::Cloth c = make_test_sheet(9, glm::vec3(0.0f, 0.0f, 5.0f), params);
+    cloth::pin_to_body(c, post_id, *world.get_body(post_id), glm::vec3(0.0f, 0.0f, 5.0f), 3.0f);
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    for (int i = 0; i < 600; ++i) world.step_fixed(util::k_default_fixed_dt);
+    ASSERT_TRUE(!world.get_cloth(id)->awake);
+
+    // A sleeping cloth must be perfectly frozen, not merely slow.
+    const glm::vec3 before = world.get_cloth(id)->particles.back().position;
+    for (int i = 0; i < 60; ++i) world.step_fixed(util::k_default_fixed_dt);
+    ASSERT_VEC3_NEAR(world.get_cloth(id)->particles.back().position, before, 1e-6f);
+
+    world.get_body(post_id)->position.x += 0.5f;
+    world.step_fixed(util::k_default_fixed_dt);
+    ASSERT_TRUE(world.get_cloth(id)->awake);
+}
+
+/** @brief Cloth particle state is part of world_state_hash(), and the whole step is invariant to
+ *         whether a JobEngine is installed -- the same oracle
+ *         test_job_parallel_stepping_matches_serial_determinism() uses for rigid bodies, extended
+ *         to cover the cloth pass. Also asserts the hash actually MOVES when cloth exists, so a
+ *         hash that silently ignored particles could not pass. */
+static void test_cloth_stepping_is_deterministic_serial_and_parallel() {
+    auto build_and_run = [](coopa::job::JobEngine* jobs) {
+        PhysicsWorld world;
+        world.set_parallel_threshold(1);
+        world.set_job_engine(jobs);
+
+        dynamics::Body ball;
+        ball.type = dynamics::BodyType::Static;
+        ball.position = glm::vec3(0.0f, 0.0f, 3.0f);
+        ball.inv_mass = 0.0f;
+        world.add_body(ball, collision::Shape::make_sphere(1.0f));
+
+        cloth::ClothParams params;
+        params.self_collision = true;
+        params.wind = glm::vec3(0.4f, 0.0f, 0.0f);
+        params.wind_turbulence = 0.6f;
+        cloth::Cloth c = make_test_sheet(13, glm::vec3(0.0f, 0.0f, 4.05f), params);
+        cloth::pin_static(c, glm::vec3(0.0f, 0.0f, 4.05f), 0.4f);
+        cloth::build_tethers(c);
+        world.add_cloth(std::move(c));
+
+        for (int i = 0; i < 180; ++i) world.step_fixed(util::k_default_fixed_dt);
+        return world.world_state_hash();
+    };
+
+    const uint64_t serial_hash = build_and_run(nullptr);
+    coopa::job::JobEngine jobs(4);
+    const uint64_t parallel_hash = build_and_run(&jobs);
+    ASSERT_TRUE(serial_hash == parallel_hash);
+
+    // Rebuilding the same scene twice must reproduce the hash exactly (turbulence is derived from
+    // the cloth's own accumulated time, never rand()).
+    ASSERT_TRUE(build_and_run(nullptr) == serial_hash);
+
+    PhysicsWorld empty;
+    ASSERT_TRUE(empty.world_state_hash() != serial_hash);
+}
+
+/** @brief ClothId generational handles reject a stale handle after the slot is recycled, matching
+ *         test_body_id_generation_rejects_stale_handle(). */
+static void test_cloth_id_generation_rejects_stale_handle() {
+    PhysicsWorld world;
+    cloth::ClothId a = world.add_cloth(make_test_sheet(5, glm::vec3(0.0f)));
+    ASSERT_TRUE(world.is_valid(a));
+    ASSERT_TRUE(world.cloth_count() == 1);
+
+    world.remove_cloth(a);
+    ASSERT_TRUE(!world.is_valid(a));
+    ASSERT_TRUE(world.get_cloth(a) == nullptr);
+    ASSERT_TRUE(world.cloth_count() == 0);
+
+    cloth::ClothId b = world.add_cloth(make_test_sheet(5, glm::vec3(0.0f)));
+    ASSERT_TRUE(b.index == a.index);   // slot recycled
+    ASSERT_TRUE(b.generation != a.generation);
+    ASSERT_TRUE(world.is_valid(b) && !world.is_valid(a));
+
+    // An empty cloth is refused rather than occupying a slot.
+    ASSERT_TRUE(!world.add_cloth(cloth::Cloth{}).is_valid());
+}
+
+/** @brief ClothComponent binds through PhysicsSystem, resolves an anchor named by object, follows
+ *         that object's kinematic Rigidbody, and unbinds when the component goes away. */
+static void test_scene_binding_cloth_resolves_anchor_and_follows_body() {
+    using namespace coopa::scene;
+
+    Scene scene("ClothBindTest");
+
+    auto ball = std::make_unique<SceneObject>("ball");
+    ball->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 3.0f));
+    ball->add_component<components::SphereCollider>()->set_radius(1.0f);
+    auto* rb = ball->add_component<components::RigidbodyComponent>();
+    rb->is_kinematic = true;
+    rb->use_gravity = false;
+    SceneObject* ball_ptr = ball.get();
+    scene.add_root_object(std::move(ball));
+
+    auto sheet = std::make_unique<SceneObject>("cloth");
+    sheet->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 4.05f));
+    auto* cc = sheet->add_component<components::ClothComponent>();
+    cc->columns = 15;
+    cc->rows = 15;
+    cc->width = 4.0f;
+    cc->height = 4.0f;
+    components::ClothAnchorSpec spec;
+    spec.object = "ball";
+    spec.point = glm::vec3(0.0f, 0.0f, 1.0f); // the ball's own local frame: its crown
+    spec.radius = 0.4f;
+    cc->anchors.push_back(spec);
+    scene.add_root_object(std::move(sheet));
+
+    scene.start();
+    system::install_physics_system(scene);
+
+    const float h = util::k_default_fixed_dt;
+    for (int i = 0; i < 180; ++i) {
+        scene.update(h);
+        scene.late_update(h);
+    }
+
+    const cloth::Cloth* sim = cc->cloth();
+    ASSERT_TRUE(sim != nullptr);
+    ASSERT_TRUE(sim->particles.size() == 15u * 15u);
+    ASSERT_TRUE(!sim->anchors.empty());
+    for (const cloth::ClothParticle& p : sim->particles) {
+        ASSERT_TRUE(glm::length(p.position - glm::vec3(0.0f, 0.0f, 3.0f)) >= 1.0f);
+    }
+
+    for (int i = 0; i < 120; ++i) {
+        coopa::util::Transform& t = ball_ptr->get_transform()->transform();
+        t.set_position(t.position() + glm::vec3(2.0f * h, 0.0f, 0.0f));
+        scene.update(h);
+        scene.late_update(h);
+    }
+
+    sim = cc->cloth();
+    const float ball_x = ball_ptr->get_transform()->transform().position().x;
+    ASSERT_TRUE(ball_x > 3.0f);
+    float mean_x = 0.0f;
+    for (const cloth::ClothParticle& p : sim->particles) mean_x += p.position.x;
+    mean_x /= static_cast<float>(sim->particles.size());
+    ASSERT_TRUE(std::abs(mean_x - ball_x) < 0.6f);
+
+    // Removing the component releases the cloth on the next refresh.
+    cc->owner->remove_component(cc);
+    dynamic_cast<system::PhysicsSystem*>(scene.find_system("Physics"))->refresh();
+    scene.update(h);
+    scene.late_update(h);
+    ASSERT_TRUE(dynamic_cast<system::PhysicsSystem*>(scene.find_system("Physics"))->world().cloth_count() == 0);
+}
+
+/**
+ * @brief Self-collision must never be the last word on a particle's position: whatever it pushes,
+ *        the rigid-collision stage runs afterwards and puts it back outside the body.
+ *
+ * Built to fail loudly on the stage order, not to hope for it. Two non-neighbouring particles are
+ * placed 2 cm apart just outside a sphere with self_distance forced to 20 cm, so self-collision
+ * must shove them 9 cm apart -- driving the inner one ~5 cm INSIDE the sphere. Every other force is
+ * removed (no constraints, no gravity, every other particle parked far away) so the assertion can
+ * only be about ordering.
+ */
+static void test_cloth_self_collision_cannot_push_a_particle_into_a_collider() {
+    PhysicsWorld world;
+
+    const float radius = 1.0f;
+    dynamics::Body ball;
+    ball.type = dynamics::BodyType::Static;
+    ball.position = glm::vec3(0.0f);
+    ball.inv_mass = 0.0f;
+    world.add_body(ball, collision::Shape::make_sphere(radius));
+
+    cloth::ClothParams params;
+    params.self_collision = true;
+    params.self_distance = 0.2f;   // >> the 2 cm gap below, so the push is large and predictable
+    params.gravity_scale = 0.0f;
+    params.air_drag = 0.0f;
+    params.air_lift = 0.0f;
+    params.thickness = 0.03f;
+    // ONE substep, so exactly one pass of each stage runs and the ordering is directly observable.
+    // At the default 4 substeps the defect hides itself: a particle self-collision shoved inside the
+    // sphere gets projected back out by the NEXT substep's rigid stage, and after four rounds the
+    // residual is under a centimetre -- small enough to pass a naive assertion while still being
+    // exactly the intermittent surface-popping this ordering causes in a real drape.
+    params.substeps = 1;
+    // Parked far from the sphere; only the two probe particles are moved onto it.
+    cloth::Cloth c = make_test_sheet(9, glm::vec3(0.0f, 0.0f, 50.0f), params);
+    c.stretch.clear();
+    c.bend.clear();
+    c.stretch_batches.clear();
+    c.bend_batches.clear();
+
+    const uint32_t probe_a = 0;                 // (0,0)
+    const uint32_t probe_b = 5 * c.columns + 5; // (5,5) -- well outside the exempt 1-ring
+    c.particles[probe_a].position = glm::vec3(radius + 0.06f, 0.0f, 0.0f);
+    c.particles[probe_b].position = glm::vec3(radius + 0.04f, 0.0f, 0.0f);
+    for (uint32_t i : {probe_a, probe_b}) {
+        c.particles[i].prev_position = c.particles[i].position;
+        c.particles[i].velocity = glm::vec3(0.0f);
+    }
+
+    cloth::ClothId id = world.add_cloth(std::move(c));
+    world.step_fixed(util::k_default_fixed_dt);
+
+    const cloth::Cloth* sim = world.get_cloth(id);
+    // They must have been separated -- otherwise the test proves nothing about ordering.
+    const float gap = glm::length(sim->particles[probe_a].position - sim->particles[probe_b].position);
+    ASSERT_TRUE(gap > 0.05f);
+    // ...and neither may have been left inside the sphere by that separation. The rigid stage runs
+    // last, so the surviving clearance is the FULL standoff, not merely "not interpenetrating".
+    ASSERT_TRUE(glm::length(sim->particles[probe_a].position) >= radius + params.thickness - 1e-4f);
+    ASSERT_TRUE(glm::length(sim->particles[probe_b].position) >= radius + params.thickness - 1e-4f);
+}
+
+/**
+ * @brief A still collider's projection is unchanged by the swept code path, to the bit.
+ *
+ * The swept branch has to be inert when nothing is moving, or every settled drape in the engine
+ * would silently shift. Asserted analytically rather than by hashing: a particle inside a stationary
+ * unit sphere lands exactly on radius + thickness along its own radial direction.
+ */
+static void test_cloth_still_collider_sweep_is_inert() {
+    collision::Shape sphere = collision::Shape::make_sphere(1.0f);
+    sphere.enabled = true;
+
+    cloth::ClothCollider collider;
+    collider.shape = &sphere;
+    collider.position = glm::vec3(0.0f);
+    collider.bounds = collision::world_bounds(sphere, collider.position, collider.orientation);
+    ASSERT_TRUE(!collider.is_swept());
+
+    glm::vec3 p(0.5f, 0.0f, 0.0f);
+    glm::vec3 normal(0.0f);
+    float depth = 0.0f;
+    ASSERT_TRUE(cloth::project_particle(collider, 0.03f, p, normal, depth));
+    ASSERT_VEC3_NEAR(p, glm::vec3(1.03f, 0.0f, 0.0f), 1e-5f);
+    ASSERT_VEC3_NEAR(normal, glm::vec3(1.0f, 0.0f, 0.0f), 1e-5f);
+    ASSERT_NEAR(depth, 0.53f, 1e-5f);
+
+    // A particle already clear of the surface is untouched.
+    glm::vec3 q(2.0f, 0.0f, 0.0f);
+    ASSERT_TRUE(!cloth::project_particle(collider, 0.03f, q, normal, depth));
+    ASSERT_VEC3_NEAR(q, glm::vec3(2.0f, 0.0f, 0.0f), 1e-6f);
+}
+
+/**
+ * @brief A moving collider is projected out of the volume it SWEEPS, not just the pose it starts at.
+ *
+ * This is what keeps the sheet clear of a collider that the renderer will draw at several
+ * intermediate poses before the cloth is solved again (above 60 Hz). Both shape paths are covered:
+ * a sphere, whose swept volume is a capsule and therefore exact; and a box, which falls back to
+ * probing the start and end poses and keeping the deeper correction.
+ */
+static void test_cloth_swept_collider_projects_out_of_the_motion_path() {
+    glm::vec3 normal(0.0f);
+    float depth = 0.0f;
+
+    // --- Sphere: exact, via the capsule the motion segment describes ---
+    collision::Shape sphere = collision::Shape::make_sphere(1.0f);
+    sphere.enabled = true;
+    cloth::ClothCollider moving;
+    moving.shape = &sphere;
+    moving.position = glm::vec3(0.0f);
+    moving.sweep = glm::vec3(2.0f, 0.0f, 0.0f);
+    moving.bounds = geometry::AABB::merge(
+        collision::world_bounds(sphere, moving.position, moving.orientation),
+        collision::world_bounds(sphere, moving.position + moving.sweep, moving.orientation));
+    ASSERT_TRUE(moving.is_swept());
+
+    // 1.58 m from the start centre -- comfortably clear of the sphere where it is now, but only
+    // 0.5 m off the line it travels along.
+    const glm::vec3 start(1.5f, 0.5f, 0.0f);
+    glm::vec3 p = start;
+    cloth::ClothCollider still = moving;
+    still.sweep = glm::vec3(0.0f);
+    ASSERT_TRUE(!cloth::project_particle(still, 0.03f, p, normal, depth)); // unswept: no contact
+    ASSERT_VEC3_NEAR(p, start, 1e-6f);
+
+    ASSERT_TRUE(cloth::project_particle(moving, 0.03f, p, normal, depth)); // swept: pushed clear
+    ASSERT_VEC3_NEAR(p, glm::vec3(1.5f, 1.03f, 0.0f), 1e-5f);
+    ASSERT_VEC3_NEAR(normal, glm::vec3(0.0f, 1.0f, 0.0f), 1e-5f);
+
+    // --- Box: start/end probe, deeper correction wins ---
+    collision::Shape box = collision::Shape::make_box(glm::vec3(0.5f));
+    box.enabled = true;
+    cloth::ClothCollider moving_box;
+    moving_box.shape = &box;
+    moving_box.position = glm::vec3(0.0f);
+    moving_box.sweep = glm::vec3(2.0f, 0.0f, 0.0f);
+    moving_box.end_orientation = moving_box.orientation;
+    moving_box.bounds = geometry::AABB::merge(
+        collision::world_bounds(box, moving_box.position, moving_box.orientation),
+        collision::world_bounds(box, moving_box.position + moving_box.sweep, moving_box.end_orientation));
+
+    // x = 1.52 is 1.02 m clear of the box at the origin, but 2 cm INSIDE it once it has travelled.
+    glm::vec3 b(1.52f, 0.0f, 0.0f);
+    cloth::ClothCollider still_box = moving_box;
+    still_box.sweep = glm::vec3(0.0f);
+    ASSERT_TRUE(!cloth::project_particle(still_box, 0.03f, b, normal, depth));
+
+    ASSERT_TRUE(cloth::project_particle(moving_box, 0.03f, b, normal, depth));
+    ASSERT_NEAR(b.x, 2.0f - (0.5f + 0.03f), 1e-5f); // exits the near -X face of the END pose
+    ASSERT_VEC3_NEAR(normal, glm::vec3(-1.0f, 0.0f, 0.0f), 1e-5f);
+}
+
+/**
+ * @brief A particle that crosses a mesh surface in one substep must be put back on the side it
+ *        came from, not left on the far side.
+ *
+ * This is the failure the mesh branch's proximity-only test cannot see: the particle lands beyond
+ * `thickness` of every triangle, so the BVH query returns nothing and it stays through the floor
+ * permanently. Sphere/box/capsule have no equivalent hole -- they all handle "already inside"
+ * explicitly -- but a triangle soup has no cheap inside to test against, so the crossing itself has
+ * to be caught.
+ */
+static void test_cloth_mesh_collider_stops_a_tunnelling_particle() {
+    geometry::TriangleMesh floor = make_two_triangle_floor(); // a 4x4 quad in the z = 0 plane
+    collision::Shape shape = collision::Shape::make_mesh(&floor);
+    shape.enabled = true;
+
+    cloth::ClothCollider collider;
+    collider.shape = &shape;
+    collider.position = glm::vec3(0.0f);
+    collider.bounds = collision::world_bounds(shape, collider.position, collider.orientation);
+
+    const float thickness = 0.03f;
+    const glm::vec3 start(0.0f, 0.0f, 0.5f);
+    glm::vec3 p(0.0f, 0.0f, -0.5f); // one substep of a ~120 m/s particle: straight through
+    glm::vec3 normal(0.0f);
+    float depth = 0.0f;
+
+    ASSERT_TRUE(cloth::project_particle(collider, thickness, p, normal, depth, &start));
+    ASSERT_NEAR(p.z, thickness, 1e-4f);                       // back on the entry side
+    ASSERT_VEC3_NEAR(normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-4f);
+
+    // ...and symmetrically from below: a mesh is a surface, not a one-way gate.
+    const glm::vec3 start_below(0.0f, 0.0f, -0.5f);
+    glm::vec3 q(0.0f, 0.0f, 0.5f);
+    ASSERT_TRUE(cloth::project_particle(collider, thickness, q, normal, depth, &start_below));
+    ASSERT_NEAR(q.z, -thickness, 1e-4f);
+    ASSERT_VEC3_NEAR(normal, glm::vec3(0.0f, 0.0f, -1.0f), 1e-4f);
+}
+
+/** @brief Driven through the real solver, not just project_particle(): a cloth fired hard at a mesh
+ *         floor ends up above it. Catches a stage-7 wiring mistake that the unit test above cannot
+ *         (e.g. failing to pass the particle's start-of-substep position). */
+static void test_cloth_mesh_collider_stops_tunnelling_through_the_solver() {
+    geometry::TriangleMesh floor = make_two_triangle_floor();
+
+    PhysicsWorld world;
+    dynamics::Body floor_body;
+    floor_body.type = dynamics::BodyType::Static;
+    floor_body.inv_mass = 0.0f;
+    world.add_body(floor_body, collision::Shape::make_mesh(&floor));
+
+    cloth::ClothParams params;
+    params.thickness = 0.03f;
+    params.air_drag = 0.0f;
+    params.air_lift = 0.0f;
+    // A small sheet dropped from just above the floor at high speed.
+    cloth::GridClothDesc desc;
+    desc.columns = 5;
+    desc.rows = 5;
+    desc.width = 1.0f;
+    desc.height = 1.0f;
+    desc.center = glm::vec3(0.0f, 0.0f, 1.0f);
+    desc.total_mass = 1.0f;
+    desc.params = params;
+    cloth::Cloth c = cloth::make_grid_cloth(desc);
+    for (cloth::ClothParticle& particle : c.particles) particle.velocity = glm::vec3(0.0f, 0.0f, -60.0f);
+    cloth::ClothId id = world.add_cloth(std::move(c));
+
+    for (int i = 0; i < 120; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    const cloth::Cloth* sim = world.get_cloth(id);
+    for (const cloth::ClothParticle& particle : sim->particles) {
+        ASSERT_TRUE(particle.position.z > 0.0f);
+    }
+}
+
+/** @brief A particle already sitting shallowly BEHIND the surface is recovered through the front
+ *         face, not pushed further behind. Today's code derives the push direction from
+ *         (particle - closest point), which for a penetrating particle points the wrong way and
+ *         cements the penetration at exactly `thickness` on the wrong side. */
+static void test_cloth_mesh_collider_recovers_a_particle_behind_the_surface() {
+    geometry::TriangleMesh floor = make_two_triangle_floor();
+    collision::Shape shape = collision::Shape::make_mesh(&floor);
+    shape.enabled = true;
+
+    cloth::ClothCollider collider;
+    collider.shape = &shape;
+    collider.position = glm::vec3(0.0f);
+    collider.bounds = collision::world_bounds(shape, collider.position, collider.orientation);
+
+    const float thickness = 0.03f;
+    glm::vec3 p(0.0f, 0.0f, -0.01f); // 1 cm under the floor, motionless
+    glm::vec3 normal(0.0f);
+    float depth = 0.0f;
+
+    ASSERT_TRUE(cloth::project_particle(collider, thickness, p, normal, depth));
+    ASSERT_NEAR(p.z, thickness, 1e-4f);
+    ASSERT_VEC3_NEAR(normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-4f);
+}
+
+/** @brief A particle a hair ABOVE the surface keeps taking exactly the path it takes today: pushed
+ *         straight up to `thickness` along the separation direction. The regression guard for every
+ *         settled drape in the engine. */
+static void test_cloth_mesh_collider_front_side_projection_is_unchanged() {
+    geometry::TriangleMesh floor = make_two_triangle_floor();
+    collision::Shape shape = collision::Shape::make_mesh(&floor);
+    shape.enabled = true;
+
+    cloth::ClothCollider collider;
+    collider.shape = &shape;
+    collider.position = glm::vec3(0.0f);
+    collider.bounds = collision::world_bounds(shape, collider.position, collider.orientation);
+
+    const float thickness = 0.03f;
+    glm::vec3 normal(0.0f);
+    float depth = 0.0f;
+
+    glm::vec3 p(0.0f, 0.0f, 0.01f);
+    ASSERT_TRUE(cloth::project_particle(collider, thickness, p, normal, depth));
+    ASSERT_NEAR(p.z, thickness, 1e-4f);
+    ASSERT_VEC3_NEAR(normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-4f);
+
+    // Beyond the standoff: untouched. Also pins the gate -- a particle whose motion is shorter than
+    // `thickness` cannot have crossed, so the swept raycast must not fire and must not perturb it.
+    const glm::vec3 start(0.0f, 0.0f, 0.11f);
+    glm::vec3 q(0.0f, 0.0f, 0.10f);
+    ASSERT_TRUE(!cloth::project_particle(collider, thickness, q, normal, depth, &start));
+    ASSERT_VEC3_NEAR(q, glm::vec3(0.0f, 0.0f, 0.10f), 1e-6f);
+}
+
+/**
+ * @brief A particle in a concave pocket -- in front of one triangle, behind its angled neighbour --
+ *        must not be flipped across the mesh.
+ *
+ * This is the guard on the "behind EVERY nearby triangle" rule. Deciding inside-ness from the single
+ * nearest triangle's normal would teleport this particle through the wall, which is the internal-
+ * edge failure mesh_contact.h needs TriangleAdjacency to avoid for rigid contacts.
+ */
+static void test_cloth_mesh_collider_concave_pocket_is_not_flipped() {
+    // A right-angled inside corner: floor in the z = 0 plane (normal +Z) and wall in the x = 0
+    // plane (normal +X). A particle just inside the corner is in front of both.
+    std::vector<glm::vec3> vertices = {
+        glm::vec3(0.0f, -1.0f, 0.0f), glm::vec3(1.0f, -1.0f, 0.0f), glm::vec3(1.0f, 1.0f, 0.0f),
+        glm::vec3(0.0f, 1.0f, 0.0f),
+        glm::vec3(0.0f, -1.0f, 1.0f), glm::vec3(0.0f, 1.0f, 1.0f),
+    };
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3, 0, 3, 5, 0, 5, 4};
+    std::vector<glm::vec3> normals = {
+        glm::vec3(0.0f, 0.0f, 1.0f), glm::vec3(0.0f, 0.0f, 1.0f),
+        glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(1.0f, 0.0f, 0.0f),
+    };
+    std::vector<geometry::TriangleAdjacency> adjacency(4);
+    geometry::TriangleMesh corner(std::move(vertices), std::move(indices),
+                                   std::move(normals), std::move(adjacency));
+
+    collision::Shape shape = collision::Shape::make_mesh(&corner);
+    shape.enabled = true;
+    cloth::ClothCollider collider;
+    collider.shape = &shape;
+    collider.position = glm::vec3(0.0f);
+    collider.bounds = collision::world_bounds(shape, collider.position, collider.orientation);
+
+    const float thickness = 0.03f;
+    // 2 mm behind the WALL but 2 cm above the FLOOR -- so the nearest triangle (the wall, 2 mm away)
+    // reports "behind" while the floor reports "in front". Deciding inside-ness from the nearest
+    // triangle alone would flip this particle 3.2 cm across the wall plane and into the room; the
+    // "behind EVERY nearby triangle" rule leaves it on the side it was already on.
+    glm::vec3 p(-0.002f, 0.0f, 0.02f);
+    glm::vec3 normal(0.0f);
+    float depth = 0.0f;
+    ASSERT_TRUE(cloth::project_particle(collider, thickness, p, normal, depth));
+
+    ASSERT_TRUE(p.x <= 0.0f);   // never teleported through the wall
+    ASSERT_TRUE(p.z >= 0.0f);   // and still above the floor
+
+    // The genuinely-penetrating case still recovers: put it behind BOTH faces and it must come back
+    // out, which is what stops the rule above from simply disabling recovery near a corner.
+    glm::vec3 q(-0.002f, 0.0f, -0.002f);
+    ASSERT_TRUE(cloth::project_particle(collider, thickness, q, normal, depth));
+    ASSERT_TRUE(q.x > 0.0f || q.z > 0.0f);
+}
+
+/** @brief A sheet settling on a mesh floor rests ON it, at the standoff, with nothing below --
+ *         the end-to-end regression guard for the common mesh-collider case. */
+static void test_cloth_settles_on_mesh_floor_at_thickness() {
+    geometry::TriangleMesh floor = make_two_triangle_floor();
+
+    PhysicsWorld world;
+    dynamics::Body floor_body;
+    floor_body.type = dynamics::BodyType::Static;
+    floor_body.inv_mass = 0.0f;
+    world.add_body(floor_body, collision::Shape::make_mesh(&floor));
+
+    cloth::ClothParams params;
+    params.thickness = 0.03f;
+    cloth::GridClothDesc desc;
+    desc.columns = 9;
+    desc.rows = 9;
+    desc.width = 2.0f;
+    desc.height = 2.0f;
+    desc.center = glm::vec3(0.0f, 0.0f, 0.6f);
+    desc.total_mass = 1.0f;
+    desc.params = params;
+    cloth::ClothId id = world.add_cloth(cloth::make_grid_cloth(desc));
+
+    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    const cloth::Cloth* sim = world.get_cloth(id);
+    float lowest = 1e9f;
+    for (const cloth::ClothParticle& p : sim->particles) lowest = std::min(lowest, p.position.z);
+    ASSERT_TRUE(lowest >= 0.0f);                       // nothing sank through
+    ASSERT_NEAR(lowest, params.thickness, 5e-3f);      // and it is resting at the standoff
+}
+
 int main() {
     RUN_TEST(test_ray_aabb_hand_computed);
     RUN_TEST(test_closest_points_segment_segment_parallel);
@@ -2240,6 +3069,27 @@ int main() {
     RUN_TEST(test_hinge_joint_zero_range_limit_acts_rigid);
     RUN_TEST(test_hinge_joint_islands_dynamic_pair_for_sleep);
     RUN_TEST(test_job_parallel_stepping_matches_serial_determinism);
+
+    RUN_TEST(test_cloth_grid_builder_topology_and_disjoint_batches);
+    RUN_TEST(test_cloth_free_fall_matches_analytic);
+    RUN_TEST(test_cloth_static_anchors_hold_and_sheet_hangs);
+    RUN_TEST(test_cloth_drapes_over_static_sphere_without_penetrating);
+    RUN_TEST(test_cloth_tethers_cap_distance_to_anchor);
+    RUN_TEST(test_cloth_anchors_follow_moving_kinematic_body);
+    RUN_TEST(test_cloth_self_collision_separates_non_neighbour_particles);
+    RUN_TEST(test_cloth_sleeps_when_settled_and_wakes_on_anchor_motion);
+    RUN_TEST(test_cloth_stepping_is_deterministic_serial_and_parallel);
+    RUN_TEST(test_cloth_id_generation_rejects_stale_handle);
+    RUN_TEST(test_scene_binding_cloth_resolves_anchor_and_follows_body);
+    RUN_TEST(test_cloth_self_collision_cannot_push_a_particle_into_a_collider);
+    RUN_TEST(test_cloth_still_collider_sweep_is_inert);
+    RUN_TEST(test_cloth_swept_collider_projects_out_of_the_motion_path);
+    RUN_TEST(test_cloth_mesh_collider_stops_a_tunnelling_particle);
+    RUN_TEST(test_cloth_mesh_collider_stops_tunnelling_through_the_solver);
+    RUN_TEST(test_cloth_mesh_collider_recovers_a_particle_behind_the_surface);
+    RUN_TEST(test_cloth_mesh_collider_front_side_projection_is_unchanged);
+    RUN_TEST(test_cloth_mesh_collider_concave_pocket_is_not_flipped);
+    RUN_TEST(test_cloth_settles_on_mesh_floor_at_thickness);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Tests run: " << g_tests_run << ", Failed: " << g_tests_failed << std::endl;
