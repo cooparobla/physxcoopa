@@ -109,7 +109,7 @@ inline void apply_material_(const fkyaml::node& node, components::Collider& coll
     const auto& m = node.at("material");
     if (m.is_string()) {
         std::string virtual_path = "physics_materials/" + m.get_value<std::string>() + ".yaml";
-        collider.set_material_asset(assets.load<dynamics::PhysicsMaterial>(virtual_path, ctx.scene_dir));
+        collider.set_material_asset(assets.load<dynamics::PhysicsMaterial>(virtual_path, ctx.base_dir()));
     } else if (m.is_mapping()) {
         collider.set_material(std::make_shared<dynamics::PhysicsMaterial>(parse_inline_material_(m)));
     }
@@ -195,7 +195,7 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
             if (node.contains("mesh_path")) {
                 std::string key = node.at("mesh_path").get_value<std::string>();
                 std::string virtual_path = "meshes/" + key + ".yaml";
-                c->set_mesh(assets.load<geometry::TriangleMesh>(virtual_path, ctx.scene_dir));
+                c->set_mesh(assets.load<geometry::TriangleMesh>(virtual_path, ctx.base_dir()));
             }
             detail::apply_common_collider_fields_(node, *c, assets, ctx);
         });
