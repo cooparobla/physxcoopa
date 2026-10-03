@@ -534,6 +534,9 @@ private:
             world_.set_shape_at(b.shape_index, shape);
             b.last_revision = col->revision();
             b.center_offset = center_offset_for_(col, world_scale);
+            if (auto* rb = col->owner->get_component<components::RigidbodyComponent>()) {
+                rb->set_local_center_of_mass(b.center_offset);
+            }
         }
     }
 
@@ -786,6 +789,7 @@ private:
         stored->last_written_position = true_center;
         stored->last_written_orientation = root_trs.rotation;
         bind_rigidbody_(root, id);
+        if (rb) rb->set_local_center_of_mass(com);
 
         components::Collider* primary_col = children[0].col;
         coopa::scene::SceneObject* sync_owner = root;

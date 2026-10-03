@@ -167,6 +167,30 @@ struct Body {
         if (type == BodyType::Dynamic) wake();
     }
 
+    /** @brief Applies an instantaneous world-space impulse at a world-space point: the linear
+     *         part changes linear_velocity and the induced angular impulse
+     *         `cross(world_point - position, impulse)` changes angular_velocity, both immediately.
+     *         The impulse counterpart of add_force_at_position() -- for callers acting from inside
+     *         PhysicsWorld::on_substep, which fires AFTER integrate_forces() (see world.h's
+     *         step_fixed()), so a force added there lands one substep late while an impulse
+     *         reaches this substep's solve. Wakes a sleeping Dynamic body -- see add_force() --
+     *         unless `wake_body` is false: a CONTINUOUS per-substep field (buoyancy, wind) must
+     *         not reset sleep_timer every substep, or a body resting in it could never fall
+     *         asleep; such a caller wakes the body itself when the field actually changes. */
+    void apply_impulse_at_position(const glm::vec3& impulse, const glm::vec3& world_point,
+                                   bool wake_body = true) {
+        linear_velocity += impulse * inv_mass;
+        angular_velocity += inv_inertia_world * glm::cross(world_point - position, impulse);
+        if (wake_body && type == BodyType::Dynamic) wake();
+    }
+
+    /** @brief World-space velocity of the material point currently at `world_point`:
+     *         `linear_velocity + cross(angular_velocity, world_point - position)` (position is
+     *         the center of mass). */
+    glm::vec3 velocity_at_point(const glm::vec3& world_point) const {
+        return linear_velocity + glm::cross(angular_velocity, world_point - position);
+    }
+
     /** @brief Clears accumulated force/torque -- called once per substep after integration. */
     void clear_accumulators() {
         force_accum = glm::vec3(0.0f);

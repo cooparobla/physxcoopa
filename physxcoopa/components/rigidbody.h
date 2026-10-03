@@ -88,6 +88,44 @@ public:
 
     dynamics::BodyId body_id() const { return body_id_; }
 
+    /** @brief Called only by PhysicsSystem when it (re)computes this body's center offset --
+     *         see local_center_of_mass(). */
+    void set_local_center_of_mass(const glm::vec3& offset) { local_center_of_mass_ = offset; }
+
+    /** @brief World-scaled, local-space (pre-rotation) offset from the owning Transform's pivot
+     *         to the body's true center of mass -- exactly PhysicsSystem's Binding::center_offset
+     *         for this body (collider center(s), compound composition and
+     *         center_of_mass_override all folded in). Zero until bound. A point authored in the
+     *         owner's (world-scaled) local frame maps to world space via the live body pose as
+     *         `world_center_of_mass() + rotation() * (p_local - local_center_of_mass())`. */
+    glm::vec3 local_center_of_mass() const { return local_center_of_mass_; }
+
+    /** @brief The body's live (un-interpolated, current-substep) center of mass. Falls back to
+     *         the owner's Transform pivot + offset when unbound. */
+    glm::vec3 world_center_of_mass() const {
+        if (const dynamics::Body* b = body_()) return b->position;
+        if (!owner) return local_center_of_mass_;
+        util::Trs trs = util::world_trs(owner->get_transform()->transform());
+        return trs.position + trs.rotation * local_center_of_mass_;
+    }
+
+    /** @brief The body's live (un-interpolated) orientation; identity when unbound. */
+    glm::quat rotation() const {
+        if (const dynamics::Body* b = body_()) return b->orientation;
+        return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    /** @brief See Body::velocity_at_point(). Zero when unbound. */
+    glm::vec3 velocity_at_point(const glm::vec3& world_point) const {
+        const dynamics::Body* b = body_();
+        return b ? b->velocity_at_point(world_point) : glm::vec3(0.0f);
+    }
+
+    /** @brief See Body::apply_impulse_at_position(). */
+    void add_impulse_at_position(const glm::vec3& impulse, const glm::vec3& world_point) {
+        if (dynamics::Body* b = body_()) b->apply_impulse_at_position(impulse, world_point);
+    }
+
     void add_force(const glm::vec3& f) {
         if (dynamics::Body* b = body_()) b->add_force(f);
     }
@@ -182,6 +220,7 @@ private:
 
     PhysicsWorld* world_ = nullptr;
     dynamics::BodyId body_id_;
+    glm::vec3 local_center_of_mass_{0.0f};
 };
 
 } // namespace components

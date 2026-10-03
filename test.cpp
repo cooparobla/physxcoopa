@@ -497,6 +497,40 @@ static void test_body_impulse_and_angular_impulse_change_velocity_immediately() 
 }
 
 /**
+ * apply_impulse_at_position() changes linear velocity by impulse*inv_mass and angular velocity by
+ * inv_inertia_world * cross(r, impulse), both immediately; velocity_at_point() is the rigid-body
+ * point velocity v + w x r. An impulse through the center of mass must induce no spin.
+ */
+static void test_body_impulse_at_position_and_velocity_at_point() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f));
+    dynamics::BodyId id = add_dynamic_sphere(world, glm::vec3(1.0f, 2.0f, 3.0f), 0.5f); // mass 1
+    dynamics::Body* b = world.get_body(id);
+    b->awake = false;
+
+    b->apply_impulse_at_position(glm::vec3(0.0f, 0.0f, 2.0f), b->position);
+    ASSERT_TRUE(b->awake);
+    ASSERT_VEC3_NEAR(b->linear_velocity, glm::vec3(0.0f, 0.0f, 2.0f), 1e-6f);
+    ASSERT_VEC3_NEAR(b->angular_velocity, glm::vec3(0.0f), 1e-6f);
+
+    // Off-center: r = (+1,0,0), J = (0,0,1) -> angular impulse cross(r, J) = (0,-1,0).
+    glm::vec3 inv_i = b->inv_inertia_local; // isotropic sphere, identity orientation
+    b->apply_impulse_at_position(glm::vec3(0.0f, 0.0f, 1.0f), b->position + glm::vec3(1.0f, 0.0f, 0.0f));
+    ASSERT_VEC3_NEAR(b->linear_velocity, glm::vec3(0.0f, 0.0f, 3.0f), 1e-6f);
+    ASSERT_VEC3_NEAR(b->angular_velocity, glm::vec3(0.0f, -inv_i.y, 0.0f), 1e-6f);
+
+    // v + w x r at r = (1,0,0): w = (0,-k,0) -> w x r = (0,0,k).
+    glm::vec3 vp = b->velocity_at_point(b->position + glm::vec3(1.0f, 0.0f, 0.0f));
+    ASSERT_VEC3_NEAR(vp, glm::vec3(0.0f, 0.0f, 3.0f + inv_i.y), 1e-6f);
+    ASSERT_VEC3_NEAR(b->velocity_at_point(b->position), b->linear_velocity, 1e-6f);
+
+    // wake_body = false: a continuous field must not keep resetting the sleep timer.
+    b->sleep_timer = 0.3f;
+    b->apply_impulse_at_position(glm::vec3(0.0f, 0.0f, 0.1f), b->position, false);
+    ASSERT_NEAR(b->sleep_timer, 0.3f, 1e-6f);
+}
+
+/**
  * add_force()/add_torque()/add_force_at_position()/apply_impulse()/apply_angular_impulse() all
  * wake a sleeping Dynamic body (matching Unity's AddForce) -- previously they silently
  * accumulated into a sleeping body's force_accum/torque_accum or wrote velocity directly, with
@@ -1493,6 +1527,39 @@ static void test_rigidbody_center_of_mass_and_inertia_override_fold_into_body() 
     // Pivot was (0,0,5), identity rotation -- true center should be pivot + override exactly.
     ASSERT_VEC3_NEAR(body->position, glm::vec3(0.3f, 0.0f, 5.0f), 1e-5f);
     ASSERT_VEC3_NEAR(body->inv_inertia_local, glm::vec3(9.0f, 9.0f, 9.0f), 1e-5f);
+}
+
+/**
+ * RigidbodyComponent::local_center_of_mass()/world_center_of_mass() mirror PhysicsSystem's
+ * Binding::center_offset and the live Body::position -- the pair a caller needs to map a point
+ * authored in the owner's local frame onto the live (substep) body pose. Also checks
+ * add_impulse_at_position()/velocity_at_point() delegate to the bound Body.
+ */
+static void test_rigidbody_component_center_of_mass_accessors() {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsComAccessorTest");
+    auto obj = std::make_unique<SceneObject>("box");
+    obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 5.0f));
+    auto* box = obj->add_component<components::BoxCollider>();
+    box->set_size(glm::vec3(1.0f));
+    box->set_center(glm::vec3(0.0f, 0.2f, 0.0f));
+    auto* rb = obj->add_component<components::RigidbodyComponent>();
+    rb->center_of_mass_override = glm::vec3(0.3f, 0.0f, 0.0f);
+    scene.add_root_object(std::move(obj));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    sys->world().set_gravity(glm::vec3(0.0f));
+    scene.update(util::k_default_fixed_dt);
+
+    ASSERT_VEC3_NEAR(rb->local_center_of_mass(), glm::vec3(0.3f, 0.2f, 0.0f), 1e-5f);
+    ASSERT_VEC3_NEAR(rb->world_center_of_mass(), glm::vec3(0.3f, 0.2f, 5.0f), 1e-5f);
+
+    glm::vec3 com = rb->world_center_of_mass();
+    rb->add_impulse_at_position(glm::vec3(1.0f, 0.0f, 0.0f), com);
+    ASSERT_VEC3_NEAR(rb->velocity(), glm::vec3(1.0f, 0.0f, 0.0f), 1e-5f); // mass 1
+    ASSERT_VEC3_NEAR(rb->velocity_at_point(com + glm::vec3(0.0f, 0.0f, 1.0f)), rb->velocity(), 1e-5f);
 }
 
 /**
@@ -3113,6 +3180,7 @@ int main() {
     RUN_TEST(test_sleeping_body_unaffected_by_awake_neighbors_impulse);
     RUN_TEST(test_body_impulse_and_angular_impulse_change_velocity_immediately);
     RUN_TEST(test_body_force_and_impulse_apis_wake_a_sleeping_body);
+    RUN_TEST(test_body_impulse_at_position_and_velocity_at_point);
     RUN_TEST(test_on_substep_signal_and_deferred_destroy);
 
     RUN_TEST(test_sat_box_box_face_contact_known_penetration);
@@ -3148,6 +3216,7 @@ int main() {
     RUN_TEST(test_scene_binding_runtime_parameter_change_rides_revision);
     RUN_TEST(test_scene_binding_rigidbody_runtime_property_changes_take_effect);
     RUN_TEST(test_rigidbody_center_of_mass_and_inertia_override_fold_into_body);
+    RUN_TEST(test_rigidbody_component_center_of_mass_accessors);
     RUN_TEST(test_rigidbody_component_sleep_wake_and_set_velocity_wakes);
     RUN_TEST(test_scene_binding_box_collider_center_offset_settles_flat);
     RUN_TEST(test_compound_collider_two_children_one_rigidbody);
