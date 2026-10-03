@@ -21,6 +21,7 @@
 #include <coopa/debug/logger.h>
 
 #include <fkYAML/node.hpp>
+#include <coopa/yaml/document.h>
 #include <glm/glm.hpp>
 
 #include <cstdint>
@@ -64,11 +65,7 @@ class TriangleMeshLoader : public coopa::asset::TypedAssetLoader<geometry::Trian
 public:
     std::shared_ptr<geometry::TriangleMesh> decode_typed(const coopa::asset::AssetId& id,
                                                           const coopa::asset::LoadContext& ctx) override {
-        std::ifstream ifs(ctx.resolved_path);
-        if (!ifs) {
-            throw std::runtime_error("[physxcoopa] TriangleMeshLoader: failed to open '" + id.path() + "'");
-        }
-        fkyaml::node node = fkyaml::node::deserialize(ifs);
+        fkyaml::node node = coopa::yaml::load_document(ctx.resolved_path);
         coopa::debug::Logger logger("Physics");
 
         // --- 1. Parse raw (unwelded) vertices ---

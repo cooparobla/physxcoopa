@@ -14,6 +14,7 @@
 #include <coopa/asset/asset_id.h>
 
 #include <fkYAML/node.hpp>
+#include <coopa/yaml/document.h>
 
 #include <fstream>
 #include <stdexcept>
@@ -63,11 +64,7 @@ class PhysicsMaterialLoader : public coopa::asset::TypedAssetLoader<dynamics::Ph
 public:
     std::shared_ptr<dynamics::PhysicsMaterial> decode_typed(const coopa::asset::AssetId& id,
                                                               const coopa::asset::LoadContext& ctx) override {
-        std::ifstream ifs(ctx.resolved_path);
-        if (!ifs) {
-            throw std::runtime_error("[physxcoopa] PhysicsMaterialLoader: failed to open '" + id.path() + "'");
-        }
-        fkyaml::node node = fkyaml::node::deserialize(ifs);
+        fkyaml::node node = coopa::yaml::load_document(ctx.resolved_path);
 
         auto mat = std::make_shared<dynamics::PhysicsMaterial>();
         if (node.contains("dynamic_friction")) mat->dynamic_friction = node.at("dynamic_friction").get_value<float>();
