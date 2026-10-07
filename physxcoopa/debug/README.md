@@ -6,7 +6,7 @@ however it likes.
 
 | File | Purpose |
 |---|---|
-| [`debug_draw.h`](debug_draw.h) | `DebugLine`, `DebugDrawFlags` (`Colliders`/`BVH`/`Contacts`), `DebugDraw` (`add_aabb()`/`add_obb()`/`add_sphere()`/`add_capsule()`/`add_mesh()` wireframe builders). Colored by state: white awake, green sleeping, yellow trigger (overrides sleep color), red contact normal. |
+| [`debug_draw.h`](debug_draw.h) | `DebugLine`, `DebugDrawFlags` (`Colliders`/`BVH`/`Contacts`/`Joints`/`All`), `DebugDraw` (`add_aabb()`/`add_obb()`/`add_sphere()`/`add_capsule()`/`add_mesh()` wireframe builders). Colored by state: white awake, green sleeping, yellow trigger (overrides sleep color), red contact normal, magenta joint anchors/axes, blue BVH nodes. |
 
 ## Usage Example
 

@@ -1,6 +1,6 @@
 /**
  * @file mesh_collider.h
- * @brief Static triangle-mesh collider component.
+ * @brief Static or kinematic triangle-mesh collider component.
  *
  * The AssetHandle is populated by physx_yaml.h's parser via `AssetManager::load<TriangleMesh>()`,
  * backed by `loaders::TriangleMeshLoader`. If the handle hasn't finished loading yet,
@@ -25,9 +25,9 @@ namespace components {
 
 /**
  * @class MeshCollider
- * @brief A static (or, with `convex = true` in a future revision, dynamic) triangle-mesh
- *        collider. Non-convex mesh colliders are static-only, matching Unity -- PhysicsSystem
- *        must refuse to bind one to a non-kinematic Rigidbody.
+ * @brief A static or kinematic triangle-mesh collider. Non-convex mesh colliders cannot be
+ *        dynamic, matching Unity -- PhysicsSystem refuses to bind one to a non-kinematic
+ *        Rigidbody. `convex` is stored but convex mesh colliders are not implemented.
  */
 class MeshCollider : public Collider {
 public:

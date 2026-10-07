@@ -54,7 +54,7 @@ struct PhysicsSettings {
      *         PhysicsWorld::debug_draw()); the render layer may still override this at runtime. */
     debug::DebugDrawFlags debug_draw = debug::DebugDrawFlags::None;
 
-    /** @brief Minimum bound-collider count before PhysicsSystem's job-parallel passes (Phase 3)
+    /** @brief Minimum bound-collider count before PhysicsSystem's job-parallel passes
      *         dispatch instead of running serially -- mirrors
      *         toyengine's JobsConfig::parallel_threshold idiom. */
     std::size_t parallel_threshold = 64;
@@ -66,6 +66,7 @@ inline debug::DebugDrawFlags parse_debug_draw_flag_(const std::string& name) {
     if (name == "Colliders") return debug::DebugDrawFlags::Colliders;
     if (name == "BVH") return debug::DebugDrawFlags::BVH;
     if (name == "Contacts") return debug::DebugDrawFlags::Contacts;
+    if (name == "Joints") return debug::DebugDrawFlags::Joints;
     if (name == "All") return debug::DebugDrawFlags::All;
     return debug::DebugDrawFlags::None;
 }

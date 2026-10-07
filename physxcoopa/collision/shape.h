@@ -38,8 +38,8 @@ enum class ShapeType {
  *
  * Dimensions here are already world-scale (a BoxCollider's authored `size` multiplied by the
  * owning SceneObject's world scale) -- PhysicsWorld itself has no notion of scale, only
- * position and orientation; that baking happens once at bind time (PhysicsSystem's reconcile
- * pass, Phase 7), not per-substep.
+ * position and orientation; that baking happens at bind time (PhysicsSystem's reconcile
+ * pass, or update_changed_shapes_() when a collider changes), not per-substep.
  *
  * A body created with no explicit shape (`enabled == false`, the default) participates in
  * dynamics but never in collision -- matching Unity's "Rigidbody with no Collider" case: it
@@ -51,15 +51,14 @@ struct Shape {
 
     /** @brief Local offset from the body's origin (Unity's collider `center`), pre-rotation:
      *         `local_center` is positioned by the BODY's own rotation alone (standard
-     *         hierarchical-transform convention -- world_pos = pos + rot * local_center), same
-     *         as before this field's sibling below existed. */
+     *         hierarchical-transform convention -- world_pos = pos + rot * local_center), not
+     *         by local_rotation below. */
     glm::vec3 local_center{0.0f};
 
     /** @brief The shape's own orientation relative to the body, composed ON TOP of the body's
      *         rotation for anything that orients the shape itself (world_rot = rot *
      *         local_rotation) -- but never for local_center's placement above, which uses `rot`
-     *         alone. Identity by default, a no-op for every shape that existed before this field
-     *         did (in particular Sphere, which is rotation-invariant and never reads this at
+     *         alone. Identity by default (Sphere, being rotation-invariant, never reads it at
      *         all). Lets a single non-compound collider's shape sit at an angle relative to its
      *         own Transform (e.g. a capsule authored diagonally), and is the primitive compound
      *         colliders need for each child shape's own local orientation. */
@@ -78,7 +77,7 @@ struct Shape {
 
     // --- TriangleMesh ---
     const geometry::TriangleMesh* mesh = nullptr; /**< Non-owning; lifetime owned by the
-                                                        MeshCollider's AssetHandle (Phase 8). */
+                                                        MeshCollider's AssetHandle. */
     /** @brief Uniform scale applied to the mesh's local-space vertices (MeshCollider takes the
      *         max component of the owning object's world scale, matching Sphere/Capsule's
      *         rule -- a mesh authored for one scale doesn't stay proportionally correct under

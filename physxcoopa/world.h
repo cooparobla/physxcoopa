@@ -1,8 +1,8 @@
 /**
  * @file world.h
  * @brief PhysicsWorld -- the Scene-agnostic simulation core. No dependency on coopa::scene;
- *        the ISceneSystem adapter (system/physics_system.h) is the only thing that knows
- *        about Scene/SceneObject/Transform.
+ *        the ISceneSystem adapter (system/physics_system.h), the components and physx_yaml.h
+ *        are the only parts that know about Scene/SceneObject/Transform.
  */
 
 #ifndef PHYSXCOOPA_WORLD_H
@@ -52,8 +52,8 @@ namespace physx {
  * @class PhysicsWorld
  * @brief Owns every Body and Shape and drives the fixed-substep simulation loop.
  *
- * Depends only on glm, coopa::event::Signal and coopa::debug::Logger -- never on
- * coopa::scene. This is what lets test.cpp exercise the whole solver/narrowphase/broadphase
+ * Depends only on glm, coopa::event::Signal, coopa::debug::Logger and coopa::job's JobEngine --
+ * never on coopa::scene. This is what lets test.cpp exercise the whole solver/narrowphase/broadphase
  * stack with no Scene at all, and lets gameplay reach the world (via
  * `scene->find_system("Physics")`, see PhysicsSystem) without ever seeing a Scene reference
  * baked into PhysicsWorld itself.
@@ -61,8 +61,9 @@ namespace physx {
 class PhysicsWorld {
 public:
     /**
-     * @brief Fired once per step_fixed(), after kinematic sync-in/force integration but
-     *        before broadphase -- see the file-level step_fixed() doc for exactly where.
+     * @brief Fired once per step_fixed(), after force integration and contact generation
+     *        (broadphase + narrowphase) but before the solve -- see step_fixed()'s doc for
+     *        exactly where.
      *        Gameplay may call add_force/add_torque/set_velocity/wake from a connected slot
      *        (applied immediately); create_body/destroy_body issued from here are deferred
      *        to the top of the NEXT step_fixed instead -- see those methods' docs.
@@ -146,8 +147,7 @@ public:
      *
      * Every world_*() shape-instancing helper (collision/shape.h) already reads a shape's pose
      * as `owner_body.position + owner_body.orientation * (shape.local_center, .local_rotation)`
-     * -- exactly the composition a compound child's own local offset/rotation needs, and
-     * exactly what Phase 3's Shape::local_rotation addition was a prerequisite for.
+     * -- exactly the composition a compound child's own local offset/rotation needs.
      */
     static constexpr uint32_t k_invalid_shape = 0xFFFFFFFFu;
     uint32_t add_shape(dynamics::BodyId owner, const collision::Shape& shape) {
@@ -232,7 +232,7 @@ public:
      *        Static, or the body is already Static.
      *
      * Becoming Kinematic leaves `mass`/`inv_mass`/`inv_inertia_local` untouched, matching
-     * create_body_for_()'s own Kinematic branch (system/physics_system.h) -- those fields are
+     * PhysicsSystem::create_compound_body_()'s own Kinematic branch -- those fields are
      * simply never read for a non-Dynamic body (every consumer gates on `type == Dynamic`
      * first: integrate_forces/integrate_velocities in dynamics/integrator.h,
      * apply_impulse_pair in dynamics/solver.h), so leaving stale values is harmless and
@@ -584,10 +584,9 @@ public:
     // Only valid between phases, not from inside on_substep (mid-solve, not-yet-integrated
     // state). `layer_mask` follows Unity's convention: bit `shape.layer` of the mask, not the
     // LayerMatrix used for solver pair rejection -- a query has no "other side" to look up a
-    // collision-matrix entry against. `include_triggers` (default true, matching every prior
-    // release of these queries -- a trigger collider always got a normal broadphase proxy and
-    // was never filtered) lets a caller exclude trigger colliders, e.g. a raycast that should
-    // only ever see solid geometry.
+    // collision-matrix entry against. `include_triggers` (default true -- a trigger collider
+    // has a normal broadphase proxy like any other) lets a caller exclude trigger colliders,
+    // e.g. a raycast that should only ever see solid geometry.
 
     /** @brief Closest hit along `ray`, or false if nothing was hit. */
     bool raycast(const geometry::Ray& ray, query::RaycastHit& hit, uint32_t layer_mask = ~0u,
@@ -938,7 +937,7 @@ public:
      * step_cloths_()'s doc for the full argument. The short version: a cloth is drawn from its
      * raw solver positions with no render interpolation, while the kinematic/static bodies it
      * drapes over are drawn wherever the wall clock put them this frame. Solving the sheet on
-     * the fixed grid therefore made the two disagree about what time it is by up to one whole
+     * the fixed grid would make the two disagree about what time it is by up to one whole
      * frame whenever the accumulator crossed a substep boundary, which reads on screen as the
      * sheet slipping against a moving body and snapping back.
      *
@@ -974,16 +973,15 @@ public:
      * see step()'s and step_cloths_()'s docs for why. A caller driving this directly (test.cpp,
      * the determinism harness) therefore has to go through step() to advance a cloth at all.
      *
-     * Order (matching the plan's architecture diagram):
+     * Order:
      *   1. drain deferred structural commands queued by last step's on_substep
      *   2. integrate forces (gravity, drag) -> velocities
-     *   3-4. brute-force broadphase (all alive-shaped pairs) + layer reject (Phase 6 adds a tree)
-     *   5. narrowphase -> this step's manifolds
-     *   6. (islands are built as part of the solve, alongside sleep -- see solver.h)
-     *   7. fire on_substep
-     *   8. solve: warm start -> velocity+relax iterations -> position correction
-     *   9. integrate velocities -> positions/orientations
-     *   10. sleep/wake (part of solve())
+     *   3. broadphase (two AABB trees + pair cache) + layer/joint reject
+     *   4. narrowphase -> this step's manifolds, plus enter/stay/exit events
+     *   5. fire on_substep
+     *   6. solve: warm start -> velocity+relax iterations -> position correction, then
+     *      islands + sleep/wake (all inside dynamics::solve() -- see solver.h)
+     *   7. integrate velocities -> positions/orientations
      *
      * @param h Substep length in seconds.
      */
@@ -1048,7 +1046,7 @@ public:
         });
         // Cloth particles are mixed in too, so the serial-vs-parallel determinism harness covers
         // the cloth pass for free rather than needing a parallel oracle of its own. A world with
-        // no cloths hashes exactly as it did before cloth existed, so no existing test moves.
+        // no cloths mixes in nothing here, so its hash covers bodies alone.
         for_each_cloth([&](cloth::ClothId, const cloth::Cloth& c) {
             for (const cloth::ClothParticle& p : c.particles) {
                 mix(&p.position, sizeof(p.position));
@@ -1063,8 +1061,7 @@ private:
      *         shapes go into static_tree_ (built once, never refit here); Dynamic and Kinematic
      *         bodies' shapes go into dynamic_tree_ (refit every step in sync_broadphase_()). A
      *         disabled shape gets no proxy at all -- it never participates in broadphase or
-     *         narrowphase (matches the pre-compound-collider "body with no shape" case exactly,
-     *         now expressed per-shape). user_data packs the SHAPE slot index (see
+     *         narrowphase (the per-shape form of the "body with no shape" case). user_data packs the SHAPE slot index (see
      *         user_data_to_index_()'s doc) -- resolving which BODY it belongs to is always a
      *         second step (shape_owner_[slot]), never folded into the packed value itself. */
     void create_shape_proxy_(uint32_t slot) {
@@ -1091,9 +1088,9 @@ private:
     }
 
     /** @brief Packs a SHAPE slot index (into shapes_/tree_proxy_/etc -- see their own doc) as
-     *         opaque proxy user-data. Deliberately not a body index -- see shapes_'s file doc:
-     *         broadphase/narrowphase have always fundamentally operated on shapes, one level
-     *         below bodies, which compound colliders is what makes that distinction visible. */
+     *         opaque proxy user-data. Deliberately not a body index -- see shapes_'s doc:
+     *         broadphase/narrowphase operate on shapes, one level below bodies, and a compound
+     *         body owns several. */
     static void* index_to_user_data_(uint32_t index) {
         return reinterpret_cast<void*>(static_cast<uintptr_t>(index));
     }
@@ -1103,8 +1100,8 @@ private:
 
     /** @brief A shape's smallest characteristic dimension -- the threshold narrowphase_()'s CCD
      *         fast-pair gate compares a substep's motion against. TriangleMesh returns +infinity
-     *         (never gates speculative treatment on; meshes are static-only and speculative mesh
-     *         contacts are out of scope for v1 -- see generate_contacts()'s `allow_speculative`
+     *         (never gates speculative treatment on; meshes are static or kinematic and
+     *         speculative mesh contacts are not supported -- see generate_contacts()'s `allow_speculative`
      *         doc), so a mesh's own motion never triggers the gate, though a fast DYNAMIC body
      *         moving toward a static mesh still can via the mesh's own min_extent contributing
      *         infinity to the pairwise std::min() at the call site -- i.e. the OTHER shape's
@@ -1261,8 +1258,7 @@ private:
      *         computed from the PREVIOUS substep's positions but CURRENT, post-gravity velocity,
      *         so this predicts forward rather than re-describing the past). This is what makes a
      *         fast body's candidate-pair set actually include a thin target it's about to
-     *         tunnel through -- AABBTree::move_proxy()'s `displacement` parameter existed since
-     *         v1 but was previously discarded (see its own doc). Static proxies never move, so
+     *         tunnel through (see AABBTree::move_proxy()'s `displacement` doc). Static proxies never move, so
      *         static_tree_ needs no per-step work. Tree mutation itself stays single-threaded --
      *         only the bounds math feeding it (compute_broadphase_bounds_()) is job-parallel. */
     void sync_broadphase_(float h) {
@@ -1280,8 +1276,8 @@ private:
      *
      * Static-static, static-kinematic and kinematic-kinematic pairs are never generated:
      * dynamic_tree_ holds both Dynamic and Kinematic bodies (so a self-query against it can
-     * surface a kinematic-kinematic pair), filtered out later by generate_manifolds_'s same
-     * `either_dynamic` check the old brute-force loop used; static_tree_ holds only Static
+     * surface a kinematic-kinematic pair), filtered out later by narrowphase_()'s
+     * `either_dynamic` check; static_tree_ holds only Static
      * bodies, so a dynamic-tree-vs-static-tree cross query can only ever surface dynamic-static
      * or kinematic-static pairs.
      *
@@ -1290,7 +1286,7 @@ private:
      * traversal stack is thread_local -- see aabb_tree.h) but PairCache::add() is not. The
      * buckets are concatenated into pair_cache_ afterward in a fixed slot order, and
      * PairCache::finalize()'s sort+dedup makes the result independent of that order and of
-     * which worker discovered which pair -- so this is bit-identical to the old serial
+     * which worker discovered which pair -- so the result is bit-identical to a serial
      * ascending-index loop regardless of thread count.
      *
      * Iterates SHAPES, not bodies (see shapes_'s file doc) -- `i`/`j` below are shape slot
@@ -1341,7 +1337,7 @@ private:
      * k -- a pure function of pairs[k]/bodies_/shapes_, so results are bit-identical regardless
      * of thread count or scheduling. The serial compaction pass afterward preserves pair-index
      * order (== pair_cache_'s sorted order, deterministic) when building manifolds_ and the
-     * collision/trigger pair caches, exactly matching the old serial loop's result.
+     * collision/trigger pair caches, exactly matching a fully serial loop's result.
      *
      * `pairs[k].a/.b` are SHAPE slot indices (see shapes_'s file doc), not body indices --
      * resolved to their owning BodyId via shape_owner_ below. ContactManifold.a/.b are still
@@ -1349,9 +1345,8 @@ private:
      * two compound bodies produce two manifolds with identical `.a`/`.b` but different geometry
      * -- exactly the intended, physically correct outcome (each child shape contributes its own
      * independent contact). Event/Collider resolution (PhysicsSystem) only resolves to each
-     * body's PRIMARY shape's Collider, not the exact child touched -- a deliberate scope trim
-     * for this pass (see the plan's Phase 5 doc); raycast queries above DO resolve the exact
-     * child (query::RaycastHit::shape_index).
+     * body's PRIMARY shape's Collider, not the exact child touched -- a deliberate scope trim;
+     * raycast queries above DO resolve the exact child (query::RaycastHit::shape_index).
      */
     void narrowphase_(float h) {
         const std::vector<broadphase::ProxyPair>& pairs = pair_cache_.current();
@@ -1380,11 +1375,10 @@ private:
                 // when a body's OWN per-substep displacement exceeds its OWN smallest extent --
                 // the classic "is this a bullet" test (same criterion Box2D's `IsBullet`/Unity's
                 // "Continuous Dynamic" mode use), deliberately NOT compared against the other
-                // shape's size. An earlier version compared against min(shape_a, shape_b)'s
-                // extent instead, which falsely triggered on completely ordinary fast falls onto
-                // any thin static platform (ground slabs are routinely thin) and measurably
-                // robbed energy from restitution well before actual contact -- caught by
-                // test_restitution_one_bounces_high regressing. This is a known, accepted
+                // shape's size. Comparing against min(shape_a, shape_b)'s extent would falsely
+                // trigger on completely ordinary fast falls onto any thin static platform (ground
+                // slabs are routinely thin) and measurably rob energy from restitution well
+                // before actual contact (test_restitution_one_bounces_high guards this). This is a known, accepted
                 // trade-off, not unique to this engine: a slow-but-large body CAN still tunnel
                 // through an extremely thin (near-zero-thickness) target this gate won't catch,
                 // exactly like every other engine using this same per-body heuristic. See
@@ -1438,19 +1432,20 @@ private:
      * PhysicsSystem::write_transforms_back_() applies to a dynamic rigid body. A kinematic body --
      * the thing sheets are actually pinned to and draped over: a character, a flagpole, the
      * cloth_test ball -- is drawn wherever its script put it on the wall clock this frame.
-     * Solving the sheet on the 1/60 s grid made those two disagree: whenever the accumulator
-     * crossed a substep boundary, a frame ran ZERO substeps and the whole sheet stood still in
-     * world space while the body travelled a full frame, then the next frame ran two and the
-     * sheet caught up in one jump. That beat is visible as jitter on any moving body a sheet
-     * touches, and no amount of collision tuning can remove it -- the two objects were on
-     * different clocks. Stepping here, with the frame's own dt, puts them on one: the sheet is
+     * Solving the sheet on the 1/60 s grid would make those two disagree: whenever the
+     * accumulator crossed a substep boundary, a frame would run ZERO substeps and the whole sheet
+     * would stand still in world space while the body travelled a full frame, then the next
+     * frame would run two and the sheet would catch up in one jump. That beat is visible as
+     * jitter on any moving body a sheet touches, and no amount of collision tuning can remove
+     * it -- the two objects would be on different clocks. Stepping here, with the frame's own
+     * dt, puts them on one: the sheet is
      * always solved against the poses this frame will draw. One-way coupling (see cloth.h) is
      * what makes this legal -- no rigid body ever reads a cloth, so nothing inside the substep
      * loop needs the cloth result.
      *
-     * The substep COUNT is sized to hold the internal XPBD substep length at the value the fixed
-     * grid produced (`fixed_dt / cloth_substeps`, 1/240 s by default) rather than dividing a
-     * variable dt by a constant count. At 60 Hz that is bit-for-bit the old 4 substeps; at 144 Hz
+     * The substep COUNT is sized to hold the internal XPBD substep length at
+     * `fixed_dt / cloth_substeps` (1/240 s by default) rather than dividing a variable dt by a
+     * constant count. At 60 Hz that is 4 substeps; at 144 Hz
      * it is 2 and at 30 Hz it is 8, so both the sheet's behaviour and its cost PER SECOND stay
      * frame-rate independent. XPBD compliance is already timestep-independent (see ClothParams),
      * so the material does not change with the count.
@@ -1510,12 +1505,9 @@ private:
             const geometry::AABB query =
                 c.bounds.expand(c.params.thickness + travel + config_.aabb_margin);
 
-            // No collider sweep is fed here any more (ClothCollider::sweep stays zero). It existed
-            // to cover the poses a collider would be DRAWN at between two cloth solves, back when
-            // solves happened on the fixed grid and frames did not; its length came from the
-            // previous frame's wall-clock dt, so it pulsed with dt noise and was itself a small
-            // jitter source. Now that the cloth is solved once per frame against the poses that
-            // frame draws, there is no un-solved frame left to cover -- see this function's doc.
+            // No collider sweep is fed here (ClothCollider::sweep stays zero). The cloth is solved
+            // once per frame against the poses that frame draws, so there are no in-between drawn
+            // poses for a sweep to cover -- see this function's doc.
             bool collider_moving = false;
             auto gather = [&](void* user_data) {
                 const uint32_t slot = user_data_to_index_(user_data);
@@ -1671,8 +1663,8 @@ private:
     std::vector<bool> alive_;
     std::vector<uint32_t> free_indices_;
     /** @brief Parallel to bodies_ -- the shape SLOT indices (into shapes_ below) this body
-     *         currently owns, in insertion order; slot [0] is the "primary" shape every
-     *         pre-compound-collider API (get_shape(BodyId), set_shape()) reads/writes. Empty
+     *         currently owns, in insertion order; slot [0] is the "primary" shape the
+     *         single-shape API (get_shape(BodyId), set_shape()) reads/writes. Empty
      *         for a shapeless body (Shape::enabled's "Rigidbody with no Collider" case). See
      *         add_shape()'s doc for how a body acquires more than one entry here. */
     std::vector<std::vector<uint32_t>> body_shapes_;
@@ -1683,9 +1675,8 @@ private:
      *        slots (body_shapes_[body.index]), not exactly one. Mirrors bodies_'s own
      *        alive_/free_indices_ pattern one level down, applied to shapes instead. Broadphase
      *        proxies (tree_proxy_/in_static_tree_ below) are parallel to THIS array, not to
-     *        bodies_ -- the fundamental unit narrowphase/broadphase operate on is a shape, and
-     *        always was even before compound colliders (a 1-shape body just made the two
-     *        concepts look identical). shape_owner_ is how a shape slot resolves back to the
+     *        bodies_ -- the fundamental unit narrowphase/broadphase operate on is a shape (a
+     *        1-shape body just makes the two concepts look identical). shape_owner_ is how a shape slot resolves back to the
      *        body it belongs to (position/orientation/dynamics live on the Body, never the
      *        Shape) -- see e.g. narrowphase_() or any query visit lambda.
      */
@@ -1712,10 +1703,8 @@ private:
     /** @brief Joint storage -- own independent generational-handle lifecycle (free list +
      *         generation bump), the exact same shape as bodies_/generations_/alive_/
      *         free_indices_ above, just for joints instead of bodies (see add_hinge_joint()'s
-     *         doc). Unlike shapes_ (which had to become independent from bodies_ for compound
-     *         colliders), joints were never coupled to bodies_ 1:1 in the first place -- this
-     *         is the same pattern purely because it already proved itself, not because
-     *         anything forced it. */
+     *         doc). Joints have no 1:1 relationship with bodies_, so they get their own
+     *         lifecycle, like shapes_. */
     std::vector<dynamics::HingeJoint> joints_;
     std::vector<uint32_t> joint_generations_;
     std::vector<bool> joint_alive_;

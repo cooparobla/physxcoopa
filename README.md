@@ -284,8 +284,8 @@ PhysicsWorld::step(dt)
       apply gravity and forces
       broadphase -> layer filter -> narrowphase -> contact manifolds
       emit on_substep
-      solve contacts and joints, then integrate positions
-      update islands and sleep
+      solve contacts and joints, then update islands and sleep
+      integrate positions
   advance every cloth once, on the frame clock
 
 PhysicsSystem::execute(scene, frame)        (UpdatePhase::Physics, order 100)

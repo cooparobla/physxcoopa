@@ -54,8 +54,7 @@ struct SatAxisResult {
  * frame. A near-degenerate edge-cross axis (parallel edges) is skipped as a candidate rather
  * than causing a false separation.
  *
- * @param allow_separated When false (the default -- every pre-existing call site), behavior is
- *        byte-for-byte identical to before this parameter existed: the first axis that proves
+ * @param allow_separated When false (the default), the first axis that proves
  *        separation short-circuits the remaining tests and the function returns false. When
  *        true, ALL 15 axes are tested regardless, and if every one of them proves separation
  *        (the pair is definitively NOT touching), the function still returns true with
@@ -183,10 +182,8 @@ inline bool sat_test_obb_obb(const geometry::OBB& a, const geometry::OBB& b, Sat
  *        (farthest vertex along the separating axis): for a pure face-separation case the other
  *        two axes have an ambiguous (zero-dot) choice and a support point can land on an
  *        arbitrary corner far from the real contact area, injecting a large phantom moment arm
- *        that neutralizes almost all of the resulting impulse -- an earlier version of this
- *        function did exactly that and a fast box was measurably barely slowed down at all
- *        before landing on closest_point_on_obb instead. Default false: every pre-existing call
- *        site is completely unaffected (separation still just returns false, same as ever).
+ *        that neutralizes almost all of the resulting impulse, so a fast box is barely slowed
+ *        down; closest_point_on_obb avoids that. Default false: separation just returns false.
  * @return True if `a` and `b` overlap (or, with `allow_speculative`, are merely close and
  *         closing fast) and `out` now holds contact points.
  */
@@ -204,8 +201,8 @@ inline bool generate_box_box_contacts(const geometry::OBB& a, const geometry::OB
         // face-separation case like axis-aligned boxes has an ambiguous (zero-dot) choice on
         // the other two axes and can land on an arbitrary corner far from the real contact
         // area, injecting a large phantom moment arm that neutralizes almost all of the
-        // resulting impulse -- caught by test_fast_box_does_not_tunnel_through_thin_wall
-        // measurably failing to slow the box down at all before this fix). closest_point_on_obb
+        // resulting impulse (test_fast_box_does_not_tunnel_through_thin_wall guards this).
+        // closest_point_on_obb
         // naturally lands on the correct face/edge/corner for whichever axis actually separates.
         glm::vec3 closest_a = geometry::closest_point_on_obb(b.center, a);
         glm::vec3 closest_b = geometry::closest_point_on_obb(a.center, b);

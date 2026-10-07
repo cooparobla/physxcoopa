@@ -4,12 +4,11 @@
  *        leaf insertion with fat AABBs, so a proxy only needs re-insertion once it escapes
  *        its enlarged bounds.
  *
- * v1 skips AVL-style rotation rebalancing: insertion still refits every ancestor's AABB on
- * the way up (so query correctness is unaffected), it just doesn't rebalance subtree height
+ * No AVL-style rotation rebalancing: insertion still refits every ancestor's AABB on the way
+ * up (so query correctness is unaffected), it just doesn't rebalance subtree height
  * afterward. That trades some query performance on pathological insertion orders for a
- * smaller, lower-risk implementation -- Phase 6's actual bar is "identical pair set to
- * brute force," which an unbalanced-but-correct tree satisfies exactly as well as a
- * balanced one.
+ * smaller, lower-risk implementation -- the requirement is "identical pair set to brute
+ * force," which an unbalanced-but-correct tree satisfies exactly as well as a balanced one.
  */
 
 #ifndef PHYSXCOOPA_BROADPHASE_AABB_TREE_H
@@ -71,9 +70,7 @@ public:
      * @param displacement Swept offset to fatten the refit bounds by, in addition to the usual
      *                      `margin_` -- normally `velocity * h` for the upcoming substep (see
      *                      PhysicsWorld::sync_broadphase_()'s call site). A zero vector
-     *                      degenerates to plain un-swept refitting, this function's original v1
-     *                      behavior before this fattening was implemented (this parameter used
-     *                      to be accepted-but-discarded).
+     *                      degenerates to plain un-swept refitting.
      * @return True if the proxy was actually re-inserted.
      */
     bool move_proxy(int32_t proxy, const geometry::AABB& tight_bounds, const glm::vec3& displacement) {
@@ -96,10 +93,10 @@ public:
     /**
      * @brief Invokes `fn(void* user_data)` for every leaf whose fat AABB overlaps `bounds`.
      *
-     * The traversal stack is `thread_local` (not the `stack_` member it used to be) so that
-     * PhysicsSystem's job-parallel pair-discovery pass (Phase 3 -- many worker threads calling
-     * query() on the same tree concurrently, each read-only) never races another thread's
-     * traversal. Reused across calls on the same thread, same as the old member did per-tree.
+     * The traversal stack is `thread_local` (not a member) so that PhysicsWorld's job-parallel
+     * pair-discovery pass (many worker threads calling query() on the same tree concurrently,
+     * each read-only) never races another thread's traversal. Reused across calls on the same
+     * thread, so traversal does not allocate in steady state.
      */
     template <typename Fn>
     void query(const geometry::AABB& bounds, Fn&& fn) const {
@@ -147,10 +144,9 @@ public:
     /**
      * @brief Invokes `fn(void* user_data)` for every leaf whose fat AABB the ray intersects, IN
      *        TRAVERSAL ORDER, stopping as soon as `fn` returns true -- for an "is anything in
-     *        the way" query that doesn't need the closest hit, just any hit. A new method
-     *        (rather than changing raycast()'s `fn` to return bool) so every existing void-
-     *        returning `raycast()` caller is completely untouched. See raycast()'s doc for the
-     *        shared traversal-stack rationale.
+     *        the way" query that doesn't need the closest hit, just any hit. A separate method
+     *        so raycast()'s `fn` can stay void-returning. See raycast()'s doc for the shared
+     *        traversal-stack rationale.
      */
     template <typename Fn>
     void raycast_until(const geometry::Ray& ray, Fn&& fn) const {

@@ -5,7 +5,7 @@
  *        floor catches on the shared edge between two coplanar triangles, because a naive
  *        per-triangle contact normal points along the edge rather than the surface.
  *
- * v1 approach: brute-force iterate every triangle (the BVH exists for Phase 9's raycasts;
+ * Approach: brute-force iterate every triangle (the BVH serves raycasts and cloth queries;
  * a mesh collider's triangle count in the scenes this targets is small enough that querying
  * it for narrowphase isn't worth the added complexity yet). Two different per-triangle contact
  * tests feed the same correction step, because Sphere/Capsule and Box need genuinely different
@@ -199,7 +199,7 @@ inline int classify_triangle_edge_(const glm::vec3& bary) {
 }
 
 /**
- * @brief Internal-edge correction (Phase 8): clamps a raw closest-point normal into a normal
+ * @brief Internal-edge correction: clamps a raw closest-point normal into a normal
  *        consistent with the mesh's actual surface, using the edge adjacency built by
  *        TriangleMeshLoader.
  *

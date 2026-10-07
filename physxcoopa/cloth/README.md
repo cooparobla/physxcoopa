@@ -8,18 +8,14 @@ hangs on).
 ## Where it runs
 
 ```text
-PhysicsWorld::step_fixed(h)
-  1. integrate forces -> velocities
-  2. broadphase -> narrowphase -> manifolds
-  3. on_substep
-  4. dynamics::solve()            -- rigid contacts + joints
-  5. integrate velocities -> rigid positions/orientations
-  6. step_cloths_(h)              <-- HERE, against the poses step 5 just produced
+PhysicsWorld::step(dt)
+  0..max_substeps x step_fixed(h)   -- rigid bodies only
+  step_cloths_(dt)                  <-- HERE, once per frame, against the poses the substeps produced
 ```
 
-Last, so every cloth collides against this substep's *final* rigid poses rather than poses one
-substep stale — which is what stops a sheet visibly lagging a body it is draped over. Nothing
-downstream reads the cloth result, because coupling is one-way.
+Last, so every cloth collides against the frame's *final* rigid poses rather than stale ones —
+which is what stops a sheet visibly lagging a body it is draped over. Nothing downstream reads the
+cloth result, because coupling is one-way. `step_fixed()` on its own never advances cloth.
 
 ## One cloth substep
 
@@ -50,20 +46,19 @@ rigid body ever reads a cloth, so nothing in the substep loop needs the result.
 It is also what keeps a sheet from jittering. A cloth is drawn straight from its particle
 positions, with none of the render interpolation a dynamic rigid body gets, while the kinematic
 bodies sheets are actually pinned to are drawn wherever the wall clock put them this frame. Solving
-on the 1/60 s grid put those two on different clocks: every time the accumulator crossed a substep
-boundary a frame ran zero substeps -- sheet frozen in world space while the body travelled a full
-frame -- and the next ran two and caught up in a jump. On the frame clock the sheet is always
-solved against the poses that frame draws, at any refresh rate.
+on the 1/60 s grid would put those two on different clocks: every time the accumulator crossed a
+substep boundary a frame would run zero substeps -- sheet frozen in world space while the body
+travelled a full frame -- and the next would run two and catch up in a jump. On the frame clock the
+sheet is always solved against the poses that frame draws, at any refresh rate.
 
 The substep *count* per frame is sized to hold the internal substep length at `fixed_dt /
 cloth_substeps` (1/240 s), so cloth cost per second and cloth feel are both frame-rate independent:
 4 substeps at 60 Hz, 2 at 144 Hz, 8 at 30 Hz.
 
-This also retired the collider **sweep** -- inflating a moving collider into the volume it would be
-drawn sweeping before the next solve. It existed only to paper over the clock mismatch above, and
-its length came from the previous frame's wall-clock `dt`, so it made the standoff on a moving
-body's leading side pulse with frame-time noise. `ClothCollider::sweep` and its exact swept-sphere
-projection remain available for a direct caller, but the engine leaves them at zero.
+For the same reason the engine does not sweep colliders (inflate a moving collider into the volume
+it would be drawn sweeping before the next solve): there is no un-solved drawn frame to cover.
+`ClothCollider::sweep` and its exact swept-sphere projection are available for a direct caller of
+`project_particle()`, but the engine leaves them at zero.
 
 Velocities are re-derived from positions at stage 8 rather than tracked through the projections.
 That is the defining property of PBD — every correction automatically becomes a velocity change,
@@ -88,8 +83,8 @@ not just thread safety, is the requirement, because `PhysicsWorld::world_state_h
 reproducible. `solve_cloth()` is templated on its work dispatcher so a `JobEngine`-backed one can
 be dropped in.
 
-It currently runs serially (`SerialDispatch`), because at realistic sheet sizes that measures
-faster: a 25×25 sheet costs ~0.12 ms per fixed substep serially, against which the parallel path
+It runs serially (`SerialDispatch`), because at realistic sheet sizes that measures
+faster: a 25×25 sheet costs ~0.12 ms per 1/60 s of simulation serially, against which the parallel path
 would pay job-dispatch overhead 30+ times per substep. Measured, single-threaded, `-O2`:
 
 | Sheet | Particles | per 1/60 s step | with self-collision |
@@ -108,12 +103,12 @@ sets the price. A resting sheet also sleeps (`ClothParams::sleep_time`), droppin
 
 ## Collider support
 
-| Collider | How a particle is resolved | Interior case | Swept (>60 Hz) |
+| Collider | How a particle is resolved | Interior case | `ClothCollider::sweep` (direct callers only) |
 |---|---|---|---|
 | `SphereCollider` | analytic centre distance | yes | **exact** — a swept sphere is a capsule |
 | `BoxCollider` | `geometry::closest_point_on_obb` | yes, exits along the minimum-penetration axis | start/end pose probe |
 | `CapsuleCollider` | `geometry::closest_point_on_segment` | yes | start/end pose probe |
-| `MeshCollider` | `MeshBVH` + `collision::closest_point_on_triangle` | recovery only (see below) | no — static-only in this engine |
+| `MeshCollider` | `MeshBVH` + `collision::closest_point_on_triangle` | recovery only (see below) | no |
 
 Static, Kinematic and Dynamic bodies all collide with cloth (both broadphase trees are queried), and
 compound colliders work for free since the gather is per *shape slot*. A shape must be `enabled`,
@@ -136,7 +131,8 @@ mechanisms instead:
   mesh.
 
 Still not handled for meshes: a particle that *starts* inside with no motion (an authoring error),
-and a mesh collider that moves onto a sheet (mesh colliders are static-only here).
+and a kinematic mesh collider that moves onto a sheet (the crossing test only follows the
+particle's own motion).
 
 **Not supported at all**: cloth-vs-cloth (cloths have no broadphase proxy; self-collision *within* a
 sheet is supported), convex hulls (no such shape type exists in the engine), and triggers (skipped by

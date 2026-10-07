@@ -104,7 +104,7 @@ inline void integrate_forces(Body& body, float h) {
  * @param body  Body to integrate. No-op for non-dynamic or sleeping bodies.
  * @param h     Fixed substep length in seconds.
  * @param exact Use the exact exponential-map quaternion step instead of first-order.
- * @param max_linear_velocity Hard speed clamp (v1's stand-in for CCD -- see config.h).
+ * @param max_linear_velocity Hard speed clamp (a tunneling backstop -- see config.h).
  */
 inline void integrate_velocities(Body& body, float h, bool exact = false,
                                   float max_linear_velocity = 1e30f) {

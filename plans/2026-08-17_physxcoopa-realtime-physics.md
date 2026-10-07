@@ -1,5 +1,12 @@
 # physxcoopa — Real-Time Rigid Body Physics for the coopa Stack
 
+> **Status: implemented.** Phases 0–9 are done. The library has since gone past this plan:
+> compound colliders, hinge joints, XPBD cloth, speculative contacts for sphere/box pairs (the
+> `max_linear_velocity` clamp remains as a backstop), and optional job-engine parallelism for
+> broadphase, narrowphase and transform sync. Of the "v1.1 — deferred" list, CCD and job-engine
+> parallelism are done; the rest is still open. The README and the per-module READMEs describe the
+> current code; this plan is kept as design history.
+
 ## Context
 
 `/home/coopa/git/physxcoopa` is an empty repo (`.git/` and `plans/` only). It becomes the physics sibling of `libcoopa` / `gfxcoopa` / `uicoopa` / `sfxcoopa` / `toyengine`: a header-only C++20 rigid body engine with Unity-equivalent semantics — box/capsule/sphere/static-mesh colliders, physics materials, static/kinematic/dynamic bodies, scene queries, triggers, collision layers — consumed by **toyengine**, the team's primary game engine.

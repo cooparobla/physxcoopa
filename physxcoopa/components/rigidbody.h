@@ -4,8 +4,8 @@
  *        the Unity-style force/velocity API gameplay code calls directly.
  *
  * A RigidbodyComponent only takes effect when a Collider is also present on the same
- * SceneObject: PhysicsSystem's reconcile pass is keyed on Collider (a body needs a shape to
- * exist in v1's binding layer, even though PhysicsWorld itself supports a shapeless body --
+ * SceneObject or a descendant (a compound body): PhysicsSystem's reconcile pass is keyed on
+ * Collider (a body needs a shape to exist in the binding layer, even though PhysicsWorld itself supports a shapeless body --
  * see Shape::enabled's doc). A bare Rigidbody with no Collider is a known v1 limitation, not
  * a bug: Unity's "Rigidbody with no Collider falls under gravity but hits nothing" case isn't
  * reachable from scene YAML today, only via PhysicsWorld::add_body() called directly.
@@ -63,16 +63,16 @@ public:
     glm::vec3 initial_angular_velocity{0.0f};
 
     /** @brief Local-space offset from the collider's own center (Collider::center(), already
-     *         folded into body.position -- see PhysicsSystem::create_body_for_()'s doc) to the
-     *         body's true center of mass, applied ON TOP of that folding at bind time. Unset by
-     *         default (no override -- the body's center of mass is exactly the collider's
-     *         center, as it always was before this field existed). Matches Unity's
+     *         folded into body.position -- see PhysicsSystem::create_compound_body_()'s doc) to
+     *         the body's true center of mass, applied ON TOP of that folding at bind time. Unset
+     *         by default (no override -- the body's center of mass is exactly the collider's
+     *         center). Matches Unity's
      *         Rigidbody.centerOfMass. Creation-time only, like initial_velocity above -- not
      *         reconciled by PhysicsSystem's per-frame runtime-property pass. */
     std::optional<glm::vec3> center_of_mass_override;
 
     /** @brief Diagonal local-space inverse inertia tensor to use instead of the one
-     *         PhysicsSystem::create_body_for_() would otherwise derive analytically from the
+     *         PhysicsSystem::create_compound_body_() would otherwise derive analytically from the
      *         collider's shape (dynamics::inertia_for_shape()). Matches Unity's
      *         Rigidbody.inertiaTensor, with the same INVERSE convention Body::inv_inertia_local
      *         already uses everywhere else in this engine (not Unity's own non-inverse

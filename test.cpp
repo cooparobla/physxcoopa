@@ -443,15 +443,14 @@ static void test_kinematic_spin_wakes_sleeping_body_it_sweeps_into() {
 }
 
 /**
- * dynamics/solver.h's apply_impulse_pair() used to apply a computed impulse to any body with
- * type == Dynamic, regardless of `awake` -- inconsistent with warm_start()/solve_velocity_pass()
- * themselves, which already zero a sleeping body's inv_mass/inv_inertia (correctly treating it
- * as immovable) before deriving that impulse's magnitude. The bug: a sleeping body touched by an
- * awake neighbor ended up with a nonzero velocity baked in while still marked asleep --
- * integrate_velocities() skips a sleeping body, so nothing visibly moved yet, but the very next
- * time the body woke (by any means) it would pop with this stale, unaccounted-for velocity
- * already in it. Three flush-stacked boxes, where the bottom one sleeps before its neighbors
- * finish settling, is exactly this shape.
+ * dynamics/solver.h's apply_impulse_pair() applies an impulse only to an AWAKE dynamic body,
+ * consistent with warm_start()/solve_velocity_pass(), which zero a sleeping body's
+ * inv_mass/inv_inertia (treating it as immovable) before deriving that impulse's magnitude.
+ * Without the `awake` check, a sleeping body touched by an awake neighbor would get a nonzero
+ * velocity baked in while still marked asleep -- integrate_velocities() skips a sleeping body,
+ * so nothing visibly moves yet, but the next time the body woke (by any means) it would pop with
+ * that stale, unaccounted-for velocity. Three flush-stacked boxes, where the bottom one sleeps
+ * before its neighbors finish settling, is exactly this shape.
  */
 static void test_sleeping_body_unaffected_by_awake_neighbors_impulse() {
     PhysicsWorld world;
@@ -532,10 +531,9 @@ static void test_body_impulse_at_position_and_velocity_at_point() {
 
 /**
  * add_force()/add_torque()/add_force_at_position()/apply_impulse()/apply_angular_impulse() all
- * wake a sleeping Dynamic body (matching Unity's AddForce) -- previously they silently
- * accumulated into a sleeping body's force_accum/torque_accum or wrote velocity directly, with
- * no effect until something ELSE woke the body (integrate_forces()/integrate_velocities() both
- * early-out on `!awake`). Confirmed two ways: the flag itself, and that a subsequent step
+ * wake a sleeping Dynamic body (matching Unity's AddForce) -- otherwise the change would sit in
+ * force_accum/torque_accum or the velocity with no effect until something ELSE woke the body
+ * (integrate_forces()/integrate_velocities() both early-out on `!awake`). Confirmed two ways: the flag itself, and that a subsequent step
  * actually integrates the change (not just that `awake` reads true).
  */
 static void test_body_force_and_impulse_apis_wake_a_sleeping_body() {
@@ -654,10 +652,9 @@ static void test_sat_box_box_edge_contact_single_point() {
 
 /**
  * A box dropped at an oblique seed orientation must tumble on landing, then come fully to rest
- * flat on a face -- not freeze mid-topple, balanced on an edge/corner. Written while chasing a
- * report of exactly that in physics_test's stack; this single-box-on-flat-ground case passes
- * even without any fix (see test_three_box_concrete_stack_settles_flat's doc for how that
- * investigation actually concluded), but it's still a legitimate general regression to keep.
+ * flat on a face -- not freeze mid-topple, balanced on an edge/corner. A general regression
+ * guard; test_scene_binding_box_collider_center_offset_settles_flat covers the scene-level
+ * stack case.
  */
 static void test_tumbled_box_settles_flat_not_balanced_on_edge() {
     PhysicsWorld world;
@@ -733,12 +730,10 @@ static void test_fast_box_does_not_tunnel_through_thin_wall() {
 /**
  * The exact 3-box, "concrete"-material configuration physics_test's stack uses (scale 0.8 ->
  * half_extents 0.4, flush-stacked, dynamic/static friction 0.6/0.7, restitution 0.05), driven
- * directly at the headless PhysicsWorld level. Added while diagnosing a report that the stack
- * tumbles and then never fully settles (floats/balances on an edge) in the actual toyengine
- * scene: this isolated case settles perfectly flat and stays asleep, with full 4-point face
- * manifolds throughout -- which rules out physxcoopa's core solver/narrowphase as the cause and
- * points at the Scene/PhysicsSystem integration layer above it instead (see the plan this test
- * landed with for the investigation that led here).
+ * directly at the headless PhysicsWorld level. It must settle perfectly flat and stay asleep,
+ * with full 4-point face manifolds throughout -- the core solver/narrowphase half of the stack
+ * case; test_scene_binding_box_collider_center_offset_settles_flat covers the Scene/PhysicsSystem
+ * half.
  */
 static void test_three_box_concrete_stack_settles_flat() {
     PhysicsWorld world;
@@ -1106,9 +1101,8 @@ static void test_raycast_any_finds_a_hit_without_necessarily_the_closest() {
 }
 
 /**
- * `include_triggers` (default true, matching every query's behavior before this parameter
- * existed) lets a caller exclude trigger colliders -- previously impossible, every query always
- * saw every enabled shape regardless of is_trigger.
+ * `include_triggers` (default true: every enabled shape is visible to queries regardless of
+ * is_trigger) lets a caller exclude trigger colliders.
  */
 static void test_query_include_triggers_flag_excludes_trigger_colliders() {
     PhysicsWorld world;
@@ -1213,11 +1207,9 @@ static void test_debug_draw_emits_collider_bvh_and_contact_lines() {
 
 /**
  * Shape::local_rotation -- a single (non-compound) collider's shape posed at an angle relative
- * to its own body, previously impossible (every world_*() helper applied the body's rotation
- * only). A capsule authored along local Z, rotated 90 degrees about X, actually points along
+ * to its own body. A capsule authored along local Z, rotated 90 degrees about X, actually points along
  * world -Y once instanced -- confirmed three independent ways (raycast, overlap, debug draw) so
- * a bug that only fixed one of the four world_*()/raycast_shape() call sites this touched would
- * still be caught.
+ * a mistake in any one of the world_*()/raycast_shape() call sites that read it is caught.
  */
 static void test_shape_local_rotation_reorients_capsule_consistently() {
     PhysicsWorld world;
@@ -1442,10 +1434,10 @@ static void test_scene_binding_runtime_parameter_change_rides_revision() {
 }
 
 /**
- * RigidbodyComponent's fields used to be read only once, at bind time (create_body_for_()) --
- * a runtime `rb->mass = 5.0f` or `rb->is_kinematic = true` after that had no effect, unlike
- * Collider's own parameters (the previous test), which already rode the per-frame revision
- * check. update_changed_rigidbodies_() closes that gap; this drives mass, use_gravity, and an
+ * RigidbodyComponent's fields are re-read every frame, not only at bind time
+ * (create_compound_body_()): a runtime `rb->mass = 5.0f` or `rb->is_kinematic = true` takes
+ * effect, just as Collider's own parameters (the previous test) do via the per-frame revision
+ * check. update_changed_rigidbodies_() does this; the test drives mass, use_gravity, and an
  * is_kinematic round-trip through the actual Scene/PhysicsSystem binding path.
  */
 static void test_scene_binding_rigidbody_runtime_property_changes_take_effect() {
@@ -1599,19 +1591,17 @@ static void test_rigidbody_component_sleep_wake_and_set_velocity_wakes() {
 }
 
 /**
- * The exact scenario that caused physics_test's stack to tumble and never settle: a
- * corner-origin mesh (cube.000's [0,1]^3 local vertices) compensated for via
- * `BoxCollider center: {0.5,0.5,0.5}` on a dynamic Rigidbody. PhysicsSystem::create_body_for_()
- * used to leave body.position pinned to the Transform's raw pivot while the shape (and mass/
- * inertia) actually sat 0.5 units away in each axis -- every dynamics formula silently assumed
- * body.position WAS the center of mass, so gravity produced a persistent spurious torque about
- * the wrong point. Fixed by folding the collider's center offset into body.position as the true
- * center of mass (see create_body_for_()'s doc) and converting back to the pivot every frame in
- * write_transforms_back_(). Unlike test_tumbled_box_settles_flat_not_balanced_on_edge (which
- * passes even without any fix -- it has no center offset) and
- * test_three_box_concrete_stack_settles_flat (headless PhysicsWorld, no Scene/Collider::center()
- * involved), this test drives the bug through the actual Scene/PhysicsSystem binding path with a
- * nonzero collider center, which is the only place the bug ever lived.
+ * A corner-origin mesh (cube.000's [0,1]^3 local vertices) compensated for via
+ * `BoxCollider center: {0.5,0.5,0.5}` on a dynamic Rigidbody must settle flat. Every dynamics
+ * formula assumes body.position IS the center of mass, so if body.position stayed pinned to the
+ * Transform's raw pivot while the shape (and mass/inertia) sat 0.5 units away in each axis,
+ * gravity would produce a persistent spurious torque about the wrong point and the stack would
+ * tumble and never settle. PhysicsSystem folds the collider's center offset into body.position
+ * as the true center of mass (see create_compound_body_()'s doc) and converts back to the pivot
+ * every frame in write_transforms_back_(). Unlike test_tumbled_box_settles_flat_not_balanced_on_edge
+ * (no center offset) and test_three_box_concrete_stack_settles_flat (headless PhysicsWorld, no
+ * Scene/Collider::center() involved), this test goes through the actual Scene/PhysicsSystem
+ * binding path with a nonzero collider center, which is where that folding happens.
  */
 static void test_scene_binding_box_collider_center_offset_settles_flat() {
     using namespace coopa::scene;
@@ -2472,17 +2462,18 @@ static void test_cloth_anchors_follow_moving_kinematic_body() {
  * @brief The sheet keeps its grip on a kinematic body across UNEVEN frames -- the regression test
  *        for the cloth/ball jitter.
  *
- * The bug this pins down: cloth used to be solved inside step_fixed(), on the 1/60 s grid, while
- * a kinematic body is posed on the wall clock every frame. Whenever a frame's dt fell short of
- * the substep length the accumulator ran ZERO substeps, so the sheet stood perfectly still in
- * world space while the body travelled a whole frame -- and the next frame ran two substeps and
- * snapped it back. Rendered, that beat is the jitter.
+ * Cloth is solved once per frame in step(), not inside step_fixed() on the 1/60 s grid, because a
+ * kinematic body is posed on the wall clock every frame. On the fixed grid, whenever a frame's dt
+ * fell short of the substep length the accumulator would run ZERO substeps, so the sheet would
+ * stand perfectly still in world space while the body travelled a whole frame -- and the next
+ * frame would run two substeps and snap it back. Rendered, that beat is jitter.
  *
  * The dt sequence below alternates 0.9h/1.1h precisely to drive the accumulator across that
  * boundary repeatedly (the pattern a vsynced display beating against a 60 Hz fixed step produces
  * for real). The anchored particles are written outright from the body's pose, so "did the cloth
  * get stepped this frame" is measurable to the micrometre at the anchor: the offset from the body
- * centre must not move. Pre-fix this drifts by up to speed*dt (~6 cm) on every zero-substep frame.
+ * centre must not move. Solved on the fixed grid it would drift by up to speed*dt (~6 cm) on every
+ * zero-substep frame.
  */
 static void test_cloth_anchor_tracks_kinematic_body_across_uneven_frames() {
     PhysicsWorld world;

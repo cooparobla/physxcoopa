@@ -2,9 +2,9 @@
  * @file narrowphase.h
  * @brief Per-shape-pair contact generation, dispatched by shape type.
  *
- * v1's dispatch table: Sphere-Sphere, Sphere-Box (Phase 3); Box-Box (Phase 4); Capsule pairs
- * (Phase 5); TriangleMesh pairs (Phase 8). Every pair has an exact analytic or SAT solution --
- * no GJK/EPA anywhere (see the plan's "Design rationale").
+ * Dispatch table: Sphere-Sphere, Sphere-Box, Box-Box, Capsule pairs and TriangleMesh pairs.
+ * Every pair has an exact analytic or SAT solution -- no GJK/EPA anywhere (see the plan's
+ * "Design rationale").
  */
 
 #ifndef PHYSXCOOPA_COLLISION_NARROWPHASE_H
@@ -159,15 +159,14 @@ inline bool sphere_vs_box_separation(const geometry::Sphere& sphere, const geome
  * @param allow_speculative When true, a not-yet-touching-but-close pair still produces a
  *        SINGLE-point speculative manifold (ContactManifold::add_speculative_point(), see its
  *        doc) instead of returning false, for Sphere-Sphere, Sphere-Box, Box-Sphere, and Box-Box
- *        pairs -- the pairs cheap enough to extend for v1 (Box-Box already needed a real
- *        extension to collision/sat.h; the sphere ones are near-trivial distance math on top of
- *        what sphere_vs_sphere()/sphere_vs_box() above already compute). Capsule-involving and
- *        TriangleMesh pairs are NOT extended (default false is unaffected either way) -- meshes
- *        are static-only already and a genuine mesh CCD lift is deferred (same precedent as
- *        sphere_cast()'s own documented mesh-inflation gap in world.h); capsule speculative
- *        support is a reasonable, tractable follow-up (closest_points_segment_obb/
- *        closest_points_segment_segment in collision/segment.h are already distance-based) but
- *        wasn't done in this pass. Default false: every pre-existing call site is unaffected.
+ *        pairs -- the pairs cheap enough to support (Box-Box via collision/sat.h's separated-axis
+ *        path; the sphere ones are near-trivial distance math on top of what
+ *        sphere_vs_sphere()/sphere_vs_box() above already compute). Capsule-involving and
+ *        TriangleMesh pairs ignore the flag -- meshes are static or kinematic and mesh CCD is
+ *        deferred (same precedent as sphere_cast()'s documented mesh-inflation gap in world.h);
+ *        capsule speculative support is a tractable follow-up (closest_points_segment_obb/
+ *        closest_points_segment_segment in collision/segment.h are already distance-based).
+ *        Defaults to false.
  *
  * @return True if the shapes overlap (or, with `allow_speculative`, are merely close and
  *         closing fast for a supported pair) and `out` now holds a valid manifold.
@@ -274,7 +273,7 @@ inline bool generate_contacts(
     } else if (shape_a.type == ShapeType::TriangleMesh && shape_b.type != ShapeType::TriangleMesh) {
         hit = generate_mesh_contacts(shape_b, pos_b, rot_b, shape_a, pos_a, rot_a, out); // normal points mesh(a)->shape(b) = a->b already
     } else {
-        return false; // pair not yet implemented at this phase
+        return false; // mesh-mesh: not supported
     }
 
     if (!hit) return false;

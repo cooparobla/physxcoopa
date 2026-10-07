@@ -75,21 +75,17 @@ struct PhysicsConfig {
     uint32_t max_substeps = 8;
 
     /** @brief Substep length in seconds -- Unity's Time.fixedDeltaTime equivalent. Defaults to
-     *         the historical 1/60 constant; PhysicsWorld::step() reads this field rather than
+     *         1/60 (k_default_fixed_dt); PhysicsWorld::step() reads this field rather than
      *         the constant directly, so a scene's `physics:` settings block can override it. */
     float fixed_dt = k_default_fixed_dt;
 
-    /** @brief Hard clamp on a dynamic body's linear speed. Originally v1's entire stand-in for
-     *         CCD (see the plan's "Design rationale" for why the FIRST attempt at margin-
-     *         inflated speculative contacts didn't work against that era's velocity-solver
-     *         bias); real speculative contacts now exist (world.h's narrowphase_() fast-pair
-     *         gate, collision::generate_contacts()'s `allow_speculative`, this file's own
-     *         solve_velocity_pass()) and are the PRIMARY tunneling defense for the shape pairs
-     *         they cover (Sphere/Box, not yet Capsule or TriangleMesh -- see
-     *         generate_contacts()'s doc). This clamp remains as a cheap backstop for whatever
-     *         isn't covered (a fast body against a static mesh, or two bodies both moving fast
-     *         enough simultaneously that neither's per-body gate alone tells the full story),
-     *         not the primary mechanism anymore. */
+    /** @brief Hard clamp on a dynamic body's linear speed. Speculative contacts (world.h's
+     *         narrowphase_() fast-pair gate, collision::generate_contacts()'s
+     *         `allow_speculative`, dynamics::solve_velocity_pass()) are the PRIMARY tunneling
+     *         defense for the shape pairs they cover (Sphere/Box, not Capsule or TriangleMesh --
+     *         see generate_contacts()'s doc). This clamp is a cheap backstop for whatever isn't
+     *         covered (a fast body against a static mesh, or two bodies both moving fast
+     *         enough simultaneously that neither's per-body gate alone tells the full story). */
     float max_linear_velocity = 200.0f;
 
     /** @brief Use the exact exponential-map quaternion integration step instead of the

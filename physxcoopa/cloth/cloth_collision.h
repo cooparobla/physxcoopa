@@ -53,18 +53,12 @@ struct ClothCollider {
     /**
      * @brief World-space displacement the cloth must stay clear of, beyond `position`.
      *
-     * **Nothing in the engine populates this today, by design.** It covered the poses a collider
-     * would be DRAWN at between two cloth solves, back when solves ran on the fixed substep grid
-     * while frames ran on the wall clock -- above 60 Hz several frames were drawn per solve and the
-     * collider advanced visibly through all of them while the sheet stood still. Its length was
-     * derived from the previous frame's dt, which made the standoff on a moving body's leading side
-     * pulse with frame-time noise.
-     *
-     * PhysicsWorld::step_cloths_() now runs once per FRAME, against the poses that same frame
-     * draws (see its doc), so there is no un-solved frame left to cover and the sweep is left at
-     * zero. The projection support below is kept -- it is exact (a swept sphere IS a capsule), self-
-     * contained and unit-tested -- for a caller driving cloth::project_particle() directly against
-     * poses of its own choosing.
+     * **The engine leaves this at zero, by design.** A sweep covers poses a collider would be
+     * drawn at between two cloth solves; PhysicsWorld::step_cloths_() runs once per FRAME, against
+     * the poses that same frame draws (see its doc), so there are no such poses to cover. The
+     * projection support below -- exact for a sphere (a swept sphere IS a capsule), self-contained
+     * and unit-tested -- is for a caller driving cloth::project_particle() directly against poses
+     * of its own choosing.
      */
     glm::vec3 sweep{0.0f};
 

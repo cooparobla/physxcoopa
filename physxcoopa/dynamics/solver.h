@@ -76,8 +76,8 @@ struct SolverState {
  * The `awake` half of that guard is load-bearing, not defensive: every caller (warm_start(),
  * solve_velocity_pass()) already zeroes a sleeping body's inv_mass/inv_inertia before deriving
  * the impulse's magnitude, correctly treating it as immovable on its side of the contact. If
- * this function applied that impulse to a sleeping body's velocity anyway (the old behavior --
- * it only checked `type == Dynamic`), the body would end up with a nonzero velocity the solve
+ * this function applied that impulse to a sleeping body's velocity anyway (checking only
+ * `type == Dynamic`), the body would end up with a nonzero velocity the solve
  * never accounted for, silently, without ever being marked awake -- integrate_velocities()
  * skips a sleeping body, so nothing visibly moves yet, but the stale velocity sits there until
  * something later wakes the body, which then pops/twitches with this leftover, non-physical
@@ -207,8 +207,7 @@ inline void warm_start(std::vector<Body>& bodies, std::vector<collision::Contact
  * is still a pure velocity constraint), but a velocity CEILING that permits closing the gap by
  * at most `separation` over this one substep, which is exactly what stops a fast body from
  * tunneling through a thin target before the two shapes ever actually overlap. An ordinary
- * point's `separation` is always 0, so `target` reduces to the pre-existing formula for every
- * contact that existed before this branch did.
+ * point's `separation` is always 0, so for it `target` is just 0/`restitution_bias`.
  */
 inline void solve_velocity_pass(std::vector<Body>& bodies, std::vector<collision::ContactManifold>& manifolds,
                                  bool use_restitution, uint32_t order_offset, float h) {

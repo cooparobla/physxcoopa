@@ -109,16 +109,15 @@ inline glm::vec3 capsule_inverse_inertia(float radius, float half_height, float 
  *        the capsule result to match `shape.capsule_axis` (0=X, 1=Y, 2=Z; see
  *        capsule_inverse_inertia()'s doc -- its own result is Z-axis-local).
  *
- * Moved here (out of PhysicsSystem, which originally owned the only copy of this dispatch)
- * because it depends on nothing but a Shape and a mass -- no Scene/Collider involvement -- so
- * PhysicsWorld::set_body_type() can share it for a runtime Kinematic->Dynamic transition without
+ * Lives here (not in PhysicsSystem) because it depends on nothing but a Shape and a mass -- no
+ * Scene/Collider involvement -- so PhysicsWorld::set_body_type() can share it for a runtime Kinematic->Dynamic transition without
  * PhysicsWorld (which has no Scene dependency, see world.h's file doc) reaching into
  * system/physics_system.h.
  *
  * @param shape Shape to derive inertia from.
  * @param mass  Body mass.
  * @return Diagonal inverse inertia tensor, or (0,0,0) for TriangleMesh (matches
- *         PhysicsSystem::create_body_for_()'s dynamic-mesh-collider rejection -- this dispatch
+ *         PhysicsSystem::create_compound_body_()'s dynamic-mesh-collider rejection -- this dispatch
  *         is never actually reached with a Dynamic TriangleMesh body in practice).
  */
 inline glm::vec3 inertia_for_shape(const collision::Shape& shape, float mass) {

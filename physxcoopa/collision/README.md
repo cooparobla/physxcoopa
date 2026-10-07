@@ -2,7 +2,7 @@
 
 Per-shape-pair contact generation. Every pair has an exact analytic or SAT solution — there is no
 GJK/EPA and no convex-hull builder anywhere in physxcoopa (see the plan's "Design rationale" for
-why: v1's shape set is closed, and every pair in it has a cheaper exact answer).
+why: the shape set is closed, and every pair in it has a cheaper exact answer).
 
 ## Dispatch
 
@@ -11,10 +11,16 @@ generate_contacts(shape_a, shape_b) -> ContactManifold
   Sphere-Sphere    analytic center distance
   Sphere-Box       closest point on OBB                         [narrowphase.h]
   Box-Box          SAT (6 face + 9 edge-cross axes) + Sutherland-Hodgman clipping   [sat.h, clip.h]
+  Capsule-Sphere   closest point on the capsule's segment         [segment.h]
   Capsule-Capsule  closest points between two segments           [segment.h]
   Capsule-Box      segment clipped against the box's 6 slabs     [segment.h]
   *-TriangleMesh   per-triangle contact + internal-edge correction via adjacency   [mesh_contact.h]
+  Mesh-Mesh        not supported
 ```
+
+With `allow_speculative` (set by `PhysicsWorld` for a fast-moving pair), Sphere-Sphere, Sphere-Box
+and Box-Box also return a single speculative point for a pair that is close but not yet touching,
+which is what stops fast spheres and boxes tunnelling through thin walls.
 
 `manifold.h`'s `normal` always points from body `a` toward body `b`; every dispatch branch in
 `narrowphase.h` is responsible for getting that sign right regardless of which underlying

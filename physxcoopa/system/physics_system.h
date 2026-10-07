@@ -1,7 +1,8 @@
 /**
  * @file physics_system.h
  * @brief PhysicsSystem -- the ISceneSystem adapter binding PhysicsWorld to a coopa::scene
- *        Scene. This is the only file in physxcoopa that depends on coopa::scene.
+ *        Scene. Together with components/ and physx_yaml.h, the only part of physxcoopa that
+ *        depends on coopa::scene.
  */
 
 #ifndef PHYSXCOOPA_SYSTEM_PHYSICS_SYSTEM_H
@@ -144,14 +145,13 @@ private:
         /** @brief Meaningful only when `is_primary`: world-scaled, local-space (pre-rotation)
          *         offset from `sync_owner`'s own pivot to the body's true center of mass --
          *         see create_compound_body_()'s doc for how this is composed across every
-         *         member (a single-collider body's is exactly `col->center() * world_scale`,
-         *         the pre-compound-colliders formula, unchanged). create_compound_body_()
+         *         member (a single-collider body's is exactly `col->center() * world_scale`).
+         *         create_compound_body_()
          *         folds this into body.position instead of leaving it on any one Shape (which
          *         couldn't represent it for N>1 children anyway), so sync_transforms_in_()/
          *         write_transforms_back_() need it every frame to convert between
-         *         `sync_owner`'s pivot and body.position. Unlike the pre-compound-colliders
-         *         version of this field, NOT refreshed by update_changed_shapes_() for a
-         *         compound body (see that function's doc) -- only by a full regather_()
+         *         `sync_owner`'s pivot and body.position. NOT refreshed by
+         *         update_changed_shapes_() for a compound body (see that function's doc) -- only by a full regather_()
          *         rebuild. */
         glm::vec3 center_offset{0.0f};
     };
@@ -175,15 +175,13 @@ private:
      *        `col->owner` (inclusive) through parent() until it finds a RigidbodyComponent,
      *        returning that object (the group's ROOT for a compound body -- see
      *        create_compound_body_()'s doc). Falls back to `col->owner` itself if no ancestor
-     *        (including `col->owner`) has one -- a standalone static collider, matching every
-     *        pre-compound-colliders scene exactly (a Collider with no Rigidbody on its OWN
-     *        object never walked any further than that before this existed either).
+     *        (including `col->owner`) has one -- a standalone static collider.
      *
-     * For every existing scene (Rigidbody, if any, always on the SAME object as its Collider)
-     * this returns `col->owner` on the FIRST iteration, zero ancestor walking needed -- the
-     * grouping this enables is then trivially "one group per collider," identical to the
-     * pre-compound-colliders behavior. Grouping only does something different once a scene
-     * actually authors a child SceneObject's Collider under a Rigidbody-bearing ancestor.
+     * When a Rigidbody sits on the SAME object as its Collider this returns `col->owner` on the
+     * FIRST iteration, with no ancestor walking. Grouping only gathers several objects' colliders
+     * into one body once a scene authors a child SceneObject's Collider under a
+     * Rigidbody-bearing ancestor; several Colliders on one object always share that object's
+     * group.
      */
     static coopa::scene::SceneObject* group_root_for_(components::Collider* col) {
         coopa::scene::SceneObject* obj = col->owner;
@@ -229,7 +227,7 @@ private:
             // frame and all agreed on the same body -- otherwise (a brand new group, a new
             // member added to an existing group, or a member that moved out of a DIFFERENT
             // group since last frame, i.e. a reparent) the whole group rebuilds from scratch.
-            // Not maximally incremental, but correct and simple -- see the plan's Phase 5 doc.
+            // Not maximally incremental, but correct and simple.
             std::unordered_set<uint32_t> old_body_indices;
             bool all_old = true;
             for (auto* col : members) {
@@ -512,9 +510,9 @@ private:
      *         mass), which this pass isn't structured for. A live parameter edit on a compound
      *         child's Collider is simply not applied until the whole group next rebuilds (a
      *         structural change: refresh() + the collider set actually differing) -- a known
-     *         v1 limitation, not a silent-corruption risk (the OLD shape stays in effect,
-     *         nothing goes stale/wrong, it just doesn't hot-reload). Every single-shape body
-     *         (== every pre-compound-colliders scene) is completely unaffected by this trim. */
+     *         limitation, not a silent-corruption risk (the current shape stays in effect,
+     *         nothing goes stale/wrong, it just doesn't hot-reload). Single-shape bodies are
+     *         unaffected by this trim. */
     void update_changed_shapes_() {
         for (Binding& b : bindings_) {
             if (world_.shapes_of(b.body).size() > 1) continue; // compound: see doc above
@@ -543,9 +541,8 @@ private:
     /**
      * @brief Reconciles each bound RigidbodyComponent's live-editable fields into its Body every
      *        frame, so a runtime write like `rb->mass = 5.0f` or `rb->is_kinematic = true` takes
-     *        effect instead of being silently ignored after the body's creation-time bind (a gap
-     *        this closes -- previously RigidbodyComponent's fields were read only once, in
-     *        create_body_for_()).
+     *        effect instead of being silently ignored after the body's creation-time bind in
+     *        create_compound_body_().
      *
      * No separate revision counter on RigidbodyComponent: unlike Collider (whose setters bump
      * revision_ to gate an expensive make_shape() + broadphase proxy rebuild), Rigidbody's fields
@@ -609,9 +606,8 @@ private:
         }
     }
 
-    /** @brief Thin alias for dynamics::inertia_for_shape() -- kept as a member so every existing
-     *         call site in this file reads the same either way; see that function's doc for why
-     *         the dispatch itself now lives in dynamics/inertia.h instead of here. */
+    /** @brief Thin alias for dynamics::inertia_for_shape(); see that function's doc for why the
+     *         dispatch lives in dynamics/inertia.h rather than here. */
     static glm::vec3 inertia_for_(const collision::Shape& shape, float mass) {
         return dynamics::inertia_for_shape(shape, mass);
     }
@@ -620,7 +616,7 @@ private:
      *         Rigidbody's authored `mass` across its children proportionally (a uniform-
      *         density approximation; there is no per-collider density/mass field anywhere in
      *         this codebase to do better). TriangleMesh returns 1.0 (a mesh child is always
-     *         either static, where mass is irrelevant, or the dynamic-mesh case already throws
+     *         static or kinematic, where mass is irrelevant, or the dynamic-mesh case throws
      *         in create_compound_body_() before this value would matter). */
     static float shape_volume_(const collision::Shape& s) {
         constexpr float k_pi = 3.14159265358979323846f;
@@ -651,24 +647,22 @@ private:
      *        one for a genuine compound collider), and appends a Binding per member to
      *        `new_bindings`.
      *
-     * Generalizes create_body_for_()'s old single-collider logic (the engine's dynamics math
-     * assumes body.position IS the true center of mass -- see that reasoning, unchanged) to N
-     * children: every child's shape offset/rotation is first expressed relative to `root`
+     * The engine's dynamics math assumes body.position IS the true center of mass, so the
+     * collider offsets are folded into it across N children: every child's shape offset/rotation is first expressed relative to `root`
      * (`rel_pos`/`rel_rot`, a rigid transform composition via world_trs() that works regardless
      * of how deeply a child is nested under root), then each child's OWN collider `center`
-     * offset is folded in on top of that (mirrors the old center_offset_for_() formula, applied
-     * per child), giving every child's shape a `local_center`/`local_rotation` already
+     * offset is folded in on top of that (center_offset_for_()'s formula, applied per child),
+     * giving every child's shape a `local_center`/`local_rotation` already
      * expressed in root's frame. Mass is split across children by volume (shape_volume_()'s
      * doc), producing per-child inertia inputs to dynamics::compose_mass_properties() (see its
      * own doc for the diagonal-only approximation that composition makes). The resulting
-     * composite center of mass is folded into body.position exactly like the old single-
-     * collider path (plus any RigidbodyComponent::center_of_mass_override, composed the same
-     * way) -- every child shape's local_center is then re-based from ROOT's pivot to the TRUE
-     * CENTER, since N children can't all fold to a zero offset the way one shape used to.
+     * composite center of mass is folded into body.position (plus any
+     * RigidbodyComponent::center_of_mass_override, composed the same way) -- every child shape's
+     * local_center is then re-based from ROOT's pivot to the TRUE CENTER, since N children can't
+     * all fold to a zero offset the way a single shape can.
      *
-     * For a single member with no ancestor Rigidbody offset (i.e. every pre-compound-colliders
-     * scene), this reduces EXACTLY to create_body_for_()'s old formulas: rel_pos=0, rel_rot=
-     * identity, mass fraction=1.0, and compose_mass_properties() over one child has zero
+     * For a single member with no ancestor Rigidbody offset, this reduces EXACTLY to the
+     * single-collider formulas: rel_pos=0, rel_rot=identity, mass fraction=1.0, and compose_mass_properties() over one child has zero
      * parallel-axis contribution (its own center IS the composite center of mass) and zero
      * rotation to apply, so the composite tensor is precisely that child's own inertia_for_()
      * result with no approximation error.
@@ -779,9 +773,9 @@ private:
                                                                           : mp.inv_inertia_local;
         }
 
-        // Re-base every child's offset from root's pivot to the TRUE CENTER just computed --
-        // the generalization of the old single-collider "zero shape.local_center" trick: N
-        // children can't all fold to zero, so each keeps its own (now much smaller) offset.
+        // Re-base every child's offset from root's pivot to the TRUE CENTER just computed. A
+        // single collider's offset folds to zero; N children can't all fold to zero, so each
+        // keeps its own (much smaller) offset.
         for (auto& c : children) c.shape.local_center -= com;
 
         dynamics::BodyId id = world_.add_body(body, children[0].shape);
@@ -815,13 +809,9 @@ private:
     /**
      * @brief Reads world position/rotation for every bound body, deriving kinematic velocity
      *        or detecting a script-driven teleport on a dynamic body. Job-parallel: each
-     *        binding's Body (unique per binding -- one BodyId per Collider) and owner
-     *        Transform (a pure, race-free read post prime_transforms_()) are touched by
-     *        exactly one binding, so concurrent iterations never share mutable state --
-     *        UNLESS two bound Colliders sit on the very same SceneObject and so share one
-     *        Transform, which was already semantically dubious pre-parallelism (each Collider
-     *        gets its own independently-simulated Body, so two of them fighting over one
-     *        Transform's position never made physical sense); this pass does not special-case it.
+     *        primary binding's Body and sync_owner Transform (a pure, race-free
+     *        read post prime_transforms_()) are touched by exactly one binding, so concurrent
+     *        iterations never share mutable state.
      *
      *        Skips every non-primary binding (a compound body's child colliders -- see
      *        Binding's own doc): they have no independent Transform to sync, their shape's
@@ -932,11 +922,9 @@ private:
      *        world_scale`), PLUS a RigidbodyComponent::center_of_mass_override on top if one is
      *        set (Unity's Rigidbody.centerOfMass, world-scaled the same way `center` already is
      *        for consistency). body.position is folded to the true center instead of Shape
-     *        carrying the offset (see create_body_for_()'s doc), so this is recomputed whenever
-     *        a Binding's center_offset needs a refresh (creation, or a shape-changing revision
-     *        bump) -- create_body_for_() itself calls this too rather than re-deriving the
-     *        collider-center term from shape.local_center, so there is exactly one place this
-     *        composition happens.
+     *        carrying the offset (see create_compound_body_()'s doc), so update_changed_shapes_()
+     *        recomputes this whenever a single-shape Binding's center_offset needs a refresh (a
+     *        shape-changing revision bump).
      */
     static glm::vec3 center_offset_for_(components::Collider* col, const glm::vec3& world_scale) {
         glm::vec3 offset = col->center() * world_scale;

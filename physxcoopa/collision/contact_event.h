@@ -4,8 +4,8 @@
  *        substep loop and drained once per frame by the caller (PhysicsSystem, for a Scene-bound
  *        world; test.cpp directly, for headless use).
  *
- * Queued rather than fired immediately for the same reason Phase 3's on_substep deferred
- * structural mutations: a callback that reacts to a collision/trigger event might spawn or
+ * Queued rather than fired immediately for the same reason on_substep defers structural
+ * mutations (PhysicsWorld::create_body()/destroy_body()): a callback that reacts to a collision/trigger event might spawn or
  * destroy a body, which must not happen while the solver is mid-iteration over this step's
  * manifolds. This is a *different* queue from that one -- that one defers structural
  * *mutation*, this one defers *notification* -- both exist because either kind of callback
