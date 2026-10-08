@@ -29,6 +29,13 @@
 #include <physxcoopa/components/rigidbody.h>
 #include <physxcoopa/loaders/physics_material_loader.h>
 #include <physxcoopa/util/physics_settings.h>
+#include <physxcoopa/physx_yaml.h>
+#include <physxcoopa/nav/nav_baker.h>
+#include <physxcoopa/nav/path_query.h>
+#include <physxcoopa/nav/flow_field.h>
+#include <physxcoopa/nav/crowd.h>
+#include <physxcoopa/nav/nav_settings.h>
+#include <physxcoopa/system/nav_system.h>
 
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_object.h>
@@ -43,6 +50,8 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <span>
+#include <cstring>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -3149,6 +3158,728 @@ static void test_cloth_settles_on_mesh_floor_at_thickness() {
     ASSERT_NEAR(lowest, params.thickness, 5e-3f);      // and it is resting at the standoff
 }
 
+// --- Navigation ---
+
+namespace navtest {
+
+inline dynamics::BodyId static_box(PhysicsWorld& world, const glm::vec3& center, const glm::vec3& half) {
+    dynamics::Body b;
+    b.type = dynamics::BodyType::Static;
+    b.position = center;
+    return world.add_body(b, collision::Shape::make_box(half));
+}
+
+/** @brief 20 x 20 m ground (top at z = 0), a 10-step staircase rising +X from x = -3 to a
+ *         platform (top z = 2) spanning x in [2, 8], y in [-4, 4]. */
+inline void stairs_world(PhysicsWorld& world) {
+    static_box(world, {0.0f, 0.0f, -0.5f}, {10.0f, 10.0f, 0.5f});
+    static_box(world, {5.0f, 0.0f, 1.0f}, {3.0f, 4.0f, 1.0f});
+    for (int i = 0; i < 10; ++i) {
+        float top = 0.2f * static_cast<float>(i + 1);
+        static_box(world, {-2.75f + 0.5f * static_cast<float>(i), 0.0f, 0.5f * top}, {0.25f, 1.0f, 0.5f * top});
+    }
+}
+
+inline std::unique_ptr<nav::NavBaker> bake(const PhysicsWorld& world, coopa::job::JobEngine* jobs = nullptr,
+                                           nav::NavBuildSettings settings = {}) {
+    auto baker = std::make_unique<nav::NavBaker>(settings);
+    std::vector<nav::SourceShape> sources;
+    nav::gather_sources(world, {}, sources);
+    baker->set_sources(sources);
+    baker->build_all(jobs);
+    return baker;
+}
+
+} // namespace navtest
+
+static void test_nav_heightfield_floor_heights_are_exact() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {5.0f, 5.0f, 0.5f});
+    navtest::static_box(world, {0.0f, 0.0f, 0.65f}, {1.5f, 1.5f, 0.65f}); // top at 1.3
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    nav::SpanRef ground = mesh->find_nearest({-3.0f, -3.0f, 0.0f}, glm::vec3(0.5f));
+    nav::SpanRef top = mesh->find_nearest({0.0f, 0.0f, 1.3f}, glm::vec3(0.5f));
+    ASSERT_TRUE(ground != nav::k_invalid_span && top != nav::k_invalid_span);
+    ASSERT_NEAR(mesh->position_of(ground).z, 0.0f, 1e-4f);
+    ASSERT_NEAR(mesh->position_of(top).z, 1.3f, 1e-4f);
+    // 1.3 m is far above max_climb: the block's top is its own island.
+    ASSERT_TRUE(mesh->component_of(ground) != mesh->component_of(top));
+}
+
+static void test_nav_erosion_keeps_agent_radius_from_walls() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {5.0f, 5.0f, 0.5f});
+    navtest::static_box(world, {0.0f, 0.0f, 1.0f}, {0.25f, 3.0f, 1.0f}); // thin wall along Y
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    const float r = mesh->params.agent_radius;
+    // Nothing walkable within the agent radius of the wall face (x = +-0.25) or the ground's edge.
+    for (float x : {0.3f, 0.5f, -0.5f}) {
+        nav::SpanRef s = mesh->locate({x, 0.0f, 0.0f});
+        if (s == nav::k_invalid_span) continue;
+        ASSERT_TRUE(std::fabs(mesh->position_of(s).x) - 0.25f >= r - mesh->params.cs);
+    }
+    ASSERT_TRUE(mesh->locate({4.95f, 4.95f, 0.0f}) == nav::k_invalid_span ||
+                mesh->position_of(mesh->locate({4.95f, 4.95f, 0.0f})).x < 5.0f - r + mesh->params.cs);
+    // A 0.5 m wall is narrower than an agent: nobody stands on top of it.
+    ASSERT_TRUE(mesh->find_nearest({0.0f, 0.0f, 2.0f}, glm::vec3(0.1f, 0.1f, 0.3f)) == nav::k_invalid_span);
+    // The wall ends at |y| = 3 and the ground at 5: the two sides connect around it.
+    ASSERT_TRUE(mesh->component_of(mesh->locate({-2.0f, 0.0f, 0.0f})) == mesh->component_of(mesh->locate({2.0f, 0.0f, 0.0f})));
+}
+
+static void test_nav_astar_climbs_stairs_to_upper_floor() {
+    PhysicsWorld world;
+    navtest::stairs_world(world);
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    nav::NavPath path;
+    nav::QueryFilter f = mesh->default_filter();
+    f.heuristic_weight = 1.0f;
+    ASSERT_TRUE(nav::find_path(*mesh, {-6.0f, 6.0f, 0.0f}, {5.0f, 0.0f, 2.0f}, f, path) == nav::PathStatus::Success);
+    ASSERT_NEAR(path.points.front().z, 0.0f, 1e-3f);
+    ASSERT_NEAR(path.points.back().z, 2.0f, 1e-3f);
+    ASSERT_VEC3_NEAR(path.points.back(), glm::vec3(5.0f, 0.0f, 2.0f), 1e-3f);
+    // The only way up is the 2 m wide staircase: the path must cross it.
+    bool on_stairs = false;
+    for (const glm::vec3& p : path.points) on_stairs |= p.x > -3.2f && p.x < 2.2f && std::fabs(p.y) < 1.0f && p.z > 0.05f && p.z < 1.95f;
+    for (std::size_t i = 1; i < path.points.size(); ++i) {
+        // No segment may jump floors outside the staircase footprint.
+        const glm::vec3& a = path.points[i - 1];
+        const glm::vec3& b = path.points[i];
+        if (std::fabs(a.z - b.z) > 0.5f) on_stairs |= std::fabs(a.y) < 1.0f && std::fabs(b.y) < 1.0f;
+    }
+    ASSERT_TRUE(on_stairs);
+    ASSERT_TRUE(path.points.size() <= 6); // smoothed to a handful of corners
+    // Smoothed length is close to the true shortest route (~14.3 m around and up).
+    ASSERT_TRUE(path.length > 13.0f && path.length < 15.5f);
+}
+
+static void test_nav_astar_unreachable_goal_is_partial_or_none() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {10.0f, 10.0f, 0.5f});
+    // A closed 4 x 4 m pen.
+    navtest::static_box(world, {5.0f, 3.0f, 1.0f}, {2.25f, 0.25f, 1.0f});
+    navtest::static_box(world, {5.0f, 7.0f, 1.0f}, {2.25f, 0.25f, 1.0f});
+    navtest::static_box(world, {3.0f, 5.0f, 1.0f}, {0.25f, 2.25f, 1.0f});
+    navtest::static_box(world, {7.0f, 5.0f, 1.0f}, {0.25f, 2.25f, 1.0f});
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    nav::QueryFilter f = mesh->default_filter();
+    nav::NavPath path;
+    ASSERT_TRUE(nav::find_path(*mesh, {-6.0f, -6.0f, 0.0f}, {5.0f, 5.0f, 0.0f}, f, path) == nav::PathStatus::Partial);
+    // Ends as close to the pen centre as the outside allows: just outside a wall.
+    glm::vec3 end = path.points.back();
+    ASSERT_TRUE(glm::distance(glm::vec2(end), glm::vec2(5.0f, 5.0f)) < 3.0f);
+    ASSERT_TRUE(path.nodes_expanded < 20000); // planned to the nearest point, not a flood
+    f.allow_partial = false;
+    ASSERT_TRUE(nav::find_path(*mesh, {-6.0f, -6.0f, 0.0f}, {5.0f, 5.0f, 0.0f}, f, path) == nav::PathStatus::NoPath);
+}
+
+static void test_nav_corridor_and_unconfined_search_agree_on_open_ground() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {40.0f, 40.0f, 0.5f});
+    for (int i = 0; i < 6; ++i) navtest::static_box(world, {-25.0f + 10.0f * static_cast<float>(i), (i % 2 ? 8.0f : -8.0f), 1.0f}, {1.0f, 25.0f, 1.0f});
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    nav::QueryFilter f = mesh->default_filter();
+    f.heuristic_weight = 1.0f;
+    nav::PathQueryOptions with, without;
+    without.use_corridor = false;
+    nav::NavPath a, b;
+    ASSERT_TRUE(nav::find_path(*mesh, {-35.0f, 0.0f, 0.0f}, {35.0f, 0.0f, 0.0f}, f, a, with) == nav::PathStatus::Success);
+    ASSERT_TRUE(nav::find_path(*mesh, {-35.0f, 0.0f, 0.0f}, {35.0f, 0.0f, 0.0f}, f, b, without) == nav::PathStatus::Success);
+    ASSERT_TRUE(a.length < b.length * 1.06f);      // corridor costs at most a few percent
+    ASSERT_TRUE(a.nodes_expanded <= b.nodes_expanded);
+}
+
+static void test_nav_raycast_and_move_along_surface_slide_on_walls() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {5.0f, 5.0f, 0.5f});
+    navtest::static_box(world, {0.0f, 0.0f, 1.0f}, {0.25f, 3.0f, 1.0f});
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    nav::QueryFilter f = mesh->default_filter();
+    nav::SpanRef s = mesh->locate({-2.0f, 0.0f, 0.0f});
+    nav::NavRaycastHit hit;
+    ASSERT_TRUE(!mesh->raycast(s, {-2.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f}, f, hit));
+    ASSERT_TRUE(hit.normal.x < -0.9f);                      // hit the wall's -X face
+    ASSERT_TRUE(hit.position.x < -0.25f - mesh->params.agent_radius + mesh->params.cs);
+    ASSERT_TRUE(mesh->raycast(s, {-2.0f, 0.0f, 0.0f}, {-2.0f, 2.0f, 0.0f}, f, hit)); // along the wall: clear
+
+    // Pushing diagonally into the wall slides along it in +Y.
+    nav::NavMoveResult mv = mesh->move_along_surface(s, {-2.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 0.0f}, f);
+    ASSERT_TRUE(mv.blocked);
+    ASSERT_TRUE(mv.position.x < -0.5f);
+    ASSERT_TRUE(mv.position.y > 0.8f);
+}
+
+static void test_nav_off_mesh_link_bridges_a_gap() {
+    PhysicsWorld world;
+    navtest::static_box(world, {-5.0f, 0.0f, -0.5f}, {3.0f, 3.0f, 0.5f});  // x in [-8, -2]
+    navtest::static_box(world, {5.0f, 0.0f, -0.5f}, {3.0f, 3.0f, 0.5f});   // x in [2, 8]
+    nav::NavBaker baker;
+    std::vector<nav::SourceShape> sources;
+    nav::gather_sources(world, {}, sources);
+    baker.set_sources(sources);
+    nav::OffMeshLink link;
+    link.start = {-2.5f, 0.0f, 0.0f};
+    link.end = {2.5f, 0.0f, 0.0f};
+    link.bidirectional = false;
+    baker.set_links({link});
+    baker.build_all(nullptr);
+    auto mesh = baker.mesh();
+    ASSERT_TRUE(mesh->links.size() == 1 && mesh->links[0].start_ref != nav::k_invalid_span && mesh->links[0].end_ref != nav::k_invalid_span);
+
+    nav::QueryFilter f = mesh->default_filter();
+    nav::NavPath path;
+    ASSERT_TRUE(nav::find_path(*mesh, {-6.0f, 1.0f, 0.0f}, {6.0f, -1.0f, 0.0f}, f, path) == nav::PathStatus::Success);
+    bool used = false;
+    for (std::size_t i = 0; i + 1 < path.points.size(); ++i) {
+        if (path.flags[i] & nav::k_path_point_link_start) {
+            used = true;
+            ASSERT_TRUE(path.flags[i + 1] & nav::k_path_point_link_end);
+            ASSERT_TRUE(path.points[i].x < -1.5f && path.points[i + 1].x > 1.5f);
+        }
+    }
+    ASSERT_TRUE(used);
+    // One-way: the way back has no route.
+    f.allow_partial = false;
+    ASSERT_TRUE(nav::find_path(*mesh, {6.0f, 0.0f, 0.0f}, {-6.0f, 0.0f, 0.0f}, f, path) == nav::PathStatus::NoPath);
+}
+
+static void test_nav_area_costs_steer_paths_and_masks_exclude_areas() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {10.0f, 10.0f, 0.5f});
+    nav::NavBuildSettings settings;
+    settings.areas.names[2] = "Swamp";
+    settings.areas.costs[2] = 10.0f;
+    nav::NavBaker baker(settings);
+    std::vector<nav::SourceShape> sources;
+    nav::gather_sources(world, {}, sources);
+    baker.set_sources(sources);
+    nav::SourceVolume swamp;
+    swamp.box.center = {0.0f, 0.0f, 0.0f};
+    swamp.box.half_extents = {2.0f, 6.0f, 1.0f};
+    swamp.area = 2;
+    swamp.fingerprint = nav::fingerprint(swamp);
+    baker.set_volumes({swamp});
+    baker.build_all(nullptr);
+    auto mesh = baker.mesh();
+    ASSERT_TRUE(mesh->span(mesh->locate({0.0f, 0.0f, 0.0f}))->area == 2);
+
+    auto max_abs_y = [](const nav::NavPath& p) {
+        float m = 0.0f;
+        for (const auto& q : p.points) m = std::max(m, std::fabs(q.y));
+        return m;
+    };
+    nav::NavPath path;
+    nav::QueryFilter f = mesh->default_filter();
+    ASSERT_TRUE(nav::find_path(*mesh, {-6.0f, 0.0f, 0.0f}, {6.0f, 0.0f, 0.0f}, f, path) == nav::PathStatus::Success);
+    ASSERT_TRUE(max_abs_y(path) > 5.9f);            // walks around the swamp
+    f.area_cost[2] = 1.0f;
+    ASSERT_TRUE(nav::find_path(*mesh, {-6.0f, 0.0f, 0.0f}, {6.0f, 0.0f, 0.0f}, f, path) == nav::PathStatus::Success);
+    ASSERT_TRUE(max_abs_y(path) < 0.5f);             // straight through when it's cheap
+    ASSERT_TRUE(path.points.size() == 2);
+    f.area_mask &= ~(1ull << 2);
+    f.area_cost[2] = 1.0f;
+    ASSERT_TRUE(nav::find_path(*mesh, {-6.0f, 0.0f, 0.0f}, {6.0f, 0.0f, 0.0f}, f, path) == nav::PathStatus::Success);
+    ASSERT_TRUE(max_abs_y(path) > 5.9f);            // excluded outright
+}
+
+static void test_nav_incremental_rebuild_only_touches_dirty_tiles() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {20.0f, 20.0f, 0.5f});
+    coopa::job::JobEngine jobs(4);
+    nav::NavBuildSettings settings;
+    settings.rebuild_delay = 0.0f;
+    auto baker = navtest::bake(world, &jobs, settings);
+    auto before = baker->mesh();
+    nav::QueryFilter f = before->default_filter();
+    nav::NavPath path;
+    ASSERT_TRUE(nav::find_path(*before, {-15.0f, 0.0f, 0.0f}, {15.0f, 0.0f, 0.0f}, f, path) == nav::PathStatus::Success);
+    ASSERT_TRUE(path.points.size() == 2);
+
+    // A wall appears across the middle, with a gap at the north end.
+    navtest::static_box(world, {0.0f, -3.0f, 1.0f}, {0.5f, 17.0f, 1.0f});
+    std::vector<nav::SourceShape> sources;
+    nav::gather_sources(world, {}, sources);
+    baker->set_sources(sources);
+    ASSERT_TRUE(baker->busy());
+    baker->flush(&jobs);
+    auto after = baker->mesh();
+    ASSERT_TRUE(after->version > before->version);
+
+    // Tiles far from the wall are shared with the old mesh, not rebuilt.
+    std::size_t shared = 0, total = 0;
+    for (std::size_t i = 0; i < after->tiles.size(); ++i) {
+        if (!after->tiles[i]) continue;
+        ++total;
+        shared += after->tiles[i] == before->tiles[i];
+    }
+    ASSERT_TRUE(shared > 0 && shared < total);
+
+    ASSERT_TRUE(nav::find_path(*after, {-15.0f, 0.0f, 0.0f}, {15.0f, 0.0f, 0.0f}, f, path) == nav::PathStatus::Success);
+    float max_y = 0.0f;
+    for (const auto& p : path.points) max_y = std::max(max_y, p.y);
+    ASSERT_TRUE(max_y > 13.5f); // around the north end
+    // The old snapshot still answers queries exactly as before.
+    ASSERT_TRUE(nav::find_path(*before, {-15.0f, 0.0f, 0.0f}, {15.0f, 0.0f, 0.0f}, f, path) == nav::PathStatus::Success);
+    ASSERT_TRUE(path.points.size() == 2);
+}
+
+static void test_nav_parallel_and_serial_builds_are_identical() {
+    PhysicsWorld world;
+    navtest::stairs_world(world);
+    navtest::static_box(world, {-6.0f, -6.0f, 0.3f}, {1.0f, 1.0f, 0.3f});
+    coopa::job::JobEngine jobs(4);
+    auto a = navtest::bake(world, nullptr);
+    auto b = navtest::bake(world, &jobs);
+    auto ma = a->mesh(), mb = b->mesh();
+    ASSERT_TRUE(ma->tiles.size() == mb->tiles.size());
+    for (std::size_t i = 0; i < ma->tiles.size(); ++i) {
+        ASSERT_TRUE(!ma->tiles[i] == !mb->tiles[i]);
+        if (!ma->tiles[i]) continue;
+        const auto& sa = ma->tiles[i]->spans;
+        const auto& sb = mb->tiles[i]->spans;
+        ASSERT_TRUE(sa.size() == sb.size());
+        for (std::size_t s = 0; s < sa.size(); ++s) {
+            ASSERT_TRUE(sa[s].floor == sb[s].floor && sa[s].ceiling == sb[s].ceiling && sa[s].region == sb[s].region);
+            ASSERT_TRUE(std::memcmp(sa[s].link, sb[s].link, 4) == 0);
+        }
+    }
+}
+
+static void test_nav_flow_field_flows_up_the_stairs_toward_goal() {
+    PhysicsWorld world;
+    navtest::stairs_world(world);
+    coopa::job::JobEngine jobs(4);
+    auto baker = navtest::bake(world, &jobs);
+    auto mesh = baker->mesh();
+    glm::vec3 goal(5.0f, 0.0f, 2.0f);
+    auto flow = nav::FlowField::build(mesh, std::span<const glm::vec3>(&goal, 1), {}, &jobs);
+    ASSERT_TRUE(flow->valid());
+
+    // In front of the stairs it points up them (+X); on the far side of the platform it points
+    // back around toward the staircase; on the platform it points at the goal.
+    nav::FlowSample s = flow->sample({-6.0f, 0.0f, 0.0f});
+    ASSERT_TRUE(s.valid && s.direction.x > 0.95f);
+    s = flow->sample({0.0f, 0.0f, 1.2f});
+    ASSERT_TRUE(s.valid && s.direction.x > 0.9f);
+    s = flow->sample({5.0f, 7.0f, 0.0f});                 // ground, north of the platform
+    ASSERT_TRUE(s.valid && s.direction.x < 0.0f);       // heads west, back toward the stairs
+    s = flow->sample({7.0f, 3.0f, 2.0f});
+    ASSERT_TRUE(s.valid);
+    glm::vec2 want = glm::normalize(glm::vec2(goal) - glm::vec2(7.0f, 3.0f));
+    ASSERT_TRUE(glm::dot(glm::vec2(s.direction), want) > 0.95f); // straight at it (Eikonal, not 8-way)
+    // Distances grow away from the goal and are roughly metric.
+    ASSERT_TRUE(flow->sample({-6.0f, 0.0f, 0.0f}).distance > flow->sample({0.0f, 0.0f, 1.2f}).distance);
+    // Without the wall penalty (on by default, it charges extra near edges) distances are metric:
+    // FMM's isotropic error on open ground is a few percent.
+    nav::FlowFieldSettings metric;
+    metric.filter.wall_penalty = 0.0f;
+    auto plain = nav::FlowField::build(mesh, std::span<const glm::vec3>(&goal, 1), metric, &jobs);
+    ASSERT_NEAR(plain->sample({7.0f, 3.0f, 2.0f}).distance, glm::distance(glm::vec2(7.0f, 3.0f), glm::vec2(goal)), 0.25f);
+    ASSERT_TRUE(flow->sample({7.0f, 3.0f, 2.0f}).distance > plain->sample({7.0f, 3.0f, 2.0f}).distance); // penalty applied
+}
+
+static void test_nav_flow_field_multiple_goals_and_max_distance() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {20.0f, 5.0f, 0.5f});
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    glm::vec3 goals[2] = {{-15.0f, 0.0f, 0.0f}, {15.0f, 0.0f, 0.0f}};
+    auto flow = nav::FlowField::build(mesh, goals);
+    ASSERT_TRUE(flow->sample({-5.0f, 0.0f, 0.0f}).direction.x < -0.9f); // nearer the west goal
+    ASSERT_TRUE(flow->sample({5.0f, 0.0f, 0.0f}).direction.x > 0.9f);
+    nav::FlowFieldSettings fs;
+    fs.max_distance = 6.0f;
+    auto bounded = nav::FlowField::build(mesh, std::span<const glm::vec3>(goals, 1), fs);
+    ASSERT_TRUE(bounded->sample({-12.0f, 0.0f, 0.0f}).valid);
+    ASSERT_TRUE(!bounded->sample({0.0f, 0.0f, 0.0f}).valid);
+    ASSERT_TRUE(bounded->reached_count() < flow->reached_count() / 3);
+}
+
+/**
+ * 40 agents (all the 0.4 m-radius bodies the ~37 m^2 eroded platform can hold, with room to
+ * spare) stream single file up the 1.2 m-wide (after erosion) staircase on one shared flow
+ * field. Exercises the crowd as a whole: no agent may stall against a wall, fall off the mesh,
+ * or overlap its neighbours much, and arrival contagion must settle the group around the goal
+ * instead of letting it swirl -- while not spreading back down the queue and stopping agents
+ * that still have room.
+ */
+static void test_nav_crowd_flow_agents_reach_goal_and_keep_apart() {
+    PhysicsWorld world;
+    navtest::stairs_world(world);
+    coopa::job::JobEngine jobs(4);
+    auto baker = navtest::bake(world, &jobs);
+    auto mesh = baker->mesh();
+    glm::vec3 goal(5.0f, 0.0f, 2.0f);
+    auto flow = nav::FlowField::build(mesh, std::span<const glm::vec3>(&goal, 1), {}, &jobs);
+
+    nav::Crowd crowd;
+    nav::CrowdAgentParams params;
+    params.filter = mesh->default_filter();
+    const int n = 40;
+    for (int i = 0; i < n; ++i) {
+        auto id = crowd.add_agent({-8.0f + static_cast<float>(i % 8) * 0.9f, -8.0f + static_cast<float>(i / 8) * 0.9f, 0.0f}, params);
+        crowd.set_flow(id, flow);
+    }
+    float min_gap = 1e9f;
+    for (int step = 0; step < 60 * 40; ++step) {
+        crowd.update(1.0f / 60.0f, *mesh, &jobs, 16);
+        if (step % 30 == 0) {
+            for (int i = 0; i < n; ++i) {
+                for (int j = i + 1; j < n; ++j) {
+                    glm::vec3 d = crowd.agent(static_cast<uint32_t>(i)).position - crowd.agent(static_cast<uint32_t>(j)).position;
+                    if (std::fabs(d.z) < 0.1f) min_gap = std::min(min_gap, glm::length(glm::vec2(d)));
+                }
+            }
+        }
+    }
+    int on_platform = 0, arrived = 0;
+    float speed = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const auto& a = crowd.agent(static_cast<uint32_t>(i));
+        ASSERT_TRUE(a.ref != nav::k_invalid_span);       // nobody left the mesh
+        on_platform += a.position.z > 1.9f;
+        arrived += a.arrived;
+        speed += glm::length(glm::vec2(a.velocity));
+    }
+    ASSERT_TRUE(on_platform == n);
+    ASSERT_TRUE(arrived >= n / 2);                        // settled around the goal...
+    ASSERT_TRUE(speed / static_cast<float>(n) < 0.5f);    // ...not swirling at full speed
+    ASSERT_TRUE(min_gap > 0.5f);                          // radii 0.4 + 0.4: overlap stays small
+}
+
+static void test_nav_crowd_path_agent_follows_link_and_arrives() {
+    PhysicsWorld world;
+    navtest::static_box(world, {-5.0f, 0.0f, -0.5f}, {3.0f, 3.0f, 0.5f});
+    navtest::static_box(world, {5.0f, 0.0f, -1.5f}, {3.0f, 3.0f, 0.5f}); // 1 m lower
+    nav::NavBaker baker;
+    std::vector<nav::SourceShape> sources;
+    nav::gather_sources(world, {}, sources);
+    baker.set_sources(sources);
+    nav::OffMeshLink drop;
+    drop.start = {-2.5f, 0.0f, 0.0f};
+    drop.end = {2.5f, 0.0f, -1.0f};
+    drop.bidirectional = false;
+    baker.set_links({drop});
+    baker.build_all(nullptr);
+    auto mesh = baker.mesh();
+
+    nav::NavPath path;
+    ASSERT_TRUE(nav::find_path(*mesh, {-6.0f, 0.0f, 0.0f}, {6.0f, 1.0f, -1.0f}, mesh->default_filter(), path) == nav::PathStatus::Success);
+    nav::Crowd crowd;
+    nav::CrowdAgentParams params;
+    params.filter = mesh->default_filter();
+    auto id = crowd.add_agent({-6.0f, 0.0f, 0.0f}, params);
+    crowd.set_path(id, path);
+    bool saw_link = false;
+    for (int i = 0; i < 60 * 10 && !crowd.agent(id).arrived; ++i) {
+        crowd.update(1.0f / 60.0f, *mesh, nullptr);
+        saw_link |= crowd.agent(id).on_link;
+    }
+    ASSERT_TRUE(saw_link);
+    ASSERT_TRUE(crowd.agent(id).arrived);
+    ASSERT_VEC3_NEAR(crowd.agent(id).position, glm::vec3(6.0f, 1.0f, -1.0f), 0.2f);
+}
+
+static void test_nav_portals_mirror_across_tile_borders() {
+    PhysicsWorld world;
+    navtest::static_box(world, {0.0f, 0.0f, -0.5f}, {12.0f, 12.0f, 0.5f});
+    // A wall along x = 0 with one 3 m gap, so the border it crosses splits into two portals.
+    navtest::static_box(world, {0.0f, -7.0f, 1.0f}, {0.25f, 5.0f, 1.0f});
+    navtest::static_box(world, {0.0f, 7.0f, 1.0f}, {0.25f, 3.5f, 1.0f});
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    std::size_t portals = 0;
+    for (uint32_t t = 0; t < mesh->tiles.size(); ++t) {
+        const nav::NavTile* tile = mesh->tiles[t].get();
+        if (!tile) continue;
+        for (uint16_t p = 0; p < tile->portals.size(); ++p) {
+            ++portals;
+            uint16_t q = mesh->mirror_portal(t, p);
+            ASSERT_TRUE(q != 0xFFFF);
+            uint32_t nt = nav::ref_tile(tile->portals[p].to);
+            ASSERT_TRUE(mesh->mirror_portal(nt, q) == p);                     // symmetric
+            ASSERT_TRUE(glm::distance(tile->portals[p].mid, mesh->tiles[nt]->portals[q].mid) < mesh->params.cs * 2.5f);
+            const nav::NavRegion& reg = tile->regions[tile->portals[p].region];
+            ASSERT_TRUE(std::find(reg.portals.begin(), reg.portals.end(), p) != reg.portals.end());
+        }
+    }
+    ASSERT_TRUE(portals > 8);
+}
+
+static void test_nav_flow_auto_stays_exact_in_small_worlds() {
+    PhysicsWorld world;
+    navtest::stairs_world(world);
+    auto baker = navtest::bake(world);
+    auto mesh = baker->mesh();
+    glm::vec3 goal(5.0f, 0.0f, 2.0f);
+    nav::FlowFieldSettings autos, exact;
+    exact.mode = nav::FlowFieldMode::Exact;
+    auto a = nav::FlowField::build(mesh, std::span<const glm::vec3>(&goal, 1), autos);
+    auto e = nav::FlowField::build(mesh, std::span<const glm::vec3>(&goal, 1), exact);
+    ASSERT_TRUE(!a->hierarchical());
+    ASSERT_TRUE(a->reached_count() == e->reached_count());
+    for (glm::vec3 q : {glm::vec3(-6, 6, 0), glm::vec3(0, 0, 1.2f), glm::vec3(7, 3, 2)}) {
+        ASSERT_NEAR(a->sample(q).distance, e->sample(q).distance, 1e-4f);
+    }
+}
+
+namespace navtest {
+/** @brief 240 x 240 m of open ground with scattered rocks -- big enough that Auto goes
+ *         hierarchical (30 x 30 tiles at 0.5 m cells). */
+inline std::unique_ptr<nav::NavBaker> open_world(PhysicsWorld& world, uint32_t seed, bool long_wall = false) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-115.0f, 115.0f), sz(0.6f, 3.0f);
+    static_box(world, {0.0f, 0.0f, -0.5f}, {120.0f, 120.0f, 0.5f});
+    for (int i = 0; i < 300; ++i) {
+        glm::vec3 c(u(rng), u(rng), 1.0f);
+        if (glm::length(glm::vec2(c)) < 8.0f || (long_wall && std::fabs(c.y + 40.0f) < 6.0f)) continue;
+        static_box(world, c, {sz(rng), sz(rng), 1.0f});
+    }
+    if (long_wall) {
+        // y = -40, from x = -120 to 120 with a single 6 m gap at x = 90.
+        static_box(world, {-16.5f, -40.0f, 1.5f}, {103.5f, 0.5f, 1.5f});
+        static_box(world, {106.5f, -40.0f, 1.5f}, {13.5f, 0.5f, 1.5f});
+    }
+    nav::NavBuildSettings settings;
+    settings.cell_size = 0.5f;
+    return bake(world, nullptr, settings);
+}
+} // namespace navtest
+
+static void test_nav_flow_hierarchical_integrates_only_where_followers_are() {
+    PhysicsWorld world;
+    auto baker = navtest::open_world(world, 11);
+    auto mesh = baker->mesh();
+    glm::vec3 goal(0.0f, 0.0f, 0.0f);
+    nav::FlowFieldSettings hs, es;
+    es.mode = nav::FlowFieldMode::Exact;
+    auto e = nav::FlowField::build(mesh, std::span<const glm::vec3>(&goal, 1), es);
+    std::vector<glm::vec3> pack;
+    for (int k = 0; k < 30; ++k) {
+        glm::vec3 q(85.0f + static_cast<float>(k % 6) * 0.9f, 60.0f + static_cast<float>(k / 6) * 0.9f, 0.0f);
+        if (e->sample(q).valid) pack.push_back(q); // skip pockets the rocks wall off entirely
+    }
+    ASSERT_TRUE(pack.size() >= 15);
+    hs.required_points = pack;
+    auto h = nav::FlowField::build(mesh, std::span<const glm::vec3>(&goal, 1), hs);
+    ASSERT_TRUE(h->hierarchical());
+    ASSERT_TRUE(h->active_tile_count() * 10 < mesh->params.tile_count()); // a corridor's worth, not the world
+    ASSERT_TRUE(h->reached_count() * 8 < e->reached_count());
+    // Where the pack is, directions are exact-quality.
+    float agree = 0.0f;
+    for (const auto& q : pack) {
+        nav::FlowSample a = h->sample(q), b = e->sample(q);
+        ASSERT_TRUE(a.valid && !a.coarse && b.valid);
+        agree += glm::dot(a.direction, b.direction);
+    }
+    ASSERT_TRUE(agree / static_cast<float>(pack.size()) > 0.85f);
+    // Elsewhere the coarse layer still answers, broadly the right way.
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> u(-110.0f, 110.0f);
+    int coarse = 0;
+    float coarse_agree = 0.0f;
+    for (int i = 0; i < 400; ++i) {
+        glm::vec3 q(u(rng), u(rng), 0.0f);
+        nav::FlowSample a = h->sample(q), b = e->sample(q);
+        if (!b.valid || !a.valid || !a.coarse || b.distance < 20.0f) continue;
+        ++coarse;
+        coarse_agree += glm::dot(a.direction, b.direction);
+    }
+    ASSERT_TRUE(coarse > 50);
+    ASSERT_TRUE(coarse_agree / static_cast<float>(coarse) > 0.6f);
+}
+
+/**
+ * The goal is south of a 240 m wall whose only gap is at its east end; a pack starts far to the
+ * north-west. Driven the way NavSystem drives it -- rebuilt every half second around the pack's
+ * current positions -- the hierarchical field must route the pack to the gap and through, with
+ * each rebuild integrating only a small fraction of the world.
+ */
+static void test_nav_flow_hierarchical_crowd_finds_the_gap() {
+    PhysicsWorld world;
+    auto baker = navtest::open_world(world, 23, /*long_wall=*/true);
+    auto mesh = baker->mesh();
+    glm::vec3 goal(0.0f, -80.0f, 0.0f);
+    coopa::job::JobEngine jobs(4);
+    nav::Crowd crowd;
+    nav::CrowdAgentParams params;
+    params.filter = mesh->default_filter();
+    params.max_speed = 6.0f;
+    for (int k = 0; k < 20; ++k) {
+        glm::vec3 q(-60.0f + static_cast<float>(k % 5) * 0.9f, 10.0f + static_cast<float>(k / 5) * 0.9f, 0.0f);
+        if (mesh->locate(q) != nav::k_invalid_span) crowd.add_agent(q, params);
+    }
+    std::size_t max_active = 0;
+    int hierarchical_builds = 0;
+    for (int step = 0; step < 60 * 75; ++step) {
+        if (step % 30 == 0) {
+            nav::FlowFieldSettings fs;
+            for (std::size_t i = 0; i < crowd.capacity(); ++i) fs.required_points.push_back(crowd.agent(static_cast<uint32_t>(i)).position);
+            auto f = nav::FlowField::build(mesh, std::span<const glm::vec3>(&goal, 1), fs, &jobs);
+            // Far out it is hierarchical; once the pack is near the goal the routed area is small
+            // and Auto rightly switches to an exact field.
+            if (f->hierarchical()) {
+                ++hierarchical_builds;
+                max_active = std::max(max_active, f->active_tile_count());
+            }
+            for (std::size_t i = 0; i < crowd.capacity(); ++i) crowd.set_flow(static_cast<uint32_t>(i), f);
+        }
+        crowd.update(1.0f / 60.0f, *mesh, &jobs, 8);
+    }
+    int arrived = 0;
+    for (std::size_t i = 0; i < crowd.capacity(); ++i) {
+        arrived += glm::distance(glm::vec2(crowd.agent(static_cast<uint32_t>(i)).position), glm::vec2(goal)) < 8.0f;
+    }
+    ASSERT_TRUE(arrived >= static_cast<int>(crowd.capacity()) - 1);
+    ASSERT_TRUE(hierarchical_builds > 20);
+    ASSERT_TRUE(max_active * 6 < mesh->params.tile_count());
+}
+
+static void test_nav_parse_settings() {
+    std::istringstream iss(
+        "cell_size: 0.3\n"
+        "cell_height: 0.05\n"
+        "tile_size: 48\n"
+        "max_slope: 30\n"
+        "layers: [Ground, 3]\n"
+        "agents:\n"
+        "  - { name: Small, radius: 0.3, height: 1.2, max_climb: 0.3 }\n"
+        "  - { name: Big, radius: 1.0, height: 3.0, max_climb: 0.6 }\n"
+        "areas:\n"
+        "  - { name: Grass, cost: 1.5 }\n"
+        "  - { name: Water, cost: 5, id: 9 }\n"
+        "max_path_requests_per_frame: 8\n"
+        "flow: { rebuild_distance: 1.0, max_distance: 40, wall_penalty: 0.5 }\n"
+        "debug_draw: [Mesh, Flow]\n");
+    fkyaml::node node = fkyaml::node::deserialize(iss);
+    nav::NavSettings s = nav::parse_nav_settings(node, {"Default", "Ground"});
+    ASSERT_NEAR(s.build.cell_size, 0.3f, 1e-6f);
+    ASSERT_NEAR(s.build.cell_height, 0.05f, 1e-6f);
+    ASSERT_TRUE(s.build.tile_size == 48);
+    ASSERT_TRUE(s.build.layer_mask == ((1u << 1) | (1u << 3)));
+    ASSERT_TRUE(s.build.agents.size() == 2 && s.build.agents[1].name == "Big");
+    ASSERT_TRUE(s.build.agent_index("Big") == 1);
+    ASSERT_TRUE(s.build.areas.find("Grass") == 2 && s.build.areas.find("Water") == 9);
+    ASSERT_NEAR(s.build.areas.costs[9], 5.0f, 1e-6f);
+    ASSERT_TRUE(s.max_path_requests_per_frame == 8);
+    ASSERT_NEAR(s.flow_max_distance, 40.0f, 1e-6f);
+    ASSERT_TRUE(nav::has_flag(s.debug_draw, nav::NavDebugFlags::Flow) && !nav::has_flag(s.debug_draw, nav::NavDebugFlags::Paths));
+}
+
+static void test_nav_system_scene_agents_path_and_flow() {
+    using namespace coopa::scene;
+    coopa::asset::AssetManager assets;
+    register_physics_components(assets);
+    std::istringstream iss(
+        "scene:\n"
+        "  scene_name: NavTest\n"
+        "  root_objects:\n"
+        "    - name: ground\n"
+        "      components:\n"
+        "        - { type: Transform, position: { x: 0, y: 0, z: -0.5 } }\n"
+        "        - { type: BoxCollider, size: { x: 20, y: 20, z: 1 } }\n"
+        "    - name: crate\n"
+        "      components:\n"
+        "        - { type: Transform, position: { x: 0, y: 0, z: 1 } }\n"
+        "        - { type: BoxCollider, size: { x: 4, y: 4, z: 2 } }\n"
+        "        - { type: NavModifier, walkable: false }\n"
+        "    - name: target\n"
+        "      components:\n"
+        "        - { type: Transform, position: { x: 7, y: 7, z: 0 } }\n"
+        "    - name: walker\n"
+        "      components:\n"
+        "        - { type: Transform, position: { x: -6, y: -6, z: 0 } }\n"
+        "        - { type: NavAgent, speed: 4, destination: { x: 6, y: 6, z: 0 } }\n"
+        "    - name: mob0\n"
+        "      components:\n"
+        "        - { type: Transform, position: { x: -7, y: 5, z: 0 } }\n"
+        "        - { type: NavAgent, speed: 4, flow_target: target }\n"
+        "    - name: mob1\n"
+        "      components:\n"
+        "        - { type: Transform, position: { x: 5, y: -7, z: 0 } }\n"
+        "        - { type: NavAgent, speed: 4, flow_target: target }\n");
+    fkyaml::node root = fkyaml::node::deserialize(iss);
+    Scene scene = SceneLoader::load_from_node(root, "");
+    scene.start();
+    system::install_physics_system(scene);
+    auto* navsys = system::install_nav_system(scene);
+
+    int arrivals = 0;
+    auto* walker = scene.find_object("walker")->get_component<components::NavAgentComponent>();
+    walker->on_arrived.connect([&](components::NavAgentComponent&) { ++arrivals; });
+    for (int i = 0; i < 60 * 8; ++i) {
+        scene.update(1.0f / 60.0f);
+        scene.late_update(1.0f / 60.0f);
+    }
+    ASSERT_TRUE(navsys->agent_count() == 3);
+    ASSERT_TRUE(navsys->mesh() != nullptr);
+    // The crate's top is not walkable even though it is flat and agent-sized.
+    ASSERT_TRUE(navsys->mesh()->find_nearest({0.0f, 0.0f, 2.0f}, glm::vec3(0.5f)) == nav::k_invalid_span);
+    ASSERT_TRUE(walker->arrived() && arrivals == 1);
+    glm::vec3 wp = glm::vec3(scene.find_object("walker")->get_transform()->get_world_matrix()[3]);
+    ASSERT_VEC3_NEAR(wp, glm::vec3(6.0f, 6.0f, 0.0f), 0.2f);
+    ASSERT_TRUE(navsys->flow_field("target") != nullptr);
+    for (const char* name : {"mob0", "mob1"}) {
+        glm::vec3 p = glm::vec3(scene.find_object(name)->get_transform()->get_world_matrix()[3]);
+        ASSERT_TRUE(glm::distance(glm::vec2(p), glm::vec2(7.0f, 7.0f)) < 1.2f);
+    }
+
+    // Move the target: the shared flow field rebuilds and the mobs follow.
+    scene.find_object("target")->get_transform()->transform().set_position(glm::vec3(-7.0f, -7.0f, 0.0f));
+    for (int i = 0; i < 60 * 8; ++i) {
+        scene.update(1.0f / 60.0f);
+        scene.late_update(1.0f / 60.0f);
+    }
+    for (const char* name : {"mob0", "mob1"}) {
+        glm::vec3 p = glm::vec3(scene.find_object(name)->get_transform()->get_world_matrix()[3]);
+        ASSERT_TRUE(glm::distance(glm::vec2(p), glm::vec2(-7.0f, -7.0f)) < 1.2f);
+    }
+    debug::DebugDraw draw;
+    navsys->debug_draw(draw, nav::NavDebugFlags::All);
+    ASSERT_TRUE(!draw.lines.empty());
+    coopa::scene::SceneLoader::clear_component_parsers();
+}
+
+static void test_nav_system_dynamic_crate_carves_when_asleep() {
+    using namespace coopa::scene;
+    Scene scene("NavCarve");
+    auto ground = std::make_unique<SceneObject>("ground");
+    ground->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, -0.5f));
+    ground->add_component<components::BoxCollider>()->set_size(glm::vec3(16.0f, 16.0f, 1.0f));
+    scene.add_root_object(std::move(ground));
+    auto crate = std::make_unique<SceneObject>("crate");
+    crate->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 1.5f));
+    crate->add_component<components::BoxCollider>()->set_size(glm::vec3(3.0f, 3.0f, 1.0f));
+    crate->add_component<components::RigidbodyComponent>()->mass = 5.0f;
+    crate->add_component<components::NavModifierComponent>()->carve = true;
+    scene.add_root_object(std::move(crate));
+    scene.start();
+    system::install_physics_system(scene);
+    nav::NavSettings settings;
+    settings.build.rebuild_delay = 0.1f;
+    auto* navsys = system::install_nav_system(scene, settings);
+
+    // Carved = no ground span left under the crate (its own top, 1 m up, stays walkable).
+    auto blocked = [&]() {
+        auto m = navsys->mesh();
+        return m && m->find_nearest({0.0f, 0.0f, 0.0f}, glm::vec3(0.2f, 0.2f, 0.3f)) == nav::k_invalid_span;
+    };
+    scene.update(1.0f / 60.0f);
+    scene.late_update(1.0f / 60.0f);
+    ASSERT_TRUE(!blocked()); // falling: not carved yet
+    for (int i = 0; i < 60 * 6; ++i) {
+        scene.update(1.0f / 60.0f);
+        scene.late_update(1.0f / 60.0f);
+    }
+    navsys->flush();
+    ASSERT_TRUE(blocked()); // came to rest and fell asleep: carved
+}
+
 int main() {
     RUN_TEST(test_ray_aabb_hand_computed);
     RUN_TEST(test_closest_points_segment_segment_parallel);
@@ -3246,6 +3977,28 @@ int main() {
     RUN_TEST(test_cloth_mesh_collider_front_side_projection_is_unchanged);
     RUN_TEST(test_cloth_mesh_collider_concave_pocket_is_not_flipped);
     RUN_TEST(test_cloth_settles_on_mesh_floor_at_thickness);
+
+    RUN_TEST(test_nav_heightfield_floor_heights_are_exact);
+    RUN_TEST(test_nav_erosion_keeps_agent_radius_from_walls);
+    RUN_TEST(test_nav_astar_climbs_stairs_to_upper_floor);
+    RUN_TEST(test_nav_astar_unreachable_goal_is_partial_or_none);
+    RUN_TEST(test_nav_corridor_and_unconfined_search_agree_on_open_ground);
+    RUN_TEST(test_nav_raycast_and_move_along_surface_slide_on_walls);
+    RUN_TEST(test_nav_off_mesh_link_bridges_a_gap);
+    RUN_TEST(test_nav_area_costs_steer_paths_and_masks_exclude_areas);
+    RUN_TEST(test_nav_incremental_rebuild_only_touches_dirty_tiles);
+    RUN_TEST(test_nav_parallel_and_serial_builds_are_identical);
+    RUN_TEST(test_nav_flow_field_flows_up_the_stairs_toward_goal);
+    RUN_TEST(test_nav_flow_field_multiple_goals_and_max_distance);
+    RUN_TEST(test_nav_crowd_flow_agents_reach_goal_and_keep_apart);
+    RUN_TEST(test_nav_crowd_path_agent_follows_link_and_arrives);
+    RUN_TEST(test_nav_portals_mirror_across_tile_borders);
+    RUN_TEST(test_nav_flow_auto_stays_exact_in_small_worlds);
+    RUN_TEST(test_nav_flow_hierarchical_integrates_only_where_followers_are);
+    RUN_TEST(test_nav_flow_hierarchical_crowd_finds_the_gap);
+    RUN_TEST(test_nav_parse_settings);
+    RUN_TEST(test_nav_system_scene_agents_path_and_flow);
+    RUN_TEST(test_nav_system_dynamic_crate_carves_when_asleep);
 
     std::cout << "===========================================" << std::endl;
     std::cout << "Tests run: " << g_tests_run << ", Failed: " << g_tests_failed << std::endl;

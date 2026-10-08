@@ -3,7 +3,8 @@
 **A header-only C++20 library for real-time rigid-body and cloth physics.**
 
 physxcoopa simulates rigid bodies with box, sphere, capsule and triangle-mesh colliders,
-hinge joints, triggers and XPBD cloth. It has two layers. `PhysicsWorld` is a plain
+hinge joints, triggers and XPBD cloth, and builds navigation (A* and flow fields for crowds)
+from those same colliders. It has two layers. `PhysicsWorld` is a plain
 simulation you can drive from any program. `PhysicsSystem` is an optional adapter that binds
 the world to a [libcoopa](https://github.com/cooparobla/libcoopa) scene, so colliders and
 rigid bodies can be written as YAML components. The library has no renderer. It gives you
@@ -62,6 +63,24 @@ debug geometry as plain line segments to draw however you like.
   Coupling is one-way: the cloth never pushes bodies.
 - **Wind and air.** Wind, turbulence, drag and lift.
 - **Sleeping.** A settled sheet stops simulating until an anchor or a nearby collider moves.
+
+### Navigation
+- **Navmesh from colliders.** Static and kinematic colliders are voxelized, tile by tile, into a
+  multi-layer walkable surface per agent profile (radius, height, climb). Stairs, ramps, bridges
+  and stacked floors are ordinary surface, so paths go upstairs by themselves.
+- **A\*.** Hierarchical (coarse region corridor, then fine 8-way search), with an O(1)
+  reachability check, area costs and masks, off-mesh links (jumps, drops, ladders), partial
+  paths and string pulling. Batches run in parallel on the job engine.
+- **Flow fields.** Fast Marching (Eikonal) integration over the same surface, so one field
+  steers thousands of agents toward one or more goals, across floors. Built in the background
+  and swapped in. In open worlds they go **hierarchical**: coarse portal routing for the whole
+  world, exact integration only in the tiles around the followers.
+- **Crowds.** Path or flow following, separation, overlap resolve, arrival contagion, wall
+  sliding and link traversal, updated in parallel.
+- **Incremental.** Moving or adding a collider rebuilds only the tiles it touches, in the
+  background. A dynamic body can carve the mesh once it comes to rest.
+- **Scene components.** `NavAgent`, `NavModifier`, `NavVolume`, `NavLink`, plus
+  `install_nav_system()`. See [`physxcoopa/nav/README.md`](physxcoopa/nav/README.md).
 
 ### Engine integration
 - **Fixed timestep.** `step(dt)` runs fixed substeps (1/60 s by default) and exposes an
@@ -250,6 +269,10 @@ Every key is optional.
 | `MeshCollider` | `mesh_path` (loads `meshes/<name>.yaml`, a `vertices:`/`faces:` mesh), `convex` |
 | `Rigidbody` | `mass`, `drag`, `angular_drag`, `use_gravity`, `is_kinematic`, `interpolation` (`Interpolate` or `None`), `freeze_position`, `freeze_rotation`, `velocity`, `angular_velocity` |
 | `HingeJoint` | `connected_object`, `anchor` and `axis` (in this object's local frame), `limits: { min, max }` (degrees) |
+| `NavAgent` | `agent_type`, `speed`, `acceleration`, `angular_speed`, `stopping_distance`, `slowdown_distance`, `radius`, `separation_weight`, `base_offset`, `update_rotation`, `forward` (`Y`, `-Y`, `X`, `-X`), `avoid_areas`, `heuristic_weight`, and one of `destination` (A\* to a point), `destination_object` (chase an object by A\*), `flow_target` (follow that object's shared flow field) |
+| `NavModifier` | `area`, `walkable`, `ignore`, `carve` (dynamic bodies carve while asleep), `apply_to_children` |
+| `NavVolume` | `size`, `center`, `area` (`NotWalkable` cuts a hole) |
+| `NavLink` | `start`, `end` (local space), `bidirectional`, `cost`, `area`, `snap_radius` |
 | `Cloth` | `resolution`, `size`, `mass`, `shear`, `stretch_compliance`, `bend_compliance`, `damping`, `thickness`, `friction`, `gravity_scale`, `max_velocity`, `external_acceleration`, `wind`, `wind_turbulence`, `air_drag`, `air_lift`, `self_collision`, `self_distance`, `tether_scale`, `substeps`, `iterations`, `sleep_threshold`, `sleep_time`, `layer`, `anchors: [{ object, point, radius }]` |
 
 A cloth sheet is built in its object's local XY plane, centred on the object. Each anchor pins
@@ -272,6 +295,41 @@ physics:
     - [Triggers, Triggers]
   debug_draw: [Colliders, Contacts]
   parallel_threshold: 64
+```
+
+Navigation is configured by a `navigation:` block. Parse it with `nav::parse_nav_settings()`
+and pass the result to `system::install_nav_system(scene, settings)`, which must run after
+the physics system (default order 150). The system idles until the scene has a `NavAgent`.
+
+```yaml
+navigation:
+  cell_size: 0.25              # XY resolution; paths and flow vectors have this resolution
+  cell_height: 0.05
+  max_slope: 45
+  agents:
+    - { name: Humanoid, radius: 0.4, height: 1.8, max_climb: 0.45 }
+  areas:
+    - { name: Mud, cost: 8.0 }
+  flow: { rebuild_distance: 0.5, wall_penalty: 1.0, mode: auto, near_radius: 12, lookahead_tiles: 2 }
+  debug_draw: [Mesh, Links, Paths, Flow, FlowTiles]
+```
+
+From code, without a scene:
+
+```cpp
+nav::NavBaker baker;                         // NavBuildSettings: cell size, agent profiles, areas
+std::vector<nav::SourceShape> sources;
+nav::gather_sources(world, {}, sources);     // snapshot the colliders
+baker.set_sources(sources);
+baker.build_all(&jobs);                      // parallel; later edits: set_sources() + update()
+
+auto mesh = baker.mesh();
+nav::NavPath path;
+nav::find_path(*mesh, start, goal, mesh->default_filter(), path);   // path.points, 3D
+
+glm::vec3 goals[1] = {goal};
+auto flow = nav::FlowField::build(mesh, goals, {}, &jobs);
+nav::FlowSample s = flow->sample(position);  // s.direction, s.distance
 ```
 
 ## How a step works
@@ -305,9 +363,10 @@ advance cloth. Events from `step()` collect over the whole frame and clear on th
 ctest --test-dir build        # or run ./build/physxcoopa directly
 ```
 
-`test.cpp` holds 86 headless tests. They cover narrowphase math, stacking, friction, restitution,
+`test.cpp` holds 107 headless tests. They cover narrowphase math, stacking, friction, restitution,
 kinematic platforms, sleep, mesh colliders, queries, triggers, joints, scene binding, materials,
-settings, cloth, and determinism.
+settings, cloth, determinism, and navigation (voxelization, A\* across floors and links, area
+costs, incremental rebuilds, flow fields, crowds, and the scene system).
 
 ## Project layout
 
@@ -323,13 +382,15 @@ physxcoopa/
 ├── cloth/         cloth data, grid builder, collision, XPBD solver
 ├── query/         raycast, shape cast and overlap helpers
 ├── debug/         DebugDraw line output
+├── nav/           navigation: voxelized walkable surface, A*, flow fields, crowds
 ├── loaders/       asset loaders for triangle meshes and physics materials
-├── components/    scene components: colliders, Rigidbody, HingeJoint, Cloth, FixedUpdateBehaviour
-└── system/        PhysicsSystem and install_physics_system()
+├── components/    scene components: colliders, Rigidbody, HingeJoint, Cloth, FixedUpdateBehaviour, Nav*
+├── nav_yaml.h     register_nav_components() (called by register_physics_components())
+└── system/        PhysicsSystem, NavSystem and their install functions
 test.cpp           the test suite
 ```
 
-Only `system/`, `components/` and `physx_yaml.h` use libcoopa's scene module. `PhysicsWorld`
+Only `system/`, `components/`, `physx_yaml.h` and `nav_yaml.h` use libcoopa's scene module. `PhysicsWorld`
 itself uses only glm and libcoopa's signals, logger and job engine.
 
 ## Notes

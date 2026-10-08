@@ -21,6 +21,7 @@
 #include <physxcoopa/loaders/triangle_mesh_loader.h>
 #include <physxcoopa/loaders/physics_material_loader.h>
 #include <physxcoopa/util/physics_settings.h>
+#include <physxcoopa/nav_yaml.h>
 
 #include <coopa/scene/scene_loader.h>
 #include <coopa/scene/scene_object.h>
@@ -289,6 +290,9 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
                 }
             }
         });
+
+    // NavAgent / NavModifier / NavVolume / NavLink -- inert until install_nav_system().
+    register_nav_components();
 }
 
 } // namespace physx
