@@ -29,6 +29,7 @@
 #include <physxcoopa/query/queries.h>
 #include <physxcoopa/query/sweep.h>
 #include <physxcoopa/debug/debug_draw.h>
+#include <physxcoopa/debug/shape_draw.h>
 #include <physxcoopa/util/physics_settings.h>
 
 #include <coopa/event/signal.h>
@@ -985,24 +986,7 @@ public:
                 const dynamics::Body& body = bodies_[shape_owner_[i].index];
                 uint32_t color = shape.is_trigger ? debug::colors::k_trigger
                                                    : (body.awake ? debug::colors::k_awake : debug::colors::k_sleeping);
-                switch (shape.type) {
-                    case collision::ShapeType::Sphere:
-                        out.add_sphere(collision::world_sphere(shape, body.position, body.orientation), color);
-                        break;
-                    case collision::ShapeType::Box:
-                        out.add_obb(collision::world_obb(shape, body.position, body.orientation), color);
-                        break;
-                    case collision::ShapeType::Capsule:
-                        out.add_capsule(collision::world_capsule(shape, body.position, body.orientation), color);
-                        break;
-                    case collision::ShapeType::TriangleMesh: {
-                        if (!shape.mesh) break;
-                        glm::mat4 transform(glm::mat3_cast(body.orientation * shape.local_rotation) * shape.mesh_scale);
-                        transform[3] = glm::vec4(body.position + body.orientation * shape.local_center, 1.0f);
-                        out.add_mesh(*shape.mesh, transform, color);
-                        break;
-                    }
-                }
+                debug::add_shape(out, shape, body.position, body.orientation, color);
             }
         }
 
