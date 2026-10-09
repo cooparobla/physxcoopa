@@ -163,7 +163,7 @@ inline bool sphere_vs_box_separation(const geometry::Sphere& sphere, const geome
  *        path; the sphere ones are near-trivial distance math on top of what
  *        sphere_vs_sphere()/sphere_vs_box() above already compute). Capsule-involving and
  *        TriangleMesh pairs ignore the flag -- meshes are static or kinematic and mesh CCD is
- *        deferred (same precedent as sphere_cast()'s documented mesh-inflation gap in world.h);
+ *        deferred;
  *        capsule speculative support is a tractable follow-up (closest_points_segment_obb/
  *        closest_points_segment_segment in collision/segment.h are already distance-based).
  *        Defaults to false.

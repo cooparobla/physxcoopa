@@ -14,6 +14,8 @@
 #include <physxcoopa/components/mesh_collider.h>
 #include <physxcoopa/components/rigidbody.h>
 #include <physxcoopa/components/hinge_joint.h>
+#include <physxcoopa/components/ball_joint.h>
+#include <physxcoopa/components/cone_twist_joint.h>
 #include <physxcoopa/components/cloth.h>
 #include <physxcoopa/dynamics/physics_material.h>
 #include <physxcoopa/dynamics/body.h>
@@ -139,6 +141,11 @@ inline uint32_t read_freeze_flags_(const fkyaml::node& node, const std::string& 
     return constraints;
 }
 
+/** @brief The keys every joint component shares beyond connected_object/anchor. */
+inline void read_joint_common_(const fkyaml::node& node, components::JointComponent& jc) {
+    if (node.contains("enable_collision")) jc.enable_collision = node.at("enable_collision").get_value<bool>();
+}
+
 } // namespace detail
 
 /**
@@ -233,6 +240,38 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
                 if (limits.contains("min")) jc->min_angle_deg = limits.at("min").get_value<float>();
                 if (limits.contains("max")) jc->max_angle_deg = limits.at("max").get_value<float>();
             }
+            // The flat spelling the editor writes (a schema field per key).
+            if (node.contains("use_limits")) jc->use_limits = node.at("use_limits").get_value<bool>();
+            if (node.contains("min_angle")) jc->min_angle_deg = node.at("min_angle").get_value<float>();
+            if (node.contains("max_angle")) jc->max_angle_deg = node.at("max_angle").get_value<float>();
+            detail::read_joint_common_(node, *jc);
+        });
+
+    SceneLoader::register_component_parser("BallJoint",
+        [](const fkyaml::node& node, SceneObject& obj, const SceneLoader::ParseContext&) {
+            auto* jc = obj.add_component<components::BallJointComponent>();
+            if (node.contains("connected_object")) jc->connected_object = node.at("connected_object").get_value<std::string>();
+            jc->anchor = detail::read_vec3_(node, "anchor", glm::vec3(0.0f));
+            detail::read_joint_common_(node, *jc);
+        });
+
+    // swing_limit is the cone half-angle in degrees (negative = free); `twist: {min, max}` (or flat
+    // twist_min / twist_max) the twist range in degrees (absent = +-30; min > max = free).
+    SceneLoader::register_component_parser("ConeTwistJoint",
+        [](const fkyaml::node& node, SceneObject& obj, const SceneLoader::ParseContext&) {
+            auto* jc = obj.add_component<components::ConeTwistJointComponent>();
+            if (node.contains("connected_object")) jc->connected_object = node.at("connected_object").get_value<std::string>();
+            jc->anchor = detail::read_vec3_(node, "anchor", glm::vec3(0.0f));
+            jc->axis = detail::read_vec3_(node, "axis", glm::vec3(0.0f, 0.0f, 1.0f));
+            if (node.contains("swing_limit")) jc->swing_limit_deg = node.at("swing_limit").get_value<float>();
+            if (node.contains("twist")) {
+                const auto& twist = node.at("twist");
+                if (twist.contains("min")) jc->twist_min_deg = twist.at("min").get_value<float>();
+                if (twist.contains("max")) jc->twist_max_deg = twist.at("max").get_value<float>();
+            }
+            if (node.contains("twist_min")) jc->twist_min_deg = node.at("twist_min").get_value<float>();
+            if (node.contains("twist_max")) jc->twist_max_deg = node.at("twist_max").get_value<float>();
+            detail::read_joint_common_(node, *jc);
         });
 
     // Every ClothParams field is authorable, flat, under the component's own mapping rather than

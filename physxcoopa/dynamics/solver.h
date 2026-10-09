@@ -329,11 +329,17 @@ inline void solve_position(std::vector<Body>& bodies, std::vector<collision::Con
 
 // --- Joints ---
 //
-// A HingeJoint is an explicit, persistent object (not rediscovered by broadphase every
-// substep), so unlike contacts its impulse accumulators live directly on the struct -- no
-// warm-start key/hash-map needed (see HingeJoint's own doc). The three passes below otherwise
-// mirror the contact solver's shape exactly: warm start, a velocity pass (zero positional bias,
-// split-impulse, same as contacts), then a separate NGS position-correction pass.
+// A Joint is an explicit, persistent object (not rediscovered by broadphase every substep), so
+// unlike contacts its impulse accumulators live directly on the struct -- no warm-start
+// key/hash-map needed (see Joint's own doc). The three passes below otherwise mirror the contact
+// solver's shape exactly: warm start, a velocity pass (zero positional bias, split-impulse, same
+// as contacts), then a separate NGS position-correction pass.
+//
+// Rows per JointType:
+//   every type   point constraint (one 3x3 block -- see point_block_mass())
+//   Hinge        axis alignment (2 rows) + optional one-sided angle limit (1 row)
+//   ConeTwist    one-sided swing-cone limit (1 row) + one-sided twist limit (1 row)
+//   Ball         nothing more
 
 /**
  * @brief Twist angle (radians) of `b` relative to `a` about the hinge axis, measured from
@@ -344,7 +350,9 @@ inline void solve_position(std::vector<Body>& bodies, std::vector<collision::Con
  *        TWIST component about that axis is `2 * atan2(dot(delta.xyz, axis), delta.w)`. Exact
  *        when `delta` is a pure rotation about `axis`; the axis-alignment constraint keeps the
  *        two hinge axes close enough to parallel every substep that the swing (non-twist)
- *        component this ignores stays negligible in practice.
+ *        component this ignores stays negligible in practice. ConeTwist's twist limit measures
+ *        its twist the same way (there the swing is real, and this is exactly the twist part of
+ *        the swing-twist decomposition `delta = swing * twist`).
  */
 inline float hinge_current_angle(const glm::quat& rot_a, const glm::quat& rot_b, const glm::vec3& local_axis_a,
                                   const glm::quat& rest_relative_rotation) {
@@ -353,19 +361,130 @@ inline float hinge_current_angle(const glm::quat& rot_a, const glm::quat& rot_b,
     glm::vec3 axis = glm::normalize(local_axis_a);
     glm::vec3 delta_v(delta.x, delta.y, delta.z);
     float w = std::clamp(delta.w, -1.0f, 1.0f);
+    // Shortest arc: q and -q are the same rotation, and only the w >= 0 one gives an angle in
+    // (-pi, pi] (otherwise a small twist the other way reads as ~2 pi).
+    if (w < 0.0f) { w = -w; delta_v = -delta_v; }
     return 2.0f * std::atan2(glm::dot(delta_v, axis), w);
 }
 
-/** @brief Re-applies each joint's own persistent impulse accumulators (point + axis-alignment;
- *         NOT the angle-limit impulse -- see solve_joint_velocity_pass()'s doc for why that one
- *         isn't warm-started) so the first velocity iteration starts from last step's converged
- *         solution instead of zero. Same "skip if neither side is an awake dynamic body" gate
- *         as warm_start() for contacts, for the identical reason (a sleeping body has no
- *         gravity to counteract this step; re-applying its last impulse every step would
+/** @brief World twist axes of a cone-twist joint's two bodies (unit). */
+inline void cone_twist_axes(const Body& a, const Body& b, const Joint& j, glm::vec3& ta, glm::vec3& tb) {
+    ta = glm::normalize(a.orientation * j.local_axis_a);
+    tb = glm::normalize(b.orientation * j.local_axis_b);
+}
+
+/**
+ * @brief Swing state of a cone-twist joint: the angle between the two twist axes, and the unit
+ *        axis rotating `b` about which INCREASES it (`cross(ta, tb)`, with a fallback
+ *        perpendicular when the axes are parallel or anti-parallel).
+ */
+inline float cone_swing(const glm::vec3& ta, const glm::vec3& tb, glm::vec3& swing_axis) {
+    glm::vec3 c = glm::cross(ta, tb);
+    float s = glm::length(c);
+    float angle = std::atan2(s, glm::dot(ta, tb));
+    if (s > 1e-6f) {
+        swing_axis = c / s;
+    } else {
+        glm::vec3 p, q;
+        util::orthonormal_basis(ta, p, q);
+        swing_axis = p;
+    }
+    return angle;
+}
+
+/** @brief Current ConeTwist twist angle (radians) -- hinge_current_angle() about `local_axis_a`. */
+inline float cone_twist_angle(const Body& a, const Body& b, const Joint& j) {
+    return hinge_current_angle(a.orientation, b.orientation, j.local_axis_a, j.rest_relative_rotation);
+}
+
+/**
+ * @brief One one-sided angular limit row: `dir` is the world axis along which positive relative
+ *        angular velocity (b minus a) moves AWAY from the limit, and `c` the remaining angle to it
+ *        (positive inside the allowed range, negative past it). Same clamped-impulse pattern as a
+ *        contact's normal constraint (`new = max(old + lambda, 0)`), and SPECULATIVE like one:
+ *        inside the range the row lets the joint close at most the remaining gap this substep
+ *        (`cdot >= -c / h`), so a fast spin stops AT the limit instead of overshooting it by a
+ *        substep's worth of rotation and leaning on position correction to come back.
+ */
+inline void solve_angular_limit_row(Body& a, Body& b, const glm::mat3& inv_ia, const glm::mat3& inv_ib,
+                                     const glm::vec3& dir, float c, float inv_h, float& accumulated) {
+    float k_eff = glm::dot(dir, inv_ia * dir) + glm::dot(dir, inv_ib * dir);
+    if (k_eff <= util::k_epsilon) return;
+    float cdot = glm::dot(b.angular_velocity - a.angular_velocity, dir);
+    float lambda = -(cdot + std::max(c, 0.0f) * inv_h) / k_eff;
+    float new_impulse = std::max(accumulated + lambda, 0.0f);
+    float delta = new_impulse - accumulated;
+    accumulated = new_impulse;
+    apply_angular_impulse_pair(a, b, dir * delta);
+}
+
+/**
+ * @brief The side of a [lo, hi] angle range `angle` is nearer to, as solve_angular_limit_row()
+ *        inputs: `sign` +1 for the lower limit (moving away = increasing), -1 for the upper, and
+ *        `c` the signed remaining angle to that limit.
+ */
+inline void nearest_limit_side(float angle, float lo, float hi, float& sign, float& c) {
+    float c_lo = angle - lo;
+    float c_hi = hi - angle;
+    if (c_lo <= c_hi) { sign = 1.0f; c = c_lo; }
+    else { sign = -1.0f; c = c_hi; }
+}
+
+/**
+ * @brief The point constraint's 3x3 effective-mass matrix `K` (relative anchor velocity change per
+ *        unit impulse): `(m_a^-1 + m_b^-1) I - [r_a]x I_a^-1 [r_a]x - [r_b]x I_b^-1 [r_b]x`.
+ *
+ * Solving the three point rows as ONE block (`impulse = K^-1 * -cdot`) rather than as three
+ * independent scalar rows along world X/Y/Z matters for anchors far off the centre of mass: the
+ * lever arms couple the axes (a push along X spins the body, which moves the anchor along Y), so
+ * per-axis rows fight each other and a chain of them (a ragdoll) is left visibly stretched after
+ * a hard hit. False when the pair has no effective mass (both sides immovable).
+ */
+inline bool point_block_mass(const glm::vec3& ra, const glm::vec3& rb, float inv_mass_a, float inv_mass_b,
+                             const glm::mat3& inv_ia, const glm::mat3& inv_ib, glm::mat3& k) {
+    auto skew = [](const glm::vec3& v) {
+        // glm is column-major: m[col][row]. skew(v) * x == cross(v, x).
+        return glm::mat3(glm::vec3(0.0f, v.z, -v.y), glm::vec3(-v.z, 0.0f, v.x), glm::vec3(v.y, -v.x, 0.0f));
+    };
+    const glm::mat3 sa = skew(ra), sb = skew(rb);
+    k = glm::mat3(inv_mass_a + inv_mass_b) - sa * inv_ia * sa - sb * inv_ib * sb;
+    return std::abs(glm::determinant(k)) > 1e-12f;
+}
+
+/**
+ * @brief NGS rotation of the pair that changes b's rotation RELATIVE to a by about `angle`
+ *        radians about unit world axis `n` (split by inverse inertia, like the linear case splits
+ *        by inverse mass). Clamped by the caller.
+ */
+inline void apply_angular_position_correction(Body& a, Body& b, bool a_dyn, bool b_dyn, const glm::mat3& inv_ia,
+                                               const glm::mat3& inv_ib, const glm::vec3& n, float angle) {
+    float k = glm::dot(n, inv_ia * n) + glm::dot(n, inv_ib * n);
+    if (k <= util::k_epsilon) return;
+    glm::vec3 correction = n * (angle / k);
+    if (a_dyn) {
+        glm::vec3 delta_rot = -(inv_ia * correction);
+        glm::quat dq(0.0f, delta_rot.x, delta_rot.y, delta_rot.z);
+        a.orientation = glm::normalize(a.orientation + 0.5f * dq * a.orientation);
+    }
+    if (b_dyn) {
+        glm::vec3 delta_rot = inv_ib * correction;
+        glm::quat dq(0.0f, delta_rot.x, delta_rot.y, delta_rot.z);
+        b.orientation = glm::normalize(b.orientation + 0.5f * dq * b.orientation);
+    }
+}
+
+/** @brief Re-applies each joint's own persistent impulse accumulators (point + hinge axis-
+ *         alignment; NOT the limit impulses -- see solve_joint_velocity_pass()'s doc for why
+ *         those aren't warm-started) so the first velocity iteration starts from last step's
+ *         converged solution instead of zero. Same "skip if neither side is an awake dynamic
+ *         body" gate as warm_start() for contacts, for the identical reason (a sleeping body has
+ *         no gravity to counteract this step; re-applying its last impulse every step would
  *         accelerate it forever). */
-inline void warm_start_joints(std::vector<Body>& bodies, std::vector<HingeJoint>& joints) {
+inline void warm_start_joints(std::vector<Body>& bodies, std::vector<Joint>& joints) {
     for (auto& j : joints) {
         if (!j.valid || !j.enabled) continue;
+        j.limit_impulse = 0.0f; // limits start every step cold -- see solve_joint_velocity_pass()
+        j.swing_impulse = 0.0f;
         Body& a = bodies[j.a.index];
         Body& b = bodies[j.b.index];
         bool a_active = a.type == BodyType::Dynamic && a.awake;
@@ -375,10 +494,7 @@ inline void warm_start_joints(std::vector<Body>& bodies, std::vector<HingeJoint>
         glm::vec3 ra = a.orientation * j.local_anchor_a;
         glm::vec3 rb = b.orientation * j.local_anchor_b;
 
-        static const glm::vec3 kWorldAxes[3] = {glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f),
-                                                 glm::vec3(0.0f, 0.0f, 1.0f)};
-        glm::vec3 point_impulse = kWorldAxes[0] * j.point_impulse.x + kWorldAxes[1] * j.point_impulse.y +
-                                   kWorldAxes[2] * j.point_impulse.z;
+        glm::vec3 point_impulse = j.point_impulse; // world X/Y/Z components
         if (glm::dot(point_impulse, point_impulse) > 0.0f) {
             if (a_active) {
                 a.linear_velocity -= point_impulse * a.inv_mass;
@@ -390,6 +506,7 @@ inline void warm_start_joints(std::vector<Body>& bodies, std::vector<HingeJoint>
             }
         }
 
+        if (j.type != JointType::Hinge) continue;
         glm::vec3 world_axis_a = glm::normalize(a.orientation * j.local_axis_a);
         glm::vec3 p, q;
         util::orthonormal_basis(world_axis_a, p, q);
@@ -399,35 +516,41 @@ inline void warm_start_joints(std::vector<Body>& bodies, std::vector<HingeJoint>
 }
 
 /**
- * @brief One Gauss-Seidel velocity-iteration pass over every hinge joint: the point constraint
- *        (3 independent scalar constraints along world X/Y/Z, target 0, no clamp -- an equality
- *        constraint, unlike a contact's one-sided normal), the axis-alignment constraint (2
- *        scalar, angular-only, also target-0 equality -- `util::orthonormal_basis()` builds the
- *        perpendicular pair `p`/`q` the same way the contact solver's friction tangent basis
- *        does), and, when `use_limits`, a ONE-SIDED angle-limit constraint using the exact same
- *        clamped-impulse pattern as a contact's normal constraint (`new_impulse =
- *        max(old+lambda, 0)`), just for an angular DOF instead of linear.
+ * @brief One Gauss-Seidel velocity-iteration pass over every joint.
  *
- * Point and axis constraints compute their OWN per-body moment arms (`ra`/`rb`, the two
- * anchors -- generally different points until the constraint has converged) rather than calling
- * apply_impulse_pair()/apply_angular_impulse_pair() with a single shared point/no point: that
- * fits a contact (one shared contact point) but not a not-yet-converged joint anchor pair, so
- * this applies impulses directly here using each body's own `ra`/`rb`.
+ * Every type runs the point constraint (target 0, no clamp -- an equality constraint, unlike a
+ * contact's one-sided normal), solved as one 3x3 block (see point_block_mass()). A Hinge
+ * adds the axis-alignment constraint (2 scalar, angular-only, also target-0 equality --
+ * `util::orthonormal_basis()` builds the perpendicular pair `p`/`q` the same way the contact
+ * solver's friction tangent basis does), and, when `use_limits`, a ONE-SIDED angle-limit
+ * constraint using the exact same clamped-impulse pattern as a contact's normal constraint
+ * (`new_impulse = max(old+lambda, 0)`), just for an angular DOF instead of linear. A ConeTwist
+ * adds two more rows of that same one-sided kind: the swing cone (about `cross(ta, tb)`, active
+ * once the twist axes diverge past `swing_limit`) and the twist range (about the twist axis).
  *
- * The angle-limit impulse is deliberately NOT warm-started (see warm_start_joints()) -- it's
- * reset to 0 whenever the joint isn't currently at/past a limit, and limit violations are
- * inherently edge-triggered (a door swinging shut hits its limit occasionally, not every
+ * The point constraint computes its OWN per-body moment arms (`ra`/`rb`, the two anchors --
+ * generally different points until the constraint has converged) rather than calling
+ * apply_impulse_pair() with a single shared point: that fits a contact (one shared contact
+ * point) but not a not-yet-converged joint anchor pair, so this applies impulses directly here
+ * using each body's own `ra`/`rb`. `point_impulse` accumulates the block's world-space impulse.
+ *
+ * The limit rows are speculative (see solve_angular_limit_row()): each always runs against the
+ * nearer end of its range, and only produces impulse once the joint would reach that end within
+ * the substep. Their impulses are deliberately NOT warm-started (see warm_start_joints()) --
+ * limit contact is edge-triggered (a door swinging shut hits its limit occasionally, not every
  * step), so there's no steady-state impulse worth carrying across steps the way the point/axis
- * constraints have.
+ * constraints have; each step's accumulator starts at 0 (see warm_start_joints()).
  *
  * Never applies positional bias -- same split-impulse reasoning as solve_velocity_pass() for
  * contacts; drift closure is solve_joint_position()'s job, run once after every velocity
  * iteration finishes (mirrors solve()'s own contact ordering).
  */
-inline void solve_joint_velocity_pass(std::vector<Body>& bodies, std::vector<HingeJoint>& joints) {
-    static const glm::vec3 kWorldAxes[3] = {glm::vec3(1.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f),
-                                             glm::vec3(0.0f, 0.0f, 1.0f)};
-    for (auto& j : joints) {
+inline void solve_joint_velocity_pass(std::vector<Body>& bodies, std::vector<Joint>& joints, float h,
+                                       bool reverse = false) {
+    const float inv_h = h > 0.0f ? 1.0f / h : 0.0f;
+    const std::size_t count = joints.size();
+    for (std::size_t n = 0; n < count; ++n) {
+        Joint& j = joints[reverse ? count - 1 - n : n];
         if (!j.valid || !j.enabled) continue;
         Body& a = bodies[j.a.index];
         Body& b = bodies[j.b.index];
@@ -440,24 +563,62 @@ inline void solve_joint_velocity_pass(std::vector<Body>& bodies, std::vector<Hin
         glm::mat3 inv_ia = a_dyn ? a.inv_inertia_world : glm::mat3(0.0f);
         glm::mat3 inv_ib = b_dyn ? b.inv_inertia_world : glm::mat3(0.0f);
 
+        // --- Angular limits first, point last: the point rows are equalities that must hold,
+        // the limits are inequalities a little leftover error in is invisible -- solving the
+        // equality last in each pass leaves the residual on the forgiving rows. ---
+        if (j.type == JointType::Hinge) {
+            // --- Axis-alignment constraint ---
+            glm::vec3 world_axis_a = glm::normalize(a.orientation * j.local_axis_a);
+            glm::vec3 p, q;
+            util::orthonormal_basis(world_axis_a, p, q);
+            const glm::vec3 kPerp[2] = {p, q};
+            for (int k = 0; k < 2; ++k) {
+                const glm::vec3& n = kPerp[k];
+                float k_eff = glm::dot(n, inv_ia * n) + glm::dot(n, inv_ib * n);
+                if (k_eff <= util::k_epsilon) continue;
+
+                float cdot = glm::dot(b.angular_velocity - a.angular_velocity, n);
+                float lambda = -cdot / k_eff;
+                j.axis_impulse[k] += lambda;
+                apply_angular_impulse_pair(a, b, n * lambda);
+            }
+
+            // --- Angle limit (optional, one-sided) ---
+            if (j.use_limits) {
+                float angle = hinge_current_angle(a.orientation, b.orientation, j.local_axis_a, j.rest_relative_rotation);
+                // +axis: the angle INCREASES (away from the lower limit); -axis: it decreases.
+                float sign, c;
+                nearest_limit_side(angle, j.min_angle, j.max_angle, sign, c);
+                solve_angular_limit_row(a, b, inv_ia, inv_ib, world_axis_a * sign, c, inv_h, j.limit_impulse);
+            }
+        } else if (j.type == JointType::ConeTwist) {
+            glm::vec3 ta, tb;
+            cone_twist_axes(a, b, j, ta, tb);
+            if (j.has_swing_limit()) {
+                glm::vec3 swing_axis;
+                float swing = cone_swing(ta, tb, swing_axis);
+                solve_angular_limit_row(a, b, inv_ia, inv_ib, -swing_axis, j.swing_limit - swing, inv_h, j.swing_impulse);
+            }
+            if (j.has_twist_limit()) {
+                float angle = cone_twist_angle(a, b, j);
+                glm::vec3 twist_axis = ta + tb;
+                float len = glm::length(twist_axis);
+                twist_axis = len > 1e-6f ? twist_axis / len : ta;
+                float sign, c;
+                nearest_limit_side(angle, j.twist_min, j.twist_max, sign, c);
+                solve_angular_limit_row(a, b, inv_ia, inv_ib, twist_axis * sign, c, inv_h, j.limit_impulse);
+            }
+        }
+
+        // --- Point constraint (every type), as one 3x3 block ---
         glm::vec3 ra = a.orientation * j.local_anchor_a;
         glm::vec3 rb = b.orientation * j.local_anchor_b;
-
-        // --- Point constraint ---
-        for (int k = 0; k < 3; ++k) {
-            const glm::vec3& n = kWorldAxes[k];
-            glm::vec3 ra_x_n = glm::cross(ra, n);
-            glm::vec3 rb_x_n = glm::cross(rb, n);
-            float k_eff = inv_mass_a + inv_mass_b + glm::dot(ra_x_n, inv_ia * ra_x_n) + glm::dot(rb_x_n, inv_ib * rb_x_n);
-            if (k_eff <= util::k_epsilon) continue;
-
+        glm::mat3 k_block;
+        if (point_block_mass(ra, rb, inv_mass_a, inv_mass_b, inv_ia, inv_ib, k_block)) {
             glm::vec3 va = a.linear_velocity + glm::cross(a.angular_velocity, ra);
             glm::vec3 vb = b.linear_velocity + glm::cross(b.angular_velocity, rb);
-            float cdot = glm::dot(vb - va, n);
-            float lambda = -cdot / k_eff;
-
-            j.point_impulse[k] += lambda;
-            glm::vec3 impulse = n * lambda;
+            glm::vec3 impulse = glm::inverse(k_block) * (va - vb);
+            j.point_impulse += impulse;
             if (a_dyn) {
                 a.linear_velocity -= impulse * inv_mass_a;
                 a.angular_velocity -= inv_ia * glm::cross(ra, impulse);
@@ -467,67 +628,28 @@ inline void solve_joint_velocity_pass(std::vector<Body>& bodies, std::vector<Hin
                 b.angular_velocity += inv_ib * glm::cross(rb, impulse);
             }
         }
-
-        // --- Axis-alignment constraint ---
-        glm::vec3 world_axis_a = glm::normalize(a.orientation * j.local_axis_a);
-        glm::vec3 p, q;
-        util::orthonormal_basis(world_axis_a, p, q);
-        const glm::vec3 kPerp[2] = {p, q};
-        for (int k = 0; k < 2; ++k) {
-            const glm::vec3& n = kPerp[k];
-            float k_eff = glm::dot(n, inv_ia * n) + glm::dot(n, inv_ib * n);
-            if (k_eff <= util::k_epsilon) continue;
-
-            float cdot = glm::dot(b.angular_velocity - a.angular_velocity, n);
-            float lambda = -cdot / k_eff;
-            j.axis_impulse[k] += lambda;
-            apply_angular_impulse_pair(a, b, n * lambda);
-        }
-
-        // --- Angle limit (optional, one-sided) ---
-        if (j.use_limits) {
-            float angle = hinge_current_angle(a.orientation, b.orientation, j.local_axis_a, j.rest_relative_rotation);
-            bool lower_violated = angle <= j.min_angle;
-            bool upper_violated = angle >= j.max_angle;
-            if (lower_violated || upper_violated) {
-                // +1: push the angle to INCREASE (fixes a lower-limit violation); -1: push it to
-                // DECREASE (fixes an upper-limit violation) -- both via the identical
-                // zero-target clamped-impulse code below, just sign-flipped, same trick
-                // solve_velocity_pass() uses for a contact's one-sided non-penetration constraint.
-                float sign = lower_violated ? 1.0f : -1.0f;
-                float k_eff = glm::dot(world_axis_a, inv_ia * world_axis_a) + glm::dot(world_axis_a, inv_ib * world_axis_a);
-                if (k_eff > util::k_epsilon) {
-                    float cdot = glm::dot(b.angular_velocity - a.angular_velocity, world_axis_a) * sign;
-                    float lambda = -cdot / k_eff;
-                    float new_impulse = std::max(j.limit_impulse + lambda, 0.0f);
-                    float delta = new_impulse - j.limit_impulse;
-                    j.limit_impulse = new_impulse;
-                    apply_angular_impulse_pair(a, b, world_axis_a * (sign * delta));
-                }
-            } else {
-                j.limit_impulse = 0.0f;
-            }
-        }
     }
 }
 
 /**
  * @brief NGS position correction for joints: closes point-constraint drift (linear, same
- *        cumulative-error-vs-slop pattern as solve_position() for contacts) and axis-alignment
- *        drift (angular -- a hinge DOES need this, unlike solve_position()'s contacts, which
- *        deliberately skip rotational correction; an axis allowed to drift out of alignment has
- *        no OTHER mechanism to pull it back, since the velocity pass only stops the drift RATE
- *        from growing, never corrects an already-accumulated misalignment).
+ *        cumulative-error-vs-slop pattern as solve_position() for contacts), a hinge's axis-
+ *        alignment drift, and any accumulated limit violation (hinge angle, cone swing, twist).
+ *        Angular corrections are needed here, unlike solve_position()'s contacts (which
+ *        deliberately skip rotational correction): a misalignment or limit overshoot has no
+ *        OTHER mechanism to pull it back, since the velocity pass only stops the drift RATE from
+ *        growing, never corrects an already-accumulated error.
  *
  * Reuses config.linear_slop/position_correction/max_linear_correction for the angular case too
  * (radians instead of meters) rather than adding new angular-specific tunables -- both are
  * already small, sane tolerances (0.005 rad =~ 0.29 degrees) and this keeps the joint API
- * surface minimal, matching this feature's "relatively simple" scope. The angle-limit
- * constraint gets no position correction of its own -- same reasoning as its warm-start
- * omission, the velocity-only clamped impulse is enough for the door/cantilever use cases this
- * targets.
+ * surface minimal.
+ *
+ * The point correction uses the same 3x3 block effective mass as the velocity pass and moves
+ * AND rotates both bodies -- for a lever-arm anchor (every ragdoll bone: the anchor sits at one
+ * end) translation alone would leave a chain of bones drifting apart under gravity.
  */
-inline void solve_joint_position(std::vector<Body>& bodies, std::vector<HingeJoint>& joints,
+inline void solve_joint_position(std::vector<Body>& bodies, std::vector<Joint>& joints,
                                   const util::PhysicsConfig& config) {
     for (auto& j : joints) {
         if (!j.valid || !j.enabled) continue;
@@ -542,46 +664,99 @@ inline void solve_joint_position(std::vector<Body>& bodies, std::vector<HingeJoi
         glm::mat3 inv_ia = a_dyn ? a.inv_inertia_world : glm::mat3(0.0f);
         glm::mat3 inv_ib = b_dyn ? b.inv_inertia_world : glm::mat3(0.0f);
 
-        // --- Point constraint drift ---
-        glm::vec3 world_anchor_a = a.position + a.orientation * j.local_anchor_a;
-        glm::vec3 world_anchor_b = b.position + b.orientation * j.local_anchor_b;
-        glm::vec3 error = world_anchor_b - world_anchor_a;
-        float error_len = glm::length(error);
-        if (error_len > config.linear_slop) {
-            float k = inv_mass_a + inv_mass_b;
-            if (k > util::k_epsilon) {
-                float correction_mag = std::min((error_len - config.linear_slop) * config.position_correction,
+        if (j.type == JointType::Hinge) {
+            // --- Axis-alignment drift ---
+            glm::vec3 world_axis_a = glm::normalize(a.orientation * j.local_axis_a);
+            glm::vec3 world_axis_b = glm::normalize(b.orientation * j.local_axis_b);
+            glm::vec3 axis_error = glm::cross(world_axis_a, world_axis_b);
+            float axis_error_len = glm::length(axis_error);
+            if (axis_error_len > config.linear_slop) {
+                glm::vec3 n = axis_error / axis_error_len;
+                float correction_mag = std::min((axis_error_len - config.linear_slop) * config.position_correction,
                                                  config.max_linear_correction);
-                glm::vec3 correction = (error / error_len) * (correction_mag / k);
-                if (a_dyn) a.position += correction * inv_mass_a;
-                if (b_dyn) b.position -= correction * inv_mass_b;
+                // b's axis is rotated away from a's about n: undo it (relative rotation -mag).
+                apply_angular_position_correction(a, b, a_dyn, b_dyn, inv_ia, inv_ib, n, -correction_mag);
+            }
+
+            // --- Angle-limit overshoot ---
+            if (j.use_limits) {
+                float angle = hinge_current_angle(a.orientation, b.orientation, j.local_axis_a, j.rest_relative_rotation);
+                float over = angle < j.min_angle ? angle - j.min_angle : (angle > j.max_angle ? angle - j.max_angle : 0.0f);
+                if (std::abs(over) > config.linear_slop) {
+                    float mag = std::min((std::abs(over) - config.linear_slop) * config.position_correction,
+                                         config.max_linear_correction);
+                    glm::vec3 axis = glm::normalize(a.orientation * j.local_axis_a);
+                    apply_angular_position_correction(a, b, a_dyn, b_dyn, inv_ia, inv_ib, axis, over > 0.0f ? -mag : mag);
+                }
+            }
+        } else if (j.type == JointType::ConeTwist) {
+            glm::vec3 ta, tb;
+            cone_twist_axes(a, b, j, ta, tb);
+            if (j.has_swing_limit()) {
+                glm::vec3 swing_axis;
+                float over = cone_swing(ta, tb, swing_axis) - j.swing_limit;
+                if (over > config.linear_slop) {
+                    float mag = std::min((over - config.linear_slop) * config.position_correction,
+                                         config.max_linear_correction);
+                    apply_angular_position_correction(a, b, a_dyn, b_dyn, inv_ia, inv_ib, swing_axis, -mag);
+                    cone_twist_axes(a, b, j, ta, tb);
+                }
+            }
+            if (j.has_twist_limit()) {
+                float angle = cone_twist_angle(a, b, j);
+                float over = angle < j.twist_min ? angle - j.twist_min : (angle > j.twist_max ? angle - j.twist_max : 0.0f);
+                if (std::abs(over) > config.linear_slop) {
+                    float mag = std::min((std::abs(over) - config.linear_slop) * config.position_correction,
+                                         config.max_linear_correction);
+                    glm::vec3 twist_axis = ta + tb;
+                    float len = glm::length(twist_axis);
+                    twist_axis = len > 1e-6f ? twist_axis / len : ta;
+                    apply_angular_position_correction(a, b, a_dyn, b_dyn, inv_ia, inv_ib, twist_axis, over > 0.0f ? -mag : mag);
+                }
             }
         }
 
-        // --- Axis-alignment drift ---
-        glm::vec3 world_axis_a = glm::normalize(a.orientation * j.local_axis_a);
-        glm::vec3 world_axis_b = glm::normalize(b.orientation * j.local_axis_b);
-        glm::vec3 axis_error = glm::cross(world_axis_a, world_axis_b);
-        float axis_error_len = glm::length(axis_error);
-        if (axis_error_len > config.linear_slop) {
-            glm::vec3 n = axis_error / axis_error_len;
-            float k = glm::dot(n, inv_ia * n) + glm::dot(n, inv_ib * n);
-            if (k > util::k_epsilon) {
-                float correction_mag = std::min((axis_error_len - config.linear_slop) * config.position_correction,
-                                                 config.max_linear_correction);
-                glm::vec3 correction = n * (correction_mag / k);
-                if (a_dyn) {
-                    glm::vec3 delta_rot = -(inv_ia * correction);
-                    glm::quat dq(0.0f, delta_rot.x, delta_rot.y, delta_rot.z);
-                    a.orientation = glm::normalize(a.orientation + 0.5f * dq * a.orientation);
-                }
-                if (b_dyn) {
-                    glm::vec3 delta_rot = inv_ib * correction;
-                    glm::quat dq(0.0f, delta_rot.x, delta_rot.y, delta_rot.z);
-                    b.orientation = glm::normalize(b.orientation + 0.5f * dq * b.orientation);
-                }
+        // --- Point constraint drift (every type), last -- see the velocity pass's ordering note ---
+        glm::vec3 ra = a.orientation * j.local_anchor_a;
+        glm::vec3 rb = b.orientation * j.local_anchor_b;
+        glm::vec3 error = (b.position + rb) - (a.position + ra);
+        float error_len = glm::length(error);
+        glm::mat3 k_block;
+        if (error_len > config.linear_slop && point_block_mass(ra, rb, inv_mass_a, inv_mass_b, inv_ia, inv_ib, k_block)) {
+            float correction_mag = std::min((error_len - config.linear_slop) * config.position_correction,
+                                             config.max_linear_correction);
+            // The positional "impulse" P that closes `correction_mag` of the gap through the
+            // same block effective mass as the velocity pass (K * P = closure), applied to both
+            // bodies' positions AND orientations -- for a lever-arm anchor (every ragdoll bone)
+            // translation alone cannot close the gap without fighting the body's other joints.
+            glm::vec3 p = glm::inverse(k_block) * ((error / error_len) * correction_mag);
+            if (a_dyn) {
+                a.position += p * inv_mass_a;
+                glm::vec3 dr = inv_ia * glm::cross(ra, p);
+                glm::quat dq(0.0f, dr.x, dr.y, dr.z);
+                a.orientation = glm::normalize(a.orientation + 0.5f * dq * a.orientation);
+            }
+            if (b_dyn) {
+                b.position -= p * inv_mass_b;
+                glm::vec3 dr = -(inv_ib * glm::cross(rb, p));
+                glm::quat dq(0.0f, dr.x, dr.y, dr.z);
+                b.orientation = glm::normalize(b.orientation + 0.5f * dq * b.orientation);
             }
         }
+    }
+}
+
+/**
+ * @brief The joints' position pass, run on the INTEGRATED poses at the end of a substep (see
+ *        solve()). Same iteration count as the contacts' position pass: a chain of joints (a
+ *        ragdoll) closes one link's drift partly by opening its neighbour's, so a single pass
+ *        converges slowly.
+ */
+inline void solve_joints_post_integrate(std::vector<Body>& bodies, std::vector<Joint>& joints,
+                                        const util::PhysicsConfig& config) {
+    if (joints.empty()) return;
+    for (uint32_t iter = 0; iter < std::max(1u, config.position_iterations); ++iter) {
+        solve_joint_position(bodies, joints, config);
     }
 }
 
@@ -632,7 +807,7 @@ inline void wake_if_kinematic_moving(Body& kin, Body& dyn, const util::PhysicsCo
  */
 inline void update_islands_and_sleep(std::vector<Body>& bodies, const std::vector<bool>& alive,
                                       std::vector<collision::ContactManifold>& manifolds,
-                                      std::vector<HingeJoint>& joints,
+                                      std::vector<Joint>& joints,
                                       const util::PhysicsConfig& config, float h) {
     IslandUnionFind uf(bodies.size());
 
@@ -701,6 +876,31 @@ inline void update_islands_and_sleep(std::vector<Body>& bodies, const std::vecto
 }
 
 /**
+ * @brief Wakes every sleeping dynamic body jointed (directly or through a chain) to an awake one.
+ *
+ * The joint passes treat a sleeping body as immovable, so a body woken alone (a kinematic ram
+ * nudging one bone of a sleeping ragdoll) would be pinned between the ram and "static"
+ * neighbours -- the joint and the contact then fight with unbounded impulses and the ragdoll
+ * explodes. An island wakes as a whole instead, like it sleeps as a whole. Repeats until
+ * nothing changes (one sweep per chain link at worst; a no-op sweep when nothing woke).
+ */
+inline void wake_jointed_islands(std::vector<Body>& bodies, std::vector<Joint>& joints) {
+    bool changed = true;
+    for (std::size_t pass = 0; changed && pass <= joints.size(); ++pass) {
+        changed = false;
+        for (auto& j : joints) {
+            if (!j.valid || !j.enabled) continue;
+            Body& a = bodies[j.a.index];
+            Body& b = bodies[j.b.index];
+            if (a.type != BodyType::Dynamic || b.type != BodyType::Dynamic || a.awake == b.awake) continue;
+            Body& sleeper = a.awake ? b : a;
+            sleeper.wake();
+            changed = true;
+        }
+    }
+}
+
+/**
  * @brief Runs the full solve: warm start, restitution capture, velocity iterations, relax
  *        iterations, position correction, cache rebuild, then islands/sleep.
  *
@@ -712,8 +912,9 @@ inline void update_islands_and_sleep(std::vector<Body>& bodies, const std::vecto
  * @param h         Substep length in seconds.
  */
 inline void solve(std::vector<Body>& bodies, const std::vector<bool>& alive,
-                   std::vector<collision::ContactManifold>& manifolds, std::vector<HingeJoint>& joints,
+                   std::vector<collision::ContactManifold>& manifolds, std::vector<Joint>& joints,
                    SolverState& state, const util::PhysicsConfig& config, float h) {
+    wake_jointed_islands(bodies, joints);
     capture_restitution_bias(bodies, manifolds, config);
     warm_start(bodies, manifolds, state);
     warm_start_joints(bodies, joints);
@@ -730,16 +931,27 @@ inline void solve(std::vector<Body>& bodies, const std::vector<bool>& alive,
     // no restitution concept, so use_restitution doesn't affect it, but running it every
     // iteration lets it converge jointly with whatever contacts are pushing on the same bodies,
     // e.g. a stack of boxes leaning against a door).
+    //
+    // The joint pass alternates direction each iteration (symmetric Gauss-Seidel): in a chain or
+    // tree of joints (a ragdoll) a forward-only sweep carries a disturbance at one end to the
+    // other within one iteration but needs many to carry it back, so a hard hit on a ragdoll's
+    // chest otherwise leaves the joints visibly stretched for several frames.
     for (uint32_t i = 0; i < config.velocity_iterations; ++i) {
         solve_velocity_pass(bodies, manifolds, /*use_restitution=*/false, /*order_offset=*/i, h);
-        solve_joint_velocity_pass(bodies, joints);
+        solve_joint_velocity_pass(bodies, joints, h, /*reverse=*/(i & 1u) != 0);
     }
     for (uint32_t i = 0; i < config.relax_iterations; ++i) {
         solve_velocity_pass(bodies, manifolds, /*use_restitution=*/true, /*order_offset=*/i, h);
-        solve_joint_velocity_pass(bodies, joints);
+        solve_joint_velocity_pass(bodies, joints, h, /*reverse=*/(i & 1u) != 0);
     }
 
     solve_position(bodies, manifolds, config);
+    // Joint drift is closed mainly AFTER integration (solve_joints_post_integrate(), called by
+    // PhysicsWorld::step_fixed()), Box2D-style: most of a fast-spinning ragdoll's joint drift is
+    // created BY the integration (anchors move on arcs, velocities only match them to first
+    // order). One pass here as well re-closes what the contact position pass just opened (a
+    // foot pushed out of the ground drags its ankle off the shin) -- this pose becomes the
+    // substep's prev_position, which render interpolation draws.
     solve_joint_position(bodies, joints, config);
     rebuild_warm_start_cache(manifolds, state);
     update_islands_and_sleep(bodies, alive, manifolds, joints, config, h);

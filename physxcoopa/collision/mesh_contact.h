@@ -5,10 +5,10 @@
  *        floor catches on the shared edge between two coplanar triangles, because a naive
  *        per-triangle contact normal points along the edge rather than the surface.
  *
- * Approach: brute-force iterate every triangle (the BVH serves raycasts and cloth queries;
- * a mesh collider's triangle count in the scenes this targets is small enough that querying
- * it for narrowphase isn't worth the added complexity yet). Two different per-triangle contact
- * tests feed the same correction step, because Sphere/Capsule and Box need genuinely different
+ * Approach: query the mesh's BVH with the convex shape's bounds for candidate triangles
+ * (mesh_contact_candidates()), then run a per-triangle contact test on each
+ * (mesh_triangle_contacts()). Two different per-triangle contact tests feed the same
+ * correction step, because Sphere/Capsule and Box need genuinely different
  * penetration measurements (see box_vs_triangle_contacts_'s doc for why a box has no
  * meaningful "closest point on surface" once it's overlapping at all):
  * - Sphere/Capsule: closest point on their core (a point or segment) to the triangle, offset
@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace coopa {
 namespace physx {
@@ -229,6 +230,113 @@ inline glm::vec3 correct_mesh_normal_(int edge, const glm::vec3& face_normal, co
 }
 
 /**
+ * @brief World transform of a TriangleMesh shape's local-space vertices (rotation, uniform
+ *        mesh_scale, translation) at its owning body's pose -- the same matrix
+ *        collision::world_bounds() fits the mesh's bounds with.
+ */
+inline glm::mat4 mesh_world_transform(const Shape& mesh_shape, const glm::vec3& mesh_pos, const glm::quat& mesh_rot) {
+    glm::mat4 m(glm::mat3_cast(mesh_rot * mesh_shape.local_rotation) * mesh_shape.mesh_scale);
+    m[3] = glm::vec4(mesh_pos + mesh_rot * mesh_shape.local_center, 1.0f);
+    return m;
+}
+
+/**
+ * @brief Maps a world-space AABB into a mesh shape's local (pre-scale) vertex space -- the
+ *        frame its MeshBVH was built in. Exact-under-rotation refit (AABB::transform), so the
+ *        result is conservative: it may admit a few extra triangles, never drop one.
+ */
+inline geometry::AABB mesh_local_bounds(const geometry::AABB& world_box, const glm::mat4& mesh_transform) {
+    return world_box.transform(glm::inverse(mesh_transform));
+}
+
+/**
+ * @brief Candidate triangles of `mesh_shape` that convex `shape` (at `pos`/`rot`) could produce
+ *        a contact against, from the mesh BVH, sorted ascending so the per-triangle loop visits
+ *        them in exactly the order a brute-force 0..N-1 scan would (the manifold keeps the first
+ *        4 points and the last-touched triangle's normal, so order is part of the result).
+ *
+ * The probe's world AABB is grown for a Box by 1.5x its half-diagonal: box_vs_triangle_contacts_
+ * accepts a triangle up to that half-diagonal away IN-PLANE from an embedded corner's
+ * projection (its footprint test), plus however deep the corner has sunk -- so a triangle just
+ * outside the box's own bounds can still contribute a contact. Sphere/Capsule contacts need
+ * real overlap, so their bounds are used as-is.
+ */
+inline void mesh_contact_candidates(const Shape& shape, const glm::vec3& pos, const glm::quat& rot,
+                                     const Shape& mesh_shape, const glm::mat4& mesh_transform,
+                                     std::vector<uint32_t>& out) {
+    out.clear();
+    geometry::AABB probe = world_bounds(shape, pos, rot);
+    if (shape.type == ShapeType::Box) probe = probe.expand(1.5f * glm::length(shape.half_extents));
+    mesh_shape.mesh->bvh().query(mesh_local_bounds(probe, mesh_transform), [&](uint32_t tri) { out.push_back(tri); });
+    std::sort(out.begin(), out.end());
+}
+
+/**
+ * @brief Per-triangle contact generation shared by generate_mesh_contacts() and
+ *        PhysicsWorld::compute_penetration(): runs the shape-appropriate test against triangle
+ *        `tri` (see this file's doc), applies the internal-edge correction, and calls
+ *        `emit(point, normal, penetration, feature_id)` per contact point -- `normal` pointing
+ *        from the mesh's surface toward the convex shape, `point` midway into the overlap.
+ *
+ * @param mesh_transform mesh_world_transform() of `mesh_shape`.
+ * @param mesh_world_rot The mesh's full world orientation (body rotation * local_rotation),
+ *                       which rotates its stored face normals.
+ */
+template <typename Fn>
+inline void mesh_triangle_contacts(const Shape& shape, const glm::vec3& pos, const glm::quat& rot,
+                                    const geometry::TriangleMesh& mesh, const glm::mat4& mesh_transform,
+                                    const glm::quat& mesh_world_rot, uint32_t tri, Fn&& emit) {
+    glm::vec3 lv0, lv1, lv2;
+    mesh.triangle_vertices(tri, lv0, lv1, lv2);
+    glm::vec3 v0 = glm::vec3(mesh_transform * glm::vec4(lv0, 1.0f));
+    glm::vec3 v1 = glm::vec3(mesh_transform * glm::vec4(lv1, 1.0f));
+    glm::vec3 v2 = glm::vec3(mesh_transform * glm::vec4(lv2, 1.0f));
+    glm::vec3 face_normal = glm::normalize(mesh_world_rot * mesh.normals()[tri]);
+    const geometry::TriangleAdjacency& adjacency = mesh.adjacency()[tri];
+
+    // Shared per-point path: classify where on this triangle the point landed, correct the
+    // normal via adjacency, and emit. `raw_normal` is the fallback used only for a genuine
+    // silhouette/crease (edge/vertex region with no coplanar neighbour); a box's corner-based
+    // test always passes its own face_normal here (see box_vs_triangle_contacts_'s doc for why
+    // the box case has no meaningful raw direction).
+    auto emit_point = [&](const glm::vec3& on_tri, float penetration, const glm::vec3& raw_normal,
+                          uint32_t feature_id) {
+        glm::vec3 bary = barycentric_(on_tri, v0, v1, v2);
+        int edge = classify_triangle_edge_(bary);
+
+        glm::vec3 neighbor_normal(0.0f);
+        bool has_neighbor = false;
+        if (edge >= 0) {
+            uint32_t neighbor_tri = adjacency.neighbor[edge];
+            if (neighbor_tri != geometry::k_no_neighbor) {
+                has_neighbor = true;
+                neighbor_normal = glm::normalize(mesh_world_rot * mesh.normals()[neighbor_tri]);
+            }
+        }
+
+        glm::vec3 normal = correct_mesh_normal_(edge, face_normal, neighbor_normal, has_neighbor, raw_normal);
+        emit(on_tri + normal * (penetration * 0.5f), normal, penetration, feature_id);
+    };
+
+    if (shape.type == ShapeType::Box) {
+        uint32_t corner_index = 0;
+        box_vs_triangle_contacts_(shape, pos, rot, v0, v1, v2, face_normal,
+                                   [&](const glm::vec3&, const glm::vec3& on_tri, float penetration) {
+                                       uint32_t feature_id = (tri << 3) | (corner_index++ & 0x7u);
+                                       emit_point(on_tri, penetration, face_normal, feature_id);
+                                   });
+    } else {
+        glm::vec3 on_shape, on_tri;
+        float penetration = 0.0f;
+        if (!sphere_or_capsule_vs_triangle_contact_(shape, pos, rot, v0, v1, v2, on_shape, on_tri, penetration)) return;
+        glm::vec3 diff = on_shape - on_tri; // points from triangle toward shape
+        float dist = glm::length(diff);
+        glm::vec3 raw_normal = dist > util::k_epsilon ? diff / dist : face_normal;
+        emit_point(on_tri, penetration, raw_normal, tri);
+    }
+}
+
+/**
  * @brief Generates a manifold between a convex Shape and a static TriangleMesh shape.
  *
  * @param shape       The convex (Sphere/Box/Capsule) shape.
@@ -236,75 +344,43 @@ inline glm::vec3 correct_mesh_normal_(int edge, const glm::vec3& face_normal, co
  * @param mesh_shape  The TriangleMesh shape (its own pose is `mesh_pos`/`mesh_rot`).
  * @param out         Output manifold, normal pointing from the mesh's surface toward the
  *                     convex shape -- caller (generate_contacts) applies the final A->B sign.
+ * @param use_bvh     True (the default) narrows the triangles tested to the mesh BVH's
+ *                     candidates for the shape's bounds (mesh_contact_candidates()); false
+ *                     scans every triangle -- the brute-force reference, kept for tests.
+ *                     Both visit triangles in ascending index order, so they agree exactly.
  * @return True if any triangle produced a contact point.
  */
 inline bool generate_mesh_contacts(const Shape& shape, const glm::vec3& pos, const glm::quat& rot,
                                     const Shape& mesh_shape, const glm::vec3& mesh_pos, const glm::quat& mesh_rot,
-                                    ContactManifold& out) {
+                                    ContactManifold& out, bool use_bvh = true) {
+    out = ContactManifold{};
     if (!mesh_shape.mesh) return false;
     const geometry::TriangleMesh& mesh = *mesh_shape.mesh;
 
-    glm::mat4 mesh_transform(glm::mat3_cast(mesh_rot * mesh_shape.local_rotation) * mesh_shape.mesh_scale);
-    mesh_transform[3] = glm::vec4(mesh_pos + mesh_rot * mesh_shape.local_center, 1.0f);
+    const glm::mat4 mesh_transform = mesh_world_transform(mesh_shape, mesh_pos, mesh_rot);
+    const glm::quat mesh_world_rot = mesh_rot * mesh_shape.local_rotation;
 
-    out = ContactManifold{};
     bool any_hit = false;
     glm::vec3 best_normal(0.0f, 0.0f, 1.0f);
+    auto emit = [&](const glm::vec3& point, const glm::vec3& normal, float penetration, uint32_t feature_id) {
+        if (out.count >= 4) return;
+        out.add_point(point, penetration, feature_id);
+        best_normal = normal;
+        any_hit = true;
+    };
 
-    for (size_t tri = 0; tri < mesh.triangle_count(); ++tri) {
-        if (out.count >= 4) break;
-        glm::vec3 lv0, lv1, lv2;
-        mesh.triangle_vertices(static_cast<uint32_t>(tri), lv0, lv1, lv2);
-        glm::vec3 v0 = glm::vec3(mesh_transform * glm::vec4(lv0, 1.0f));
-        glm::vec3 v1 = glm::vec3(mesh_transform * glm::vec4(lv1, 1.0f));
-        glm::vec3 v2 = glm::vec3(mesh_transform * glm::vec4(lv2, 1.0f));
-        glm::vec3 face_normal = glm::normalize(mesh_rot * mesh.normals()[tri]);
-        const geometry::TriangleAdjacency& adjacency = mesh.adjacency()[tri];
-
-        // Shared per-point path: classify where on this triangle the point landed, correct the
-        // normal via adjacency, and append to the manifold. `raw_normal` is the fallback used
-        // only for a genuine silhouette/crease (edge/vertex region with no coplanar neighbour);
-        // a box's corner-based test always passes its own face_normal here (see
-        // box_vs_triangle_contacts_'s doc for why the box case has no meaningful raw direction).
-        auto emit_point = [&](const glm::vec3& on_shape, const glm::vec3& on_tri, float penetration,
-                               const glm::vec3& raw_normal, uint32_t feature_id) {
-            if (out.count >= 4) return;
-            (void)on_shape;
-            glm::vec3 bary = barycentric_(on_tri, v0, v1, v2);
-            int edge = classify_triangle_edge_(bary);
-
-            glm::vec3 neighbor_normal(0.0f);
-            bool has_neighbor = false;
-            if (edge >= 0) {
-                uint32_t neighbor_tri = adjacency.neighbor[edge];
-                if (neighbor_tri != geometry::k_no_neighbor) {
-                    has_neighbor = true;
-                    neighbor_normal = glm::normalize(mesh_rot * mesh.normals()[neighbor_tri]);
-                }
-            }
-
-            glm::vec3 normal = correct_mesh_normal_(edge, face_normal, neighbor_normal, has_neighbor, raw_normal);
-            glm::vec3 point = on_tri + normal * (penetration * 0.5f);
-            out.add_point(point, penetration, feature_id);
-            best_normal = normal;
-            any_hit = true;
-        };
-
-        if (shape.type == ShapeType::Box) {
-            uint32_t corner_index = 0;
-            box_vs_triangle_contacts_(shape, pos, rot, v0, v1, v2, face_normal,
-                                       [&](const glm::vec3& on_shape, const glm::vec3& on_tri, float penetration) {
-                                           uint32_t feature_id = (static_cast<uint32_t>(tri) << 3) | (corner_index++ & 0x7u);
-                                           emit_point(on_shape, on_tri, penetration, face_normal, feature_id);
-                                       });
-        } else {
-            glm::vec3 on_shape, on_tri;
-            float penetration = 0.0f;
-            if (!sphere_or_capsule_vs_triangle_contact_(shape, pos, rot, v0, v1, v2, on_shape, on_tri, penetration)) continue;
-            glm::vec3 diff = on_shape - on_tri; // points from triangle toward shape
-            float dist = glm::length(diff);
-            glm::vec3 raw_normal = dist > util::k_epsilon ? diff / dist : face_normal;
-            emit_point(on_shape, on_tri, penetration, raw_normal, static_cast<uint32_t>(tri));
+    if (use_bvh) {
+        // Reused per thread: narrowphase runs this job-parallel, one pair per call, never nested.
+        thread_local std::vector<uint32_t> candidates;
+        mesh_contact_candidates(shape, pos, rot, mesh_shape, mesh_transform, candidates);
+        for (uint32_t tri : candidates) {
+            if (out.count >= 4) break;
+            mesh_triangle_contacts(shape, pos, rot, mesh, mesh_transform, mesh_world_rot, tri, emit);
+        }
+    } else {
+        for (size_t tri = 0; tri < mesh.triangle_count(); ++tri) {
+            if (out.count >= 4) break;
+            mesh_triangle_contacts(shape, pos, rot, mesh, mesh_transform, mesh_world_rot, static_cast<uint32_t>(tri), emit);
         }
     }
 

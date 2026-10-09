@@ -13,6 +13,7 @@
 #include <physxcoopa/dynamics/body.h>
 #include <physxcoopa/dynamics/inertia.h>
 #include <physxcoopa/world.h>
+#include <physxcoopa/character/character_motor.h>
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/collision/sat.h>
 #include <physxcoopa/broadphase/aabb_tree.h>
@@ -27,6 +28,8 @@
 #include <physxcoopa/components/box_collider.h>
 #include <physxcoopa/components/sphere_collider.h>
 #include <physxcoopa/components/rigidbody.h>
+#include <physxcoopa/components/ball_joint.h>
+#include <physxcoopa/components/cone_twist_joint.h>
 #include <physxcoopa/loaders/physics_material_loader.h>
 #include <physxcoopa/util/physics_settings.h>
 #include <physxcoopa/physx_yaml.h>
@@ -47,6 +50,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <random>
 #include <set>
@@ -1126,7 +1130,7 @@ static void test_query_include_triggers_flag_excludes_trigger_colliders() {
 }
 
 /**
- * box_cast()/capsule_cast()'s discretized-stepped-sweep approximation against a simple,
+ * box_cast()/capsule_cast() against a simple,
  * axis-aligned known target -- exact geometry, so the expected hit distance is hand-computed
  * (see each assertion's comment), not just "found something."
  */
@@ -1152,6 +1156,453 @@ static void test_box_cast_and_capsule_cast_hit_known_target() {
     // touches the target's near face when d + 0.3 == 4.5 -> d == 4.2.
     ASSERT_NEAR(capsule_hit.distance, 4.2f, 0.05f);
     ASSERT_TRUE(capsule_hit.body.index == target_id.index);
+}
+
+// --- Query groundwork: filters, exact sweeps, penetration, BVH mesh contacts ---
+
+/** Builds a TriangleMesh from raw vertex/index arrays, computing face normals (right-handed
+ *  winding) and edge adjacency by shared vertex pairs -- what TriangleMeshLoader does after
+ *  welding, for hand-built test meshes. */
+static geometry::TriangleMesh make_mesh_with_adjacency(std::vector<glm::vec3> vertices, std::vector<uint32_t> indices) {
+    size_t tri_count = indices.size() / 3;
+    std::vector<glm::vec3> normals(tri_count);
+    std::vector<geometry::TriangleAdjacency> adjacency(tri_count);
+    std::map<std::pair<uint32_t, uint32_t>, std::pair<uint32_t, int>> edges;
+    for (size_t t = 0; t < tri_count; ++t) {
+        const glm::vec3& a = vertices[indices[t * 3 + 0]];
+        const glm::vec3& b = vertices[indices[t * 3 + 1]];
+        const glm::vec3& c = vertices[indices[t * 3 + 2]];
+        normals[t] = glm::normalize(glm::cross(b - a, c - a));
+        for (int e = 0; e < 3; ++e) {
+            uint32_t i0 = indices[t * 3 + e], i1 = indices[t * 3 + (e + 1) % 3];
+            auto key = std::make_pair(std::min(i0, i1), std::max(i0, i1));
+            auto it = edges.find(key);
+            if (it == edges.end()) {
+                edges.emplace(key, std::make_pair(static_cast<uint32_t>(t), e));
+            } else {
+                adjacency[t].neighbor[e] = it->second.first;
+                adjacency[it->second.first].neighbor[it->second.second] = static_cast<uint32_t>(t);
+            }
+        }
+    }
+    return geometry::TriangleMesh(std::move(vertices), std::move(indices), std::move(normals), std::move(adjacency));
+}
+
+/** A 30-degree ramp rising along +X: z = x * tan(30deg) for x in [0, 4], y in [-2, 2]. */
+static geometry::TriangleMesh make_ramp_mesh() {
+    const float h = 4.0f * std::tan(glm::radians(30.0f));
+    return make_mesh_with_adjacency({glm::vec3(0.0f, -2.0f, 0.0f), glm::vec3(4.0f, -2.0f, h),
+                                     glm::vec3(4.0f, 2.0f, h), glm::vec3(0.0f, 2.0f, 0.0f)},
+                                    {0, 1, 2, 0, 2, 3});
+}
+
+static dynamics::BodyId add_static_mesh(PhysicsWorld& world, const geometry::TriangleMesh* mesh,
+                                         const glm::vec3& pos = glm::vec3(0.0f)) {
+    dynamics::Body body;
+    body.type = dynamics::BodyType::Static;
+    body.position = pos;
+    return world.add_body(body, collision::Shape::make_mesh(mesh));
+}
+
+/**
+ * Sweep exactness against a box CORNER: the sphere's path passes 0.3/0.3 off the box's
+ * top-side edge line, so it first touches the corner vertex (4.5, 0.5, 0.5) -- where the old
+ * "inflate the box, raycast" approximation reported the sharp inflated face instead (4.0).
+ * Solving |(x - 4.5, 0.3, 0.3)| = 0.5 gives x = 4.5 - sqrt(0.07). A rotated box cast and a
+ * capsule-vs-capsule sweep check the other two exact paths (swept SAT, segment-segment).
+ */
+static void test_sweeps_are_exact_against_box_corner_and_capsule() {
+    PhysicsWorld world;
+    dynamics::BodyId box_id = add_static_box(world, glm::vec3(5.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+
+    query::RaycastHit hit;
+    ASSERT_TRUE(world.sphere_cast(glm::vec3(0.0f, 0.8f, 0.8f), 0.5f, glm::vec3(1.0f, 0.0f, 0.0f), 100.0f, hit));
+    const float expected = 4.5f - std::sqrt(0.07f);
+    ASSERT_NEAR(hit.distance, expected, 1e-3f);
+    ASSERT_VEC3_NEAR(hit.point, glm::vec3(4.5f, 0.5f, 0.5f), 1e-3f);
+    ASSERT_VEC3_NEAR(hit.normal, glm::vec3(-std::sqrt(0.07f), 0.3f, 0.3f) / 0.5f, 1e-2f);
+    ASSERT_TRUE(hit.body == box_id);
+    ASSERT_TRUE(hit.shape_index == world.shape_at(box_id));
+    ASSERT_TRUE(!hit.started_inside);
+
+    // A box yawed 45 degrees reaches 0.5*sqrt(2) along +X: its leading vertical edge meets the
+    // face x=4.5 at d = 4.5 - 0.7071.
+    query::RaycastHit box_hit;
+    ASSERT_TRUE(world.box_cast(glm::vec3(0.0f), glm::vec3(0.5f), glm::angleAxis(glm::radians(45.0f), glm::vec3(0, 0, 1)),
+                               glm::vec3(1.0f, 0.0f, 0.0f), 100.0f, box_hit));
+    ASSERT_NEAR(box_hit.distance, 4.5f - 0.5f * std::sqrt(2.0f), 1e-3f);
+    ASSERT_VEC3_NEAR(box_hit.normal, glm::vec3(-1.0f, 0.0f, 0.0f), 1e-3f);
+    ASSERT_VEC3_NEAR(box_hit.point, glm::vec3(4.5f, 0.0f, 0.0f), 1e-2f);
+
+    // Capsule (Z axis, r 0.3, half-height 0.5) swept +X past a Y-axis capsule (r 0.2) at
+    // (3, 0, 0.8): the cast's top core end (x, 0, 0.5) meets it when
+    // (3 - x)^2 + 0.3^2 = 0.5^2 -> x = 2.6, normal along (-0.4, 0, -0.3) / 0.5.
+    PhysicsWorld capsules;
+    dynamics::Body target;
+    target.type = dynamics::BodyType::Static;
+    target.position = glm::vec3(3.0f, 0.0f, 0.8f);
+    capsules.add_body(target, collision::Shape::make_capsule(0.2f, 1.0f, /*axis=*/1));
+    query::RaycastHit cap_hit;
+    ASSERT_TRUE(capsules.capsule_cast(glm::vec3(0.0f), 0.3f, 0.5f, 2, glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                      glm::vec3(1.0f, 0.0f, 0.0f), 100.0f, cap_hit));
+    ASSERT_NEAR(cap_hit.distance, 2.6f, 1e-3f);
+    ASSERT_VEC3_NEAR(cap_hit.normal, glm::vec3(-0.8f, 0.0f, -0.6f), 1e-2f);
+    // A path that clears it (top core end 0.3 + radii 0.5 below z = 1.4) misses.
+    ASSERT_TRUE(!capsules.capsule_cast(glm::vec3(0.0f, 0.0f, -0.65f), 0.3f, 0.5f, 2, glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                       glm::vec3(1.0f, 0.0f, 0.0f), 100.0f, cap_hit));
+}
+
+/**
+ * Sphere/box/capsule casts against a mesh ramp (30 degrees, normal n = (-0.5, 0, 0.866)) are
+ * real sweeps through the mesh BVH, not a raycast of the surface: a sphere dropped at x=2
+ * stops when its centre is 0.5 off the plane (z = 1.1547 + 0.5 / cos30), a box when its
+ * downhill-lower edge (x + 0.25, z - 0.25) touches it.
+ */
+static void test_sweeps_are_exact_against_mesh_ramp() {
+    geometry::TriangleMesh ramp = make_ramp_mesh();
+    PhysicsWorld world;
+    dynamics::BodyId ramp_id = add_static_mesh(world, &ramp);
+    const float tan30 = std::tan(glm::radians(30.0f));
+    const glm::vec3 n = glm::normalize(glm::vec3(-tan30, 0.0f, 1.0f));
+    const glm::vec3 down(0.0f, 0.0f, -1.0f);
+
+    query::RaycastHit hit;
+    ASSERT_TRUE(world.sphere_cast(glm::vec3(2.0f, 0.0f, 5.0f), 0.5f, down, 10.0f, hit));
+    ASSERT_NEAR(hit.distance, 5.0f - (2.0f * tan30 + 0.5f / n.z), 1e-3f);
+    ASSERT_VEC3_NEAR(hit.normal, n, 1e-3f);
+    ASSERT_VEC3_NEAR(hit.point, glm::vec3(2.0f, 0.0f, 5.0f - hit.distance) - n * 0.5f, 1e-3f);
+    ASSERT_TRUE(hit.body == ramp_id);
+
+    query::RaycastHit box_hit;
+    ASSERT_TRUE(world.box_cast(glm::vec3(2.0f, 0.0f, 5.0f), glm::vec3(0.25f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), down,
+                               10.0f, box_hit));
+    ASSERT_NEAR(box_hit.distance, 5.0f - (0.25f + 2.25f * tan30), 1e-3f);
+    ASSERT_VEC3_NEAR(box_hit.normal, n, 1e-3f);
+    ASSERT_VEC3_NEAR(box_hit.point, glm::vec3(2.25f, 0.0f, 2.25f * tan30), 1e-2f);
+
+    // A vertical capsule (r 0.3, half-height 0.6) lands on its bottom hemisphere: same rule as
+    // the sphere, with the sphere centre 0.6 above the bottom core point.
+    query::RaycastHit cap_hit;
+    ASSERT_TRUE(world.capsule_cast(glm::vec3(2.0f, 0.0f, 5.0f), 0.3f, 0.6f, 2, glm::quat(1.0f, 0.0f, 0.0f, 0.0f), down,
+                                   10.0f, cap_hit));
+    ASSERT_NEAR(cap_hit.distance, 5.0f - (2.0f * tan30 + 0.3f / n.z + 0.6f), 1e-3f);
+    ASSERT_VEC3_NEAR(cap_hit.normal, n, 1e-3f);
+
+    // Sweeping uphill parallel to the slope, clear of it, hits nothing; aimed into it, hits.
+    const glm::vec3 uphill = glm::normalize(glm::vec3(1.0f, 0.0f, tan30));
+    const glm::vec3 above = glm::vec3(0.5f, 0.0f, 0.5f * tan30) + n * 0.6f;
+    ASSERT_TRUE(!world.sphere_cast(above, 0.5f, uphill, 3.0f, hit));
+    ASSERT_TRUE(world.sphere_cast(above, 0.5f, glm::normalize(glm::vec3(1.0f, 0.0f, 0.0f)), 3.0f, hit));
+    ASSERT_VEC3_NEAR(hit.normal, n, 1e-3f);
+}
+
+/**
+ * Initial-overlap rules: a cast starting inside a target reports it at distance 0 with
+ * `started_inside` only when moving deeper; moving out ignores it. A shape merely resting on a
+ * surface (touching, no depth) can sweep along it freely, reports distance 0 without
+ * `started_inside` when pushed into it -- and on a tessellated mesh floor the shared internal
+ * edge doesn't produce a ghost hit for a slightly sunk sphere sliding across it.
+ */
+static void test_sweep_started_inside_and_resting_contact() {
+    PhysicsWorld world;
+    dynamics::BodyId box_id = add_static_box(world, glm::vec3(5.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+
+    query::RaycastHit hit;
+    // Sphere centre 0.3 inside the -X face: deeper (+X) is a started-inside hit; out (-X) is not.
+    ASSERT_TRUE(world.sphere_cast(glm::vec3(4.8f, 0.0f, 0.0f), 0.25f, glm::vec3(1.0f, 0.0f, 0.0f), 2.0f, hit));
+    ASSERT_TRUE(hit.started_inside);
+    ASSERT_NEAR(hit.distance, 0.0f, 1e-6f);
+    ASSERT_VEC3_NEAR(hit.normal, glm::vec3(-1.0f, 0.0f, 0.0f), 1e-3f);
+    ASSERT_TRUE(hit.body == box_id);
+    ASSERT_TRUE(!world.sphere_cast(glm::vec3(4.8f, 0.0f, 0.0f), 0.25f, glm::vec3(-1.0f, 0.0f, 0.0f), 2.0f, hit));
+    // Same for a box cast overlapping by 0.1 (SAT minimum-overlap axis).
+    ASSERT_TRUE(world.box_cast(glm::vec3(4.1f, 0.0f, 0.0f), glm::vec3(0.5f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                               glm::vec3(1.0f, 0.0f, 0.0f), 2.0f, hit));
+    ASSERT_TRUE(hit.started_inside);
+    ASSERT_VEC3_NEAR(hit.normal, glm::vec3(-1.0f, 0.0f, 0.0f), 1e-3f);
+    ASSERT_TRUE(!world.box_cast(glm::vec3(4.1f, 0.0f, 0.0f), glm::vec3(0.5f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                glm::vec3(-1.0f, 0.0f, 0.0f), 2.0f, hit));
+
+    // Resting exactly on a floor box: sliding along it is free, pressing into it is a
+    // distance-0 contact that is NOT started_inside.
+    PhysicsWorld floor_world;
+    add_static_box(floor_world, glm::vec3(0.0f, 0.0f, -0.5f), glm::vec3(10.0f, 10.0f, 0.5f));
+    ASSERT_TRUE(!floor_world.sphere_cast(glm::vec3(0.0f, 0.0f, 0.5f), 0.5f, glm::vec3(1.0f, 0.0f, 0.0f), 3.0f, hit));
+    ASSERT_TRUE(!floor_world.capsule_cast(glm::vec3(0.0f, 0.0f, 0.9f), 0.4f, 0.5f, 2, glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                          glm::vec3(0.0f, 1.0f, 0.0f), 3.0f, hit));
+    ASSERT_TRUE(!floor_world.box_cast(glm::vec3(0.0f, 0.0f, 0.25f), glm::vec3(0.25f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                      glm::vec3(1.0f, 0.0f, 0.0f), 3.0f, hit));
+    ASSERT_TRUE(floor_world.sphere_cast(glm::vec3(0.0f, 0.0f, 0.5f), 0.5f, glm::vec3(0.0f, 0.0f, -1.0f), 3.0f, hit));
+    ASSERT_NEAR(hit.distance, 0.0f, 1e-3f);
+    ASSERT_TRUE(!hit.started_inside);
+
+    // Two-triangle mesh floor, diagonal internal edge x == y: a sphere sunk 0.01 near the edge
+    // slides across it without catching.
+    geometry::TriangleMesh floor_mesh = make_two_triangle_floor();
+    PhysicsWorld mesh_world;
+    add_static_mesh(mesh_world, &floor_mesh);
+    const glm::vec3 across = glm::normalize(glm::vec3(-1.0f, 1.0f, 0.0f));
+    ASSERT_TRUE(!mesh_world.sphere_cast(glm::vec3(0.05f, 0.0f, 0.49f), 0.5f, across, 1.0f, hit));
+    // ...but pressing it down is a started-inside hit with the face normal.
+    ASSERT_TRUE(mesh_world.sphere_cast(glm::vec3(0.05f, 0.0f, 0.49f), 0.5f, glm::vec3(0.0f, 0.0f, -1.0f), 1.0f, hit));
+    ASSERT_TRUE(hit.started_inside);
+    ASSERT_VEC3_NEAR(hit.normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-3f);
+}
+
+/** QueryFilter: `ignore` skips one body for every query kind; `predicate` can skip any; the
+ *  (layer_mask, include_triggers) overloads still behave as before. */
+static void test_query_filter_ignores_bodies() {
+    PhysicsWorld world;
+    dynamics::BodyId near_id = add_static_box(world, glm::vec3(3.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+    dynamics::BodyId far_id = add_static_box(world, glm::vec3(6.0f, 0.0f, 0.0f), glm::vec3(0.5f));
+
+    geometry::Ray ray;
+    ray.origin = glm::vec3(0.0f);
+    ray.direction = glm::vec3(1.0f, 0.0f, 0.0f);
+    ray.max_distance = 100.0f;
+
+    query::QueryFilter ignore_near;
+    ignore_near.ignore = near_id;
+
+    query::RaycastHit hit;
+    ASSERT_TRUE(world.raycast(ray, hit));
+    ASSERT_TRUE(hit.body == near_id);
+    ASSERT_TRUE(world.raycast(ray, hit, ignore_near));
+    ASSERT_TRUE(hit.body == far_id);
+    ASSERT_NEAR(hit.distance, 5.5f, 1e-4f);
+
+    ASSERT_TRUE(world.raycast_all(ray, ignore_near).size() == 1);
+    ASSERT_TRUE(world.sphere_cast(glm::vec3(0.0f), 0.25f, ray.direction, 100.0f, hit, ignore_near));
+    ASSERT_TRUE(hit.body == far_id);
+    ASSERT_TRUE(world.capsule_cast(glm::vec3(0.0f), 0.25f, 0.5f, 2, glm::quat(1.0f, 0.0f, 0.0f, 0.0f), ray.direction,
+                                   100.0f, hit, ignore_near));
+    ASSERT_TRUE(hit.body == far_id);
+    ASSERT_TRUE(world.box_cast(glm::vec3(0.0f), glm::vec3(0.25f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), ray.direction,
+                               100.0f, hit, ignore_near));
+    ASSERT_TRUE(hit.body == far_id);
+    ASSERT_NEAR(hit.distance, 5.25f, 1e-3f);
+
+    ASSERT_TRUE(world.overlap_sphere(glm::vec3(3.0f, 0.0f, 0.0f), 0.5f).size() == 1);
+    ASSERT_TRUE(world.overlap_sphere(glm::vec3(3.0f, 0.0f, 0.0f), 0.5f, ignore_near).empty());
+    ASSERT_TRUE(world.compute_penetration(collision::Shape::make_sphere(0.5f), glm::vec3(3.0f, 0.0f, 0.9f),
+                                          glm::quat(1.0f, 0.0f, 0.0f, 0.0f), ignore_near).empty());
+
+    // The predicate sees every candidate body and can veto any of them.
+    query::QueryFilter none;
+    none.predicate = [](dynamics::BodyId) { return false; };
+    ASSERT_TRUE(!world.raycast(ray, hit, none));
+    ASSERT_TRUE(!world.raycast_any(ray, none));
+    query::QueryFilter only_far;
+    only_far.predicate = [&](dynamics::BodyId id) { return id == far_id; };
+    ASSERT_TRUE(world.sphere_cast(glm::vec3(0.0f), 0.25f, ray.direction, 100.0f, hit, only_far));
+    ASSERT_TRUE(hit.body == far_id);
+
+    // Layer mask through the filter matches the shorthand overload.
+    world.get_shape(near_id)->layer = 3;
+    query::QueryFilter skip_layer3;
+    skip_layer3.layer_mask = ~(1u << 3);
+    ASSERT_TRUE(world.raycast(ray, hit, skip_layer3) && hit.body == far_id);
+    ASSERT_TRUE(world.raycast(ray, hit, ~(1u << 3)) && hit.body == far_id);
+}
+
+/** compute_penetration(): exact MTVs against boxes (face contact, a capsule whose core is
+ *  inside the box), and per-direction merged entries against meshes. */
+static void test_compute_penetration_against_box_and_mesh() {
+    PhysicsWorld world;
+    dynamics::BodyId floor_id = add_static_box(world, glm::vec3(0.0f, 0.0f, -0.5f), glm::vec3(2.0f, 2.0f, 0.5f));
+    const glm::quat identity(1.0f, 0.0f, 0.0f, 0.0f);
+
+    auto pens = world.compute_penetration(collision::Shape::make_sphere(0.5f), glm::vec3(0.0f, 0.0f, 0.4f), identity);
+    ASSERT_TRUE(pens.size() == 1);
+    ASSERT_NEAR(pens[0].depth, 0.1f, 1e-4f);
+    ASSERT_VEC3_NEAR(pens[0].normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-4f);
+    ASSERT_TRUE(pens[0].body == floor_id);
+
+    // Box sunk 0.15 into the floor's top face.
+    pens = world.compute_penetration(collision::Shape::make_box(glm::vec3(0.25f)), glm::vec3(0.5f, 0.0f, 0.1f), identity);
+    ASSERT_TRUE(pens.size() == 1);
+    ASSERT_NEAR(pens[0].depth, 0.15f, 1e-4f);
+    ASSERT_VEC3_NEAR(pens[0].normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-4f);
+
+    // Lying capsule (X axis, r 0.2) whose core is 0.3 BELOW the floor's top: push-out is up
+    // through the top face, 0.3 + 0.2 deep.
+    pens = world.compute_penetration(collision::Shape::make_capsule(0.2f, 0.5f, 0), glm::vec3(0.0f, 0.0f, -0.3f), identity);
+    ASSERT_TRUE(pens.size() == 1);
+    ASSERT_NEAR(pens[0].depth, 0.5f, 1e-4f);
+    ASSERT_VEC3_NEAR(pens[0].normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-4f);
+
+    // Not touching: nothing.
+    ASSERT_TRUE(world.compute_penetration(collision::Shape::make_sphere(0.5f), glm::vec3(0.0f, 0.0f, 0.6f), identity).empty());
+
+    // Mesh corner: a floor (z=0) and a wall (x=0, facing +X), two triangles each. A sphere
+    // pressed into the corner gets one entry per surface, not per triangle.
+    geometry::TriangleMesh corner = make_mesh_with_adjacency(
+        {glm::vec3(0, -2, 0), glm::vec3(4, -2, 0), glm::vec3(4, 2, 0), glm::vec3(0, 2, 0), glm::vec3(0, -2, 4), glm::vec3(0, 2, 4)},
+        {0, 1, 2, 0, 2, 3, 0, 3, 5, 0, 5, 4});
+    PhysicsWorld mesh_world;
+    dynamics::BodyId mesh_id = add_static_mesh(mesh_world, &corner);
+    pens = mesh_world.compute_penetration(collision::Shape::make_sphere(0.5f), glm::vec3(0.4f, 0.0f, 0.45f), identity);
+    ASSERT_TRUE(pens.size() == 2);
+    std::sort(pens.begin(), pens.end(), [](const query::Penetration& a, const query::Penetration& b) { return a.depth < b.depth; });
+    ASSERT_VEC3_NEAR(pens[0].normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-4f);
+    ASSERT_NEAR(pens[0].depth, 0.05f, 1e-4f);
+    ASSERT_VEC3_NEAR(pens[1].normal, glm::vec3(1.0f, 0.0f, 0.0f), 1e-4f);
+    ASSERT_NEAR(pens[1].depth, 0.1f, 1e-4f);
+    ASSERT_TRUE(pens[0].body == mesh_id && pens[1].body == mesh_id);
+
+    // A sphere straddling the floor's internal diagonal edge: one merged upward entry.
+    pens = mesh_world.compute_penetration(collision::Shape::make_sphere(0.5f), glm::vec3(2.0f, 0.0f, 0.45f), identity);
+    ASSERT_TRUE(pens.size() == 1);
+    ASSERT_VEC3_NEAR(pens[0].normal, glm::vec3(0.0f, 0.0f, 1.0f), 1e-4f);
+    ASSERT_NEAR(pens[0].depth, 0.05f, 1e-4f);
+}
+
+/**
+ * BVH-narrowed mesh contact generation matches the brute-force every-triangle scan exactly --
+ * same points, depths, feature ids and normal -- for spheres, capsules and boxes at random
+ * poses around a bumpy 16x16-cell heightfield.
+ */
+// --- Character motor --------------------------------------------------------------------------
+
+/** @brief Runs `frames` motor moves of `step` per frame plus simple gravity, carrying grounded
+ *         state like a controller would; returns the last result. */
+static character::MoveResult run_motor(const PhysicsWorld& world, glm::vec3& center, const glm::vec3& step, int frames,
+                                       const character::MotorSettings& s) {
+    character::MoveResult r;
+    bool grounded = false;
+    float vz = 0.0f;
+    const float dt = 1.0f / 60.0f;
+    for (int i = 0; i < frames; ++i) {
+        vz = grounded ? 0.0f : vz - 9.81f * dt;
+        if (grounded) vz = -9.81f * dt;
+        character::MoveOptions opt;
+        opt.was_grounded = grounded;
+        r = character::move(world, center, step + glm::vec3(0.0f, 0.0f, vz * dt), {}, s, opt);
+        center = r.position;
+        grounded = r.grounded;
+        if (r.grounded) vz = 0.0f;
+    }
+    return r;
+}
+
+/**
+ * @brief The motor walks up a riser at or under step_height and is stopped by a taller one,
+ *        keeping its skin gap and staying grounded on each tread.
+ */
+static void test_character_motor_steps_up_low_risers_only() {
+    PhysicsWorld world;
+    add_static_box(world, glm::vec3(0.0f, 0.0f, -0.5f), glm::vec3(30.0f, 30.0f, 0.5f));
+    add_static_box(world, glm::vec3(3.0f, 0.0f, 0.15f), glm::vec3(1.0f, 3.0f, 0.15f));   // 0.30 riser at x = 2
+    add_static_box(world, glm::vec3(3.0f, 10.0f, 0.25f), glm::vec3(1.0f, 3.0f, 0.25f));  // 0.50 riser at x = 2
+    character::MotorSettings s; // r 0.3, h 1.8, step 0.35, skin 0.02
+
+    glm::vec3 low(0.0f, 0.0f, 0.92f);
+    character::MoveResult r = run_motor(world, low, glm::vec3(0.05f, 0.0f, 0.0f), 50, s);
+    ASSERT_TRUE(r.grounded);
+    ASSERT_TRUE(low.x > 2.2f);
+    ASSERT_NEAR(low.z, 0.3f + 0.9f + s.skin, 0.01f);
+
+    glm::vec3 high(0.0f, 10.0f, 0.92f);
+    r = run_motor(world, high, glm::vec3(0.05f, 0.0f, 0.0f), 60, s);
+    ASSERT_TRUE(r.grounded);
+    ASSERT_NEAR(high.x, 2.0f - s.radius - s.skin, 0.01f);
+    ASSERT_NEAR(high.z, 0.9f + s.skin, 0.01f);
+}
+
+/**
+ * @brief Slopes: a walkable ramp is walked up (grounded throughout); a slope steeper than the
+ *        limit can't be walked up and a capsule left on it slides down it.
+ */
+static void test_character_motor_slope_limit() {
+    character::MotorSettings s;
+    const float dt = 1.0f / 60.0f;
+    // 20 degree ramp rising toward +X, its top face through the origin.
+    {
+        PhysicsWorld world;
+        const glm::quat rot = glm::angleAxis(glm::radians(-20.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        add_static_box(world, rot * glm::vec3(0.0f, 0.0f, -0.5f), glm::vec3(10.0f, 3.0f, 0.5f), rot);
+        glm::vec3 c(-3.0f, 0.0f, -3.0f * std::tan(glm::radians(20.0f)) + 2.0f);
+        character::MoveResult r = run_motor(world, c, glm::vec3(0.0f), 30, s); // settle
+        ASSERT_TRUE(r.grounded);
+        const float z0 = c.z;
+        r = run_motor(world, c, glm::vec3(4.0f * dt, 0.0f, 0.0f), 60, s);
+        ASSERT_TRUE(r.grounded);
+        ASSERT_NEAR(c.x, 1.0f, 0.05f);
+        ASSERT_NEAR(c.z - z0, 4.0f * std::tan(glm::radians(20.0f)), 0.05f);
+    }
+    // 60 degree slope: walking into it gains no height; standing on it slides down.
+    {
+        PhysicsWorld world;
+        add_static_box(world, glm::vec3(0.0f, 0.0f, -0.5f), glm::vec3(30.0f, 30.0f, 0.5f));
+        const glm::quat rot = glm::angleAxis(glm::radians(-60.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        add_static_box(world, glm::vec3(3.0f, 0.0f, 0.0f) + rot * glm::vec3(0.0f, 0.0f, -0.5f), glm::vec3(4.0f, 3.0f, 0.5f), rot);
+        glm::vec3 c(0.0f, 0.0f, 0.92f);
+        character::MoveResult r = run_motor(world, c, glm::vec3(4.0f * dt, 0.0f, 0.0f), 90, s);
+        ASSERT_TRUE(c.z < 0.92f + 0.35f + 0.05f); // at most one step's worth onto the toe
+        // Dropped onto the slope higher up: it slides down toward -X.
+        glm::vec3 d(4.5f, 0.0f, 1.5f * std::tan(glm::radians(60.0f)) + 1.5f);
+        r = character::move(world, d, glm::vec3(0.0f, 0.0f, -1.0f), {}, s, {});
+        ASSERT_TRUE(!r.grounded);
+        const glm::vec3 start = d;
+        run_motor(world, d, glm::vec3(0.0f), 60, s);
+        ASSERT_TRUE(d.x < start.x - 0.5f);
+        ASSERT_TRUE(d.z < start.z - 0.5f);
+    }
+}
+
+static void test_mesh_contacts_bvh_matches_brute_force() {
+    const int cells = 16;
+    const float cell = 0.5f;
+    auto height = [](float x, float y) { return 0.4f * std::sin(x * 1.3f) * std::cos(y * 0.9f); };
+    std::vector<glm::vec3> vertices;
+    std::vector<uint32_t> indices;
+    for (int j = 0; j <= cells; ++j)
+        for (int i = 0; i <= cells; ++i) {
+            float x = i * cell, y = j * cell;
+            vertices.push_back(glm::vec3(x, y, height(x, y)));
+        }
+    for (int j = 0; j < cells; ++j)
+        for (int i = 0; i < cells; ++i) {
+            uint32_t a = j * (cells + 1) + i, b = a + 1, c = a + cells + 1, d = c + 1;
+            indices.insert(indices.end(), {a, b, d, a, d, c});
+        }
+    geometry::TriangleMesh terrain = make_mesh_with_adjacency(std::move(vertices), std::move(indices));
+    collision::Shape mesh_shape = collision::Shape::make_mesh(&terrain);
+    const glm::vec3 mesh_pos(-1.0f, 0.5f, 0.2f);
+    const glm::quat mesh_rot = glm::angleAxis(0.3f, glm::normalize(glm::vec3(0.2f, 0.1f, 1.0f)));
+
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+    int compared = 0, touching = 0;
+    for (int trial = 0; trial < 600; ++trial) {
+        collision::Shape probe;
+        switch (trial % 3) {
+            case 0: probe = collision::Shape::make_sphere(0.2f + 0.4f * unit(rng)); break;
+            case 1: probe = collision::Shape::make_capsule(0.15f + 0.2f * unit(rng), 0.2f + 0.4f * unit(rng)); break;
+            default: probe = collision::Shape::make_box(glm::vec3(0.1f + 0.4f * unit(rng), 0.1f + 0.4f * unit(rng), 0.1f + 0.3f * unit(rng))); break;
+        }
+        float lx = 0.5f + 7.0f * unit(rng), ly = 0.5f + 7.0f * unit(rng);
+        glm::vec3 local(lx, ly, height(lx, ly) + 0.1f + 0.4f * (unit(rng) - 0.5f));
+        glm::vec3 pos = mesh_pos + mesh_rot * local;
+        glm::quat rot = glm::angleAxis(6.28f * unit(rng), glm::normalize(glm::vec3(unit(rng) - 0.5f, unit(rng) - 0.5f, unit(rng) + 0.1f)));
+
+        collision::ContactManifold fast, brute;
+        bool hit_fast = collision::generate_mesh_contacts(probe, pos, rot, mesh_shape, mesh_pos, mesh_rot, fast, true);
+        bool hit_brute = collision::generate_mesh_contacts(probe, pos, rot, mesh_shape, mesh_pos, mesh_rot, brute, false);
+        ASSERT_TRUE(hit_fast == hit_brute);
+        ++compared;
+        if (!hit_fast) continue;
+        ++touching;
+        ASSERT_TRUE(fast.count == brute.count);
+        ASSERT_VEC3_NEAR(fast.normal, brute.normal, 1e-6f);
+        for (uint8_t k = 0; k < fast.count; ++k) {
+            ASSERT_VEC3_NEAR(fast.points[k].position, brute.points[k].position, 1e-6f);
+            ASSERT_NEAR(fast.points[k].penetration, brute.points[k].penetration, 1e-6f);
+            ASSERT_TRUE(fast.points[k].feature_id == brute.points[k].feature_id);
+        }
+    }
+    ASSERT_TRUE(compared == 600);
+    ASSERT_TRUE(touching > 150); // the pose range really exercises contacts, not just misses
 }
 
 // --- Phase 9: triggers ---
@@ -2118,6 +2569,184 @@ static void test_hinge_joint_free_pendulum_swings_without_drift() {
     // Actually swung: gravity pulled it down and away from its purely-horizontal start.
     float end_z = world.get_body(pendulum_id)->position.z;
     ASSERT_TRUE(end_z < start_z - 0.3f);
+}
+
+/**
+ * A ball joint holds its anchor through sustained 3D motion: a capsule-shaped bob hanging from a
+ * static ceiling point, kicked sideways AND forward so it swings on a cone (a hinge could not),
+ * must keep its end at the ceiling anchor every step -- and actually move.
+ */
+static void test_ball_joint_holds_anchor() {
+    PhysicsWorld world; // default gravity -Z
+
+    dynamics::Body ceiling_body;
+    ceiling_body.type = dynamics::BodyType::Static;
+    dynamics::BodyId ceiling_id = world.add_body(ceiling_body);
+
+    dynamics::Body bob_body;
+    bob_body.position = glm::vec3(0.0f, 0.0f, -0.5f); // centre 0.5 below the anchor
+    bob_body.mass = 2.0f;
+    bob_body.inv_mass = 0.5f;
+    collision::Shape bob_shape = collision::Shape::make_capsule(0.08f, 0.42f);
+    bob_body.inv_inertia_local = dynamics::inertia_for_shape(bob_shape, 2.0f);
+    bob_body.linear_velocity = glm::vec3(2.0f, 1.5f, 0.0f);
+    dynamics::BodyId bob_id = world.add_body(bob_body, bob_shape);
+
+    dynamics::JointId joint = world.add_ball_joint(ceiling_id, bob_id, glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 0.5f));
+    ASSERT_TRUE(joint.is_valid());
+    ASSERT_TRUE(world.get_joint(joint)->type == dynamics::JointType::Ball);
+
+    float max_drift = 0.0f;
+    float max_x = 0.0f, max_y = 0.0f;
+    for (int i = 0; i < 180; ++i) {
+        world.step_fixed(util::k_default_fixed_dt);
+        const dynamics::Body* bob = world.get_body(bob_id);
+        const dynamics::Joint* j = world.get_joint(joint);
+        glm::vec3 anchor_b = bob->position + bob->orientation * j->local_anchor_b;
+        max_drift = std::max(max_drift, glm::length(anchor_b));
+        max_x = std::max(max_x, std::abs(bob->position.x));
+        max_y = std::max(max_y, std::abs(bob->position.y));
+    }
+    ASSERT_TRUE(max_drift < 0.02f);
+    // Swung out in BOTH horizontal directions (a cone, not a plane) and stayed on the 0.5 m sphere.
+    ASSERT_TRUE(max_x > 0.15f && max_y > 0.1f);
+    ASSERT_NEAR(glm::length(world.get_body(bob_id)->position), 0.5f, 0.03f);
+
+    // remove_joint() stops the constraint at once: the bob falls away.
+    world.remove_joint(joint);
+    for (int i = 0; i < 30; ++i) world.step_fixed(util::k_default_fixed_dt);
+    ASSERT_TRUE(glm::length(world.get_body(bob_id)->position) > 0.8f);
+}
+
+/**
+ * A cone-twist joint keeps the anchor, keeps the swing inside its cone and the twist inside its
+ * range: a limb hanging along -Z from a static shoulder is spun hard about a horizontal axis
+ * (swing) and about its own long axis (twist), with gravity off so nothing but the limits stops
+ * it. Both limits must hold within a few degrees, and both must actually be reached.
+ */
+static void test_cone_twist_joint_respects_swing_and_twist_limits() {
+    PhysicsWorld world;
+    world.set_gravity(glm::vec3(0.0f));
+
+    dynamics::Body shoulder_body;
+    shoulder_body.type = dynamics::BodyType::Static;
+    dynamics::BodyId shoulder_id = world.add_body(shoulder_body);
+
+    dynamics::Body arm_body;
+    arm_body.position = glm::vec3(0.0f, 0.0f, -0.3f);
+    collision::Shape arm_shape = collision::Shape::make_capsule(0.06f, 0.24f);
+    arm_body.mass = 2.0f;
+    arm_body.inv_mass = 0.5f;
+    arm_body.inv_inertia_local = dynamics::inertia_for_shape(arm_shape, 2.0f);
+    arm_body.angular_velocity = glm::vec3(6.0f, 0.0f, 9.0f); // swing about X + twist about Z
+    dynamics::BodyId arm_id = world.add_body(arm_body, arm_shape);
+
+    const float swing_limit = glm::radians(40.0f);
+    const float twist_min = glm::radians(-20.0f), twist_max = glm::radians(25.0f);
+    dynamics::JointId joint = world.add_cone_twist_joint(shoulder_id, arm_id, glm::vec3(0.0f), glm::vec3(0.0f, 0.0f, 0.3f),
+                                                          glm::vec3(0.0f, 0.0f, -1.0f), swing_limit, twist_min, twist_max);
+    ASSERT_TRUE(joint.is_valid());
+
+    float max_swing = 0.0f, max_twist = -10.0f, min_twist = 10.0f, max_drift = 0.0f;
+    for (int i = 0; i < 240; ++i) {
+        world.step_fixed(util::k_default_fixed_dt);
+        const dynamics::Body* a = world.get_body(shoulder_id);
+        const dynamics::Body* b = world.get_body(arm_id);
+        const dynamics::Joint* j = world.get_joint(joint);
+        glm::vec3 ta, tb, swing_axis;
+        dynamics::cone_twist_axes(*a, *b, *j, ta, tb);
+        max_swing = std::max(max_swing, dynamics::cone_swing(ta, tb, swing_axis));
+        float twist = dynamics::cone_twist_angle(*a, *b, *j);
+        max_twist = std::max(max_twist, twist);
+        min_twist = std::min(min_twist, twist);
+        glm::vec3 anchor_b = b->position + b->orientation * j->local_anchor_b;
+        max_drift = std::max(max_drift, glm::length(anchor_b));
+    }
+    const float tol = glm::radians(4.0f);
+    ASSERT_TRUE(max_swing <= swing_limit + tol);
+    ASSERT_TRUE(max_swing >= swing_limit - tol);   // the cone was actually reached
+    ASSERT_TRUE(min_twist >= twist_min - tol);
+    ASSERT_TRUE(min_twist <= twist_min + tol);     // ...and the twist range's lower end (+Z spin
+                                                   // is a NEGATIVE twist about the -Z axis)
+    ASSERT_TRUE(max_twist <= twist_max + tol);
+    ASSERT_TRUE(max_drift < 0.02f);
+}
+
+/**
+ * Hierarchical dynamic bodies (a ragdoll's shape: each link a CHILD of the previous one, each
+ * with its own Rigidbody + Collider, jointed with a BallJoint and a ConeTwistJoint component)
+ * must be written back as correct LOCAL poses -- computed from the parent's new body pose, not
+ * its stale world matrix -- on the job-parallel path too. Checked every frame: each link's
+ * Transform world position equals its body's pivot, and no link ever "teleports" (the
+ * write-back and the next frame's teleport check agree), so the chain swings smoothly.
+ */
+static void test_scene_hierarchical_dynamic_bodies_write_back_parallel() {
+    using namespace coopa::scene;
+    coopa::job::JobEngine jobs(4);
+    Scene scene("PhysicsHierarchyWriteBack");
+    scene.set_job_engine(&jobs);
+
+    auto anchor = std::make_unique<SceneObject>("anchor");
+    anchor->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 3.0f));
+    anchor->add_component<components::SphereCollider>()->set_radius(0.05f);
+    SceneObject* parent = anchor.get();
+    scene.add_root_object(std::move(anchor));
+
+    const char* names[3] = {"link0", "link1", "link2"};
+    for (int i = 0; i < 3; ++i) {
+        auto link = std::make_unique<SceneObject>(names[i]);
+        // Each link's pivot sits 0.5 m along +X from its parent's (horizontal start: it swings).
+        link->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.5f, 0.0f, 0.0f));
+        auto* box = link->add_component<components::BoxCollider>();
+        box->set_size(glm::vec3(0.4f, 0.1f, 0.1f));
+        box->set_center(glm::vec3(0.25f, 0.0f, 0.0f));
+        link->add_component<components::RigidbodyComponent>()->mass = 1.0f;
+        if (i == 1) {
+            auto* cone = link->add_component<components::ConeTwistJointComponent>();
+            cone->connected_object = names[i - 1];
+            cone->axis = glm::vec3(1.0f, 0.0f, 0.0f);
+            cone->swing_limit_deg = 70.0f;
+        } else {
+            auto* ball = link->add_component<components::BallJointComponent>();
+            ball->connected_object = i == 0 ? "anchor" : names[i - 1];
+        }
+        SceneObject* raw = link.get();
+        raw->get_transform()->set_parent_transform(&parent->get_transform()->transform());
+        parent->add_child(std::move(link));
+        parent = raw;
+    }
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    sys->set_parallel_threshold(1); // force the job-parallel write-back path
+
+    float max_error = 0.0f;
+    glm::vec3 start_tip(0.0f);
+    for (int frame = 0; frame < 120; ++frame) {
+        scene.update(util::k_default_fixed_dt);
+        scene.late_update(util::k_default_fixed_dt);
+        for (int i = 0; i < 3; ++i) {
+            SceneObject* obj = scene.find_object(names[i]);
+            auto* col = obj->get_component<components::BoxCollider>();
+            const dynamics::Body* body = sys->world().get_body(col->body_id());
+            ASSERT_TRUE(body != nullptr);
+            const glm::mat4 world = obj->get_transform()->transform().get_world_matrix();
+            // last_written_*: what the write-back wrote (interpolated, when the body interpolates).
+            const glm::vec3 pivot = body->last_written_position - body->last_written_orientation * glm::vec3(0.25f, 0.0f, 0.0f);
+            max_error = std::max(max_error, glm::length(glm::vec3(world[3]) - pivot));
+        }
+        if (frame == 0) start_tip = glm::vec3(scene.find_object("link2")->get_transform()->transform().get_world_matrix()[3]);
+    }
+    ASSERT_TRUE(max_error < 0.02f);
+    // It swung down under gravity (the joints did not lock it, the write-back did not freeze it).
+    glm::vec3 end_tip(scene.find_object("link2")->get_transform()->transform().get_world_matrix()[3]);
+    ASSERT_TRUE(end_tip.z < start_tip.z - 0.3f);
+    // ...and the links stayed linked (pivot-to-pivot distance ~0.5 m).
+    for (int i = 1; i < 3; ++i) {
+        glm::vec3 p0(scene.find_object(names[i - 1])->get_transform()->transform().get_world_matrix()[3]);
+        glm::vec3 p1(scene.find_object(names[i])->get_transform()->transform().get_world_matrix()[3]);
+        ASSERT_NEAR(glm::length(p1 - p0), 0.5f, 0.03f);
+    }
 }
 
 /**
@@ -3927,6 +4556,14 @@ int main() {
     RUN_TEST(test_raycast_any_finds_a_hit_without_necessarily_the_closest);
     RUN_TEST(test_query_include_triggers_flag_excludes_trigger_colliders);
     RUN_TEST(test_box_cast_and_capsule_cast_hit_known_target);
+    RUN_TEST(test_sweeps_are_exact_against_box_corner_and_capsule);
+    RUN_TEST(test_sweeps_are_exact_against_mesh_ramp);
+    RUN_TEST(test_sweep_started_inside_and_resting_contact);
+    RUN_TEST(test_query_filter_ignores_bodies);
+    RUN_TEST(test_compute_penetration_against_box_and_mesh);
+    RUN_TEST(test_mesh_contacts_bvh_matches_brute_force);
+    RUN_TEST(test_character_motor_steps_up_low_risers_only);
+    RUN_TEST(test_character_motor_slope_limit);
     RUN_TEST(test_trigger_enter_stay_exit_fires_correct_sequence);
     RUN_TEST(test_debug_draw_emits_collider_bvh_and_contact_lines);
     RUN_TEST(test_shape_local_rotation_reorients_capsule_consistently);
@@ -3953,6 +4590,9 @@ int main() {
     RUN_TEST(test_hinge_joint_free_pendulum_swings_without_drift);
     RUN_TEST(test_hinge_joint_zero_range_limit_acts_rigid);
     RUN_TEST(test_hinge_joint_islands_dynamic_pair_for_sleep);
+    RUN_TEST(test_ball_joint_holds_anchor);
+    RUN_TEST(test_cone_twist_joint_respects_swing_and_twist_limits);
+    RUN_TEST(test_scene_hierarchical_dynamic_bodies_write_back_parallel);
     RUN_TEST(test_job_parallel_stepping_matches_serial_determinism);
 
     RUN_TEST(test_cloth_grid_builder_topology_and_disjoint_batches);

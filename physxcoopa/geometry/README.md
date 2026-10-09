@@ -12,4 +12,4 @@ depends on `dynamics/` or `collision/`.
 | [`obb.h`](obb.h) | `OBB` — center/half-extents/orientation, `axes()`, `bounds()`, `closest_point_on_obb()`. |
 | [`capsule.h`](capsule.h) | `Capsule` — a segment swept by a radius; `closest_point_on_segment()` and `closest_points_segment_segment()` (Ericson's clamped-parametric approach, with the near-parallel-segments branch handled explicitly). |
 | [`triangle_mesh.h`](triangle_mesh.h) | `TriangleMesh` — welded vertices/indices, per-triangle normals, `TriangleAdjacency` (per-edge neighbour triangle or `k_no_neighbor` for a mesh boundary). Construction from raw arrays only; `loaders::TriangleMeshLoader` is the only thing that builds one from an asset. Builds a `MeshBVH` over itself at construction. |
-| [`mesh_bvh.h`](mesh_bvh.h) | `MeshBVH` — median-split top-down BVH over a mesh's triangles; `query()` (AABB) and `raycast()` (Ray), both BVH-descent, no full-mesh scan. |
+| [`mesh_bvh.h`](mesh_bvh.h) | `MeshBVH` — median-split top-down BVH over a mesh's triangles; `query()` (AABB), `raycast()` (Ray) and `sweep()` (a box translating along a ray, for shape casts), all BVH-descent, no full-mesh scan. |

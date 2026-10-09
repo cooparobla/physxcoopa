@@ -72,6 +72,19 @@ public:
         raycast_recursive_(root_, ray, fn);
     }
 
+    /**
+     * @brief Invokes `fn(uint32_t triangle_index)` for every triangle whose bounds the box
+     *        `box` could touch while translating along `ray` -- each node's bounds are grown by
+     *        the box's half-extents (a Minkowski sum) and slab-tested against `ray`, whose
+     *        origin should be the box's center. Tighter than query()-ing the whole swept AABB
+     *        for a long diagonal cast, which is what shape casts against a mesh use it for.
+     */
+    template <typename Fn>
+    void sweep(const AABB& box, const Ray& ray, Fn&& fn) const {
+        if (nodes_.empty()) return;
+        sweep_recursive_(root_, (box.max - box.min) * 0.5f, ray, fn);
+    }
+
     bool empty() const { return nodes_.empty(); }
 
 private:
@@ -138,6 +151,22 @@ private:
         } else {
             raycast_recursive_(node.left, ray, fn);
             raycast_recursive_(node.right, ray, fn);
+        }
+    }
+
+    template <typename Fn>
+    void sweep_recursive_(int32_t idx, const glm::vec3& half, const Ray& ray, Fn&& fn) const {
+        const Node& node = nodes_[idx];
+        AABB grown;
+        grown.min = node.bounds.min - half;
+        grown.max = node.bounds.max + half;
+        float t;
+        if (!grown.contains(ray.origin) && !ray.intersect(grown, t)) return;
+        if (node.is_leaf()) {
+            for (uint32_t i = 0; i < node.tri_count; ++i) fn(tri_order_[node.tri_start + i]);
+        } else {
+            sweep_recursive_(node.left, half, ray, fn);
+            sweep_recursive_(node.right, half, ray, fn);
         }
     }
 

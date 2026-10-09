@@ -27,6 +27,7 @@
 #include <physxcoopa/broadphase/layer_matrix.h>
 #include <physxcoopa/broadphase/pair_cache.h>
 #include <physxcoopa/query/queries.h>
+#include <physxcoopa/query/sweep.h>
 #include <physxcoopa/debug/debug_draw.h>
 #include <physxcoopa/util/physics_settings.h>
 
@@ -44,6 +45,9 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <algorithm>
+#include <iterator>
+#include <unordered_set>
 
 namespace coopa {
 namespace physx {
@@ -122,12 +126,16 @@ public:
         for (uint32_t shape_index : owned) remove_shape(shape_index);
         // Any joint referencing this body must be invalidated NOW -- unlike a contact manifold
         // (rediscovered fresh by broadphase every substep, so a stale one simply never
-        // reappears), a HingeJoint is a persistent object the solver would otherwise keep
+        // reappears), a Joint is a persistent object the solver would otherwise keep
         // indexing into bodies_[id.index] via the raw index alone (no generation check --
         // see solve_joint_velocity_pass()'s doc), silently acting on WHATEVER body this slot
         // gets recycled for next.
         for (auto& j : joints_) {
             if (j.valid && (j.a == id || j.b == id)) j.valid = false;
+        }
+        for (auto it = ignored_pairs_.begin(); it != ignored_pairs_.end();) {
+            const bool involved = static_cast<uint32_t>(*it >> 32) == id.index || static_cast<uint32_t>(*it) == id.index;
+            it = involved ? ignored_pairs_.erase(it) : std::next(it);
         }
         alive_[id.index] = false;
         ++generations_[id.index];
@@ -372,7 +380,7 @@ public:
      *        get the world-space constraint target every solve (see
      *        dynamics::solve_joint_velocity_pass()'s doc).
      *
-     * `HingeJoint::rest_relative_rotation` (the reference angle limits are measured from) is
+     * `Joint::rest_relative_rotation` (the reference angle limits are measured from) is
      * captured automatically from the two bodies' CURRENT orientations at the moment this is
      * called -- matching Unity's HingeJoint.limits, which are relative to the joint's initial
      * relative orientation, not some externally-authored zero.
@@ -382,7 +390,7 @@ public:
      *                    natural choice) locks the one remaining DOF entirely, giving a fully
      *                    rigid attachment with no separate "fixed joint" implementation needed.
      * @param collide_connected When false (the default), `a` and `b` never generate contacts
-     *                          against each other -- see HingeJoint::collide_connected's own doc
+     *                          against each other -- see Joint::collide_connected's own doc
      *                          for why that's the sane default for a hinge specifically (its two
      *                          bodies are EXPECTED to overlap right at the anchor).
      */
@@ -394,7 +402,8 @@ public:
         const dynamics::Body* bb = get_body(b);
         if (!ba || !bb) return dynamics::JointId{};
 
-        dynamics::HingeJoint j;
+        dynamics::Joint j;
+        j.type = dynamics::JointType::Hinge;
         j.a = a;
         j.b = b;
         j.local_anchor_a = local_anchor_a;
@@ -406,22 +415,78 @@ public:
         j.max_angle = max_angle;
         j.collide_connected = collide_connected;
         j.rest_relative_rotation = glm::inverse(ba->orientation) * bb->orientation;
-        j.enabled = true;
-        j.valid = true;
+        return insert_joint_(j);
+    }
 
-        uint32_t index;
-        if (!free_joint_indices_.empty()) {
-            index = free_joint_indices_.back();
-            free_joint_indices_.pop_back();
-            joints_[index] = j;
-        } else {
-            index = static_cast<uint32_t>(joints_.size());
-            joints_.push_back(j);
-            joint_generations_.push_back(0);
-            joint_alive_.push_back(false);
-        }
-        joint_alive_[index] = true;
-        return dynamics::JointId{index, joint_generations_[index]};
+    /**
+     * @brief Creates a ball-and-socket joint: `a`'s `local_anchor_a` and `b`'s `local_anchor_b`
+     *        are held together, every rotation stays free. Same body/frame conventions as
+     *        add_hinge_joint(); returns an invalid JointId if either body is invalid.
+     */
+    dynamics::JointId add_ball_joint(dynamics::BodyId a, dynamics::BodyId b, const glm::vec3& local_anchor_a,
+                                      const glm::vec3& local_anchor_b, bool collide_connected = false) {
+        const dynamics::Body* ba = get_body(a);
+        const dynamics::Body* bb = get_body(b);
+        if (!ba || !bb) return dynamics::JointId{};
+        dynamics::Joint j;
+        j.type = dynamics::JointType::Ball;
+        j.a = a;
+        j.b = b;
+        j.local_anchor_a = local_anchor_a;
+        j.local_anchor_b = local_anchor_b;
+        j.collide_connected = collide_connected;
+        j.rest_relative_rotation = glm::inverse(ba->orientation) * bb->orientation;
+        return insert_joint_(j);
+    }
+
+    /**
+     * @brief Creates a cone-twist joint (a shoulder, hip or neck): the anchors are held together
+     *        like a ball joint, `b`'s twist axis may swing at most `swing_limit` radians away from
+     *        `a`'s (a cone; negative = free), and twist about that axis stays within
+     *        [twist_min, twist_max] radians of the rest twist (`twist_min > twist_max` = free).
+     *
+     * `local_twist_axis_a` is in `a`'s frame; `b`'s matching axis is derived from the bodies'
+     * CURRENT relative orientation, which also becomes the rest pose both limits are measured
+     * from (like add_hinge_joint()). For a rest pose other than the current one, fill a
+     * dynamics::Joint yourself and call add_joint().
+     */
+    dynamics::JointId add_cone_twist_joint(dynamics::BodyId a, dynamics::BodyId b, const glm::vec3& local_anchor_a,
+                                            const glm::vec3& local_anchor_b, const glm::vec3& local_twist_axis_a,
+                                            float swing_limit, float twist_min, float twist_max,
+                                            bool collide_connected = false) {
+        const dynamics::Body* ba = get_body(a);
+        const dynamics::Body* bb = get_body(b);
+        if (!ba || !bb) return dynamics::JointId{};
+        dynamics::Joint j;
+        j.type = dynamics::JointType::ConeTwist;
+        j.a = a;
+        j.b = b;
+        j.local_anchor_a = local_anchor_a;
+        j.local_anchor_b = local_anchor_b;
+        j.rest_relative_rotation = glm::inverse(ba->orientation) * bb->orientation;
+        j.local_axis_a = glm::normalize(local_twist_axis_a);
+        j.local_axis_b = glm::inverse(j.rest_relative_rotation) * j.local_axis_a;
+        j.swing_limit = swing_limit;
+        j.twist_min = twist_min;
+        j.twist_max = twist_max;
+        j.collide_connected = collide_connected;
+        return insert_joint_(j);
+    }
+
+    /**
+     * @brief Inserts a fully described joint as-is -- every field, including
+     *        `rest_relative_rotation` and both local axes, is the caller's (e.g. a ragdoll
+     *        building its joints from the rig's bind pose while the bones are posed elsewhere).
+     *        Accumulators are reset. Returns an invalid JointId if either body is invalid.
+     */
+    dynamics::JointId add_joint(const dynamics::Joint& desc) {
+        if (!get_body(desc.a) || !get_body(desc.b)) return dynamics::JointId{};
+        dynamics::Joint j = desc;
+        j.point_impulse = glm::vec3(0.0f);
+        j.axis_impulse = glm::vec2(0.0f);
+        j.limit_impulse = 0.0f;
+        j.swing_impulse = 0.0f;
+        return insert_joint_(j);
     }
 
     /** @brief True if `id` addresses a currently-alive joint. */
@@ -433,6 +498,9 @@ public:
     /** @brief Destroys a joint immediately. A no-op if `id` is already invalid/stale. */
     void remove_joint(dynamics::JointId id) {
         if (!is_valid(id)) return;
+        // valid = false too: the solver passes walk joints_ directly and gate on `valid`, so a
+        // removed joint must stop acting immediately, not linger until its slot is reused.
+        joints_[id.index].valid = false;
         joint_alive_[id.index] = false;
         ++joint_generations_[id.index];
         free_joint_indices_.push_back(id.index);
@@ -440,11 +508,28 @@ public:
 
     /** @brief Returns the joint `id` addresses, or nullptr if `id` is invalid/stale -- mutable
      *         access is intentional (e.g. a caller adjusting limits at runtime). */
-    dynamics::HingeJoint* get_joint(dynamics::JointId id) {
+    dynamics::Joint* get_joint(dynamics::JointId id) {
         return is_valid(id) ? &joints_[id.index] : nullptr;
     }
-    const dynamics::HingeJoint* get_joint(dynamics::JointId id) const {
+    const dynamics::Joint* get_joint(dynamics::JointId id) const {
         return is_valid(id) ? &joints_[id.index] : nullptr;
+    }
+
+    /**
+     * @brief Turns contacts between two specific bodies off (`collide == false`) or back on,
+     *        regardless of layers -- for bodies that overlap by design without being jointed to
+     *        each other (a ragdoll's grandparent/sibling bones around a shoulder or hip). Either
+     *        body being removed forgets the pair.
+     */
+    void set_pair_collision(dynamics::BodyId a, dynamics::BodyId b, bool collide) {
+        if (!is_valid(a) || !is_valid(b) || a == b) return;
+        const uint64_t key = pair_key_(a.index, b.index);
+        if (collide) ignored_pairs_.erase(key);
+        else ignored_pairs_.insert(key);
+    }
+    /** @brief False when set_pair_collision() turned this pair's contacts off. */
+    bool pair_collides(dynamics::BodyId a, dynamics::BodyId b) const {
+        return ignored_pairs_.empty() || ignored_pairs_.count(pair_key_(a.index, b.index)) == 0;
     }
 
     // --- Cloth -------------------------------------------------------------------------------
@@ -582,22 +667,23 @@ public:
     // --- Queries ---
     //
     // Only valid between phases, not from inside on_substep (mid-solve, not-yet-integrated
-    // state). `layer_mask` follows Unity's convention: bit `shape.layer` of the mask, not the
+    // state). Every query takes a query::QueryFilter (layer mask, trigger inclusion, one body to
+    // ignore, an optional predicate -- see its doc); the `(layer_mask, include_triggers)`
+    // overloads are the original shorthand and behave exactly like a filter with only those two
+    // fields set. `layer_mask` follows Unity's convention: bit `shape.layer` of the mask, not the
     // LayerMatrix used for solver pair rejection -- a query has no "other side" to look up a
     // collision-matrix entry against. `include_triggers` (default true -- a trigger collider
     // has a normal broadphase proxy like any other) lets a caller exclude trigger colliders,
     // e.g. a raycast that should only ever see solid geometry.
 
     /** @brief Closest hit along `ray`, or false if nothing was hit. */
-    bool raycast(const geometry::Ray& ray, query::RaycastHit& hit, uint32_t layer_mask = ~0u,
-                 bool include_triggers = true) const {
+    bool raycast(const geometry::Ray& ray, query::RaycastHit& hit, const query::QueryFilter& filter) const {
         bool found = false;
         float best_t = ray.max_distance;
         auto visit = [&](void* user_data) {
             uint32_t i = user_data_to_index_(user_data);
-            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (!include_triggers && shapes_[i].is_trigger) return;
             const dynamics::BodyId owner = shape_owner_[i];
+            if (!filter.accepts(shapes_[i], owner)) return;
             const dynamics::Body& body = bodies_[owner.index];
             geometry::Ray clipped = ray;
             clipped.max_distance = best_t;
@@ -605,6 +691,7 @@ public:
             glm::vec3 n;
             if (!query::raycast_shape(clipped, shapes_[i], body.position, body.orientation, t, n)) return;
             best_t = t;
+            hit = query::RaycastHit{};
             hit.point = ray.origin + ray.direction * t;
             hit.normal = n;
             hit.distance = t;
@@ -616,6 +703,10 @@ public:
         static_tree_.raycast(ray, visit);
         return found;
     }
+    bool raycast(const geometry::Ray& ray, query::RaycastHit& hit, uint32_t layer_mask = ~0u,
+                 bool include_triggers = true) const {
+        return raycast(ray, hit, filter_(layer_mask, include_triggers));
+    }
 
     /**
      * @brief True if ANYTHING along `ray` is hit, stopping at the first tree-traversal hit --
@@ -623,12 +714,11 @@ public:
      *        "is anything blocking this line" checks that don't care which thing is in the way,
      *        built on AABBTree::raycast_until()'s early-out traversal.
      */
-    bool raycast_any(const geometry::Ray& ray, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+    bool raycast_any(const geometry::Ray& ray, const query::QueryFilter& filter) const {
         bool found = false;
         auto visit = [&](void* user_data) -> bool {
             uint32_t i = user_data_to_index_(user_data);
-            if (!((layer_mask >> shapes_[i].layer) & 1u)) return false;
-            if (!include_triggers && shapes_[i].is_trigger) return false;
+            if (!filter.accepts(shapes_[i], shape_owner_[i])) return false;
             const dynamics::Body& body = bodies_[shape_owner_[i].index];
             float t;
             glm::vec3 n;
@@ -640,17 +730,18 @@ public:
         if (!found) static_tree_.raycast_until(ray, visit);
         return found;
     }
+    bool raycast_any(const geometry::Ray& ray, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        return raycast_any(ray, filter_(layer_mask, include_triggers));
+    }
 
     /** @brief Every hit along `ray`, sorted nearest-first (unlike raycast(), not clipped to the
      *         closest hit as it goes, since every overlapping body along the ray is wanted). */
-    std::vector<query::RaycastHit> raycast_all(const geometry::Ray& ray, uint32_t layer_mask = ~0u,
-                                                bool include_triggers = true) const {
+    std::vector<query::RaycastHit> raycast_all(const geometry::Ray& ray, const query::QueryFilter& filter) const {
         std::vector<query::RaycastHit> hits;
         auto visit = [&](void* user_data) {
             uint32_t i = user_data_to_index_(user_data);
-            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (!include_triggers && shapes_[i].is_trigger) return;
             const dynamics::BodyId owner = shape_owner_[i];
+            if (!filter.accepts(shapes_[i], owner)) return;
             const dynamics::Body& body = bodies_[owner.index];
             float t;
             glm::vec3 n;
@@ -670,103 +761,147 @@ public:
         });
         return hits;
     }
+    std::vector<query::RaycastHit> raycast_all(const geometry::Ray& ray, uint32_t layer_mask = ~0u,
+                                                bool include_triggers = true) const {
+        return raycast_all(ray, filter_(layer_mask, include_triggers));
+    }
 
     /**
-     * @brief Casts a sphere of `radius` from `origin` along `dir`, up to `max_distance`.
+     * @brief Sweeps convex `shape` (Sphere, Capsule or Box -- its local_center/local_rotation/
+     *        capsule_axis honoured as for a body's shape) from pose `pos`/`rot` along `dir`, up to
+     *        `max_distance`, without rotating, and reports the FIRST thing it would touch.
      *
-     * v1 simplification: approximates each candidate shape as inflated by `radius` (a rounded
-     * box becomes a sharp box, a rounded capsule keeps its exact swept-sphere shape since a
-     * capsule inflated by a sphere is just a larger capsule) and raycasts the inflated shape --
-     * exact for Sphere and Capsule targets, a conservative-at-the-corners approximation for Box
-     * and TriangleMesh. Good enough for v1's use cases (character-controller-style probes);
-     * revisit with a true swept-volume test if a caller needs exact rounded-corner behavior.
+     * Exact against every target type, meshes included (BVH-narrowed per triangle):
+     * conservative advancement for round cast shapes, a swept separating-axis test for box vs
+     * box/triangle -- see query/sweep.h's file doc. `hit.distance` is how far the shape can
+     * travel before touching (within query::k_sweep_tolerance), `hit.normal` the contact normal
+     * (target toward cast shape), `hit.point` a contact point on the target, `hit.shape_index`
+     * the exact shape slot hit.
+     *
+     * A target already touching/overlapping the shape at `pos` counts only when `dir` leads into
+     * it (distance 0, `started_inside` when genuinely overlapping) -- a shape resting against
+     * something can still be swept along or away from it. Use compute_penetration() to resolve
+     * an overlap first.
+     *
+     * @param dir Travel direction; normalized here (false for a zero vector).
+     * @return False if nothing is hit within `max_distance`, or `shape` is a TriangleMesh.
      */
-    bool sphere_cast(const glm::vec3& origin, float radius, const glm::vec3& dir, float max_distance,
-                      query::RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
-        geometry::Ray ray;
-        ray.origin = origin;
-        ray.direction = dir;
-        ray.max_distance = max_distance;
+    bool shape_cast(const collision::Shape& shape, const glm::vec3& pos, const glm::quat& rot, const glm::vec3& dir,
+                    float max_distance, query::RaycastHit& hit, const query::QueryFilter& filter = {}) const {
+        if (shape.type == collision::ShapeType::TriangleMesh || !(max_distance >= 0.0f)) return false;
+        float dir_len = glm::length(dir);
+        if (dir_len < 1e-8f) return false;
+        const glm::vec3 unit_dir = dir / dir_len;
 
+        geometry::AABB swept = geometry::AABB::merge(collision::world_bounds(shape, pos, rot),
+                                                     collision::world_bounds(shape, pos + unit_dir * max_distance, rot));
         bool found = false;
-        float best_t = max_distance;
-        auto visit = [&](void* user_data) {
-            uint32_t i = user_data_to_index_(user_data);
-            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (!include_triggers && shapes_[i].is_trigger) return;
+        float best = max_distance;
+        query_aabb_(swept, filter, [&](uint32_t i) {
+            if (found && best <= 0.0f) return; // nothing beats a distance-0 hit
             const dynamics::BodyId owner = shape_owner_[i];
             const dynamics::Body& body = bodies_[owner.index];
-            collision::Shape inflated = shapes_[i];
-            switch (inflated.type) {
-                case collision::ShapeType::Sphere: inflated.radius += radius; break;
-                case collision::ShapeType::Box: inflated.half_extents += glm::vec3(radius); break;
-                case collision::ShapeType::Capsule: inflated.capsule_radius += radius; break;
-                case collision::ShapeType::TriangleMesh: break; // no inflation available; exact-surface cast only
-            }
-            geometry::Ray clipped = ray;
-            clipped.max_distance = best_t;
-            float t;
-            glm::vec3 n;
-            if (!query::raycast_shape(clipped, inflated, body.position, body.orientation, t, n)) return;
-            best_t = t;
-            hit.point = ray.origin + ray.direction * t;
-            hit.normal = n;
-            hit.distance = t;
+            query::SweepResult r;
+            if (!query::sweep_shape(shape, pos, rot, unit_dir, best, shapes_[i], body.position, body.orientation, r)) return;
+            if (found && r.distance >= best) return;
+            best = r.distance;
+            hit = query::RaycastHit{};
+            hit.point = r.point;
+            hit.normal = r.normal;
+            hit.distance = r.distance;
             hit.body = owner;
             hit.shape_index = i;
+            hit.started_inside = r.started_inside;
             found = true;
-        };
-        dynamic_tree_.raycast(ray, visit);
-        static_tree_.raycast(ray, visit);
+        });
         return found;
     }
 
-    /**
-     * @brief Casts a `half_extents`-sized box from `origin` along `dir`, up to `max_distance`,
-     *        keeping `orientation` fixed throughout the sweep (no tumbling mid-cast).
-     *
-     * Unlike sphere_cast(), a box (or capsule below) can't be folded into an "inflate the
-     * target, raycast" trick in general -- see world.h's own file doc / the plan's "Design
-     * rationale" for why no swept-OBB/conservative-advancement routine exists in this codebase
-     * (no GJK/EPA). v1 approximates instead with a DISCRETIZED STEPPED SWEEP: sample the casting
-     * box's pose at increasing distance along `dir` (step size a quarter of its own smallest
-     * half-extent, so it can't skip past a thin target entirely), overlap-test each sample
-     * against broadphase candidates, and on the first overlapping sample binary-search back
-     * toward the last clear sample to tighten the hit distance. This can miss a target thinner
-     * than the step size (same class of approximation sphere_cast already accepts for box/mesh
-     * corners) -- acceptable for v1's use cases, not a substitute for exact conservative
-     * advancement if a caller ever needs one.
-     */
+    /** @brief Casts a sphere of `radius` from `origin` along `dir`, up to `max_distance` --
+     *         shape_cast() with a sphere (exact against every target, see its doc). */
+    bool sphere_cast(const glm::vec3& origin, float radius, const glm::vec3& dir, float max_distance,
+                      query::RaycastHit& hit, const query::QueryFilter& filter) const {
+        return shape_cast(collision::Shape::make_sphere(radius), origin, glm::quat(1.0f, 0.0f, 0.0f, 0.0f), dir,
+                          max_distance, hit, filter);
+    }
+    bool sphere_cast(const glm::vec3& origin, float radius, const glm::vec3& dir, float max_distance,
+                      query::RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        return sphere_cast(origin, radius, dir, max_distance, hit, filter_(layer_mask, include_triggers));
+    }
+
+    /** @brief Casts a `half_extents`-sized box from `origin` along `dir`, up to `max_distance`,
+     *         keeping `orientation` fixed throughout the sweep (no tumbling mid-cast) --
+     *         shape_cast() with a box. */
+    bool box_cast(const glm::vec3& origin, const glm::vec3& half_extents, const glm::quat& orientation,
+                  const glm::vec3& dir, float max_distance, query::RaycastHit& hit,
+                  const query::QueryFilter& filter) const {
+        return shape_cast(collision::Shape::make_box(half_extents), origin, orientation, dir, max_distance, hit, filter);
+    }
     bool box_cast(const glm::vec3& origin, const glm::vec3& half_extents, const glm::quat& orientation,
                   const glm::vec3& dir, float max_distance, query::RaycastHit& hit,
                   uint32_t layer_mask = ~0u, bool include_triggers = true) const {
-        float min_extent = std::min({half_extents.x, half_extents.y, half_extents.z});
-        auto probe_at = [&](float d, collision::Shape& probe, glm::vec3& pos, glm::quat& rot) {
-            probe = collision::Shape::make_box(half_extents);
-            pos = origin + dir * d;
-            rot = orientation;
-        };
-        return stepped_cast_(origin, dir, max_distance, min_extent, probe_at, layer_mask, include_triggers, hit);
+        return box_cast(origin, half_extents, orientation, dir, max_distance, hit, filter_(layer_mask, include_triggers));
     }
 
-    /**
-     * @brief Casts a capsule (`radius`, `half_height` along `direction_axis` -- 0=X, 1=Y, 2=Z,
-     *        matching CapsuleCollider's own convention) from `origin` along `dir`, up to
-     *        `max_distance`, keeping `orientation` fixed throughout the sweep.
-     *
-     * Same discretized-stepped-sweep approximation as box_cast() above, for the same reason --
-     * see that doc.
-     */
+    /** @brief Casts a capsule (`radius`, `half_height` along `direction_axis` -- 0=X, 1=Y, 2=Z,
+     *         matching CapsuleCollider's own convention) from `origin` along `dir`, up to
+     *         `max_distance`, keeping `orientation` fixed -- shape_cast() with a capsule. */
+    bool capsule_cast(const glm::vec3& origin, float radius, float half_height, int direction_axis,
+                       const glm::quat& orientation, const glm::vec3& dir, float max_distance,
+                       query::RaycastHit& hit, const query::QueryFilter& filter) const {
+        return shape_cast(collision::Shape::make_capsule(radius, half_height, direction_axis), origin, orientation, dir,
+                          max_distance, hit, filter);
+    }
     bool capsule_cast(const glm::vec3& origin, float radius, float half_height, int direction_axis,
                        const glm::quat& orientation, const glm::vec3& dir, float max_distance,
                        query::RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
-        float min_extent = std::min(radius, half_height);
-        auto probe_at = [&](float d, collision::Shape& probe, glm::vec3& pos, glm::quat& rot) {
-            probe = collision::Shape::make_capsule(radius, half_height, direction_axis);
-            pos = origin + dir * d;
-            rot = orientation;
-        };
-        return stepped_cast_(origin, dir, max_distance, min_extent, probe_at, layer_mask, include_triggers, hit);
+        return capsule_cast(origin, radius, half_height, direction_axis, orientation, dir, max_distance, hit,
+                            filter_(layer_mask, include_triggers));
+    }
+
+    /**
+     * @brief Every overlap between convex `shape` (Sphere, Capsule or Box at `pos`/`rot`) and the
+     *        world, as minimum-translation vectors: moving the shape by `normal * depth` clears
+     *        that target (see query::Penetration). Candidates come from both broadphase trees;
+     *        each runs the same pairwise contact math as the solver (collision::generate_contacts,
+     *        or the BVH-narrowed per-triangle path for meshes, internal-edge-corrected), so a
+     *        flat tessellated floor reports one upward entry, not one per triangle -- entries of
+     *        one mesh whose normals agree are merged, keeping the deepest. Only positive depths
+     *        are reported. A character motor resolves these (deepest first, re-querying) before
+     *        sweeping; pass a filter that ignores the motor's own body and excludes triggers.
+     */
+    std::vector<query::Penetration> compute_penetration(const collision::Shape& shape, const glm::vec3& pos,
+                                                        const glm::quat& rot,
+                                                        const query::QueryFilter& filter = {}) const {
+        std::vector<query::Penetration> out;
+        if (shape.type == collision::ShapeType::TriangleMesh) return out;
+        query_aabb_(collision::world_bounds(shape, pos, rot), filter, [&](uint32_t i) {
+            const dynamics::BodyId owner = shape_owner_[i];
+            const dynamics::Body& body = bodies_[owner.index];
+            const collision::Shape& target = shapes_[i];
+            if (target.type == collision::ShapeType::TriangleMesh) {
+                const std::size_t first = out.size();
+                query::mesh_penetrations(shape, pos, rot, target, body.position, body.orientation,
+                                         [&](const glm::vec3& normal, float depth, const glm::vec3& point) {
+                                             for (std::size_t k = first; k < out.size(); ++k) {
+                                                 if (glm::dot(out[k].normal, normal) > 0.999f) {
+                                                     if (depth > out[k].depth) {
+                                                         out[k].depth = depth;
+                                                         out[k].point = point;
+                                                     }
+                                                     return;
+                                                 }
+                                             }
+                                             out.push_back(query::Penetration{normal, depth, point, owner, i});
+                                         });
+                return;
+            }
+            glm::vec3 normal, point;
+            float depth;
+            if (query::convex_penetration(shape, pos, rot, target, body.position, body.orientation, normal, depth, point))
+                out.push_back(query::Penetration{normal, depth, point, owner, i});
+        });
+        return out;
     }
 
     /** @brief Every body whose shape overlaps a world-space sphere -- for a compound body
@@ -774,72 +909,64 @@ public:
      *         it can appear more than once (Unity's own overlap semantics are per-collider, not
      *         per-body; this is the closest match without a new return type -- see the plan's
      *         Phase 5 doc for why that trade was made). */
-    std::vector<dynamics::BodyId> overlap_sphere(const glm::vec3& center, float radius, uint32_t layer_mask = ~0u,
-                                                  bool include_triggers = true) const {
+    std::vector<dynamics::BodyId> overlap_sphere(const glm::vec3& center, float radius,
+                                                  const query::QueryFilter& filter) const {
         geometry::Sphere query_sphere{center, radius};
         geometry::AABB bounds;
         bounds.min = center - glm::vec3(radius);
         bounds.max = center + glm::vec3(radius);
 
         std::vector<dynamics::BodyId> results;
-        auto visit = [&](void* user_data) {
-            uint32_t i = user_data_to_index_(user_data);
-            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (!include_triggers && shapes_[i].is_trigger) return;
+        query_aabb_(bounds, filter, [&](uint32_t i) {
             const dynamics::Body& body = bodies_[shape_owner_[i].index];
             if (query::shape_overlaps_sphere(shapes_[i], body.position, body.orientation, query_sphere)) {
                 results.push_back(shape_owner_[i]);
             }
-        };
-        dynamic_tree_.query(bounds, visit);
-        static_tree_.query(bounds, visit);
+        });
         return results;
+    }
+    std::vector<dynamics::BodyId> overlap_sphere(const glm::vec3& center, float radius, uint32_t layer_mask = ~0u,
+                                                  bool include_triggers = true) const {
+        return overlap_sphere(center, radius, filter_(layer_mask, include_triggers));
     }
 
     /** @brief Every body whose shape overlaps a world-space OBB -- see overlap_sphere()'s doc
      *         for the per-child-shape duplication a compound body can produce here too. */
-    std::vector<dynamics::BodyId> overlap_box(const geometry::OBB& box, uint32_t layer_mask = ~0u,
-                                               bool include_triggers = true) const {
-        geometry::AABB bounds = box.bounds();
-
+    std::vector<dynamics::BodyId> overlap_box(const geometry::OBB& box, const query::QueryFilter& filter) const {
         std::vector<dynamics::BodyId> results;
-        auto visit = [&](void* user_data) {
-            uint32_t i = user_data_to_index_(user_data);
-            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (!include_triggers && shapes_[i].is_trigger) return;
+        query_aabb_(box.bounds(), filter, [&](uint32_t i) {
             const dynamics::Body& body = bodies_[shape_owner_[i].index];
             if (query::shape_overlaps_obb(shapes_[i], body.position, body.orientation, box)) {
                 results.push_back(shape_owner_[i]);
             }
-        };
-        dynamic_tree_.query(bounds, visit);
-        static_tree_.query(bounds, visit);
+        });
         return results;
+    }
+    std::vector<dynamics::BodyId> overlap_box(const geometry::OBB& box, uint32_t layer_mask = ~0u,
+                                               bool include_triggers = true) const {
+        return overlap_box(box, filter_(layer_mask, include_triggers));
     }
 
     /** @brief Every body whose shape overlaps a world-space capsule -- see overlap_sphere()'s
      *         doc for the per-child-shape duplication a compound body can produce here too. */
-    std::vector<dynamics::BodyId> overlap_capsule(const geometry::Capsule& capsule, uint32_t layer_mask = ~0u,
-                                                   bool include_triggers = true) const {
+    std::vector<dynamics::BodyId> overlap_capsule(const geometry::Capsule& capsule,
+                                                   const query::QueryFilter& filter) const {
         geometry::AABB bounds;
-        glm::vec3 lo = glm::min(capsule.a, capsule.b) - glm::vec3(capsule.radius);
-        glm::vec3 hi = glm::max(capsule.a, capsule.b) + glm::vec3(capsule.radius);
-        bounds.min = lo;
-        bounds.max = hi;
+        bounds.min = glm::min(capsule.a, capsule.b) - glm::vec3(capsule.radius);
+        bounds.max = glm::max(capsule.a, capsule.b) + glm::vec3(capsule.radius);
 
         std::vector<dynamics::BodyId> results;
-        auto visit = [&](void* user_data) {
-            uint32_t i = user_data_to_index_(user_data);
-            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (!include_triggers && shapes_[i].is_trigger) return;
+        query_aabb_(bounds, filter, [&](uint32_t i) {
             const dynamics::Body& body = bodies_[shape_owner_[i].index];
             if (query::shape_overlaps_capsule(shapes_[i], body.position, body.orientation, capsule)) {
                 results.push_back(shape_owner_[i]);
             }
-        };
-        dynamic_tree_.query(bounds, visit);
-        static_tree_.query(bounds, visit);
+        });
         return results;
+    }
+    std::vector<dynamics::BodyId> overlap_capsule(const geometry::Capsule& capsule, uint32_t layer_mask = ~0u,
+                                                   bool include_triggers = true) const {
+        return overlap_capsule(capsule, filter_(layer_mask, include_triggers));
     }
 
     /**
@@ -901,9 +1028,32 @@ public:
                 // The two anchors should be nearly coincident once converged -- drawing both
                 // ends (rather than just one) makes any solver drift visually obvious.
                 out.add_line(world_anchor_a, world_anchor_b, debug::colors::k_joint);
+                if (j.type == dynamics::JointType::Ball) continue; // no axis to show
                 glm::vec3 world_axis_a = glm::normalize(a.orientation * j.local_axis_a);
-                out.add_line(world_anchor_a - world_axis_a * k_axis_length,
-                             world_anchor_a + world_axis_a * k_axis_length, debug::colors::k_joint);
+                if (j.type == dynamics::JointType::Hinge) {
+                    out.add_line(world_anchor_a - world_axis_a * k_axis_length,
+                                 world_anchor_a + world_axis_a * k_axis_length, debug::colors::k_joint);
+                    continue;
+                }
+                // ConeTwist: both twist axes from the anchor (their angle is the swing), plus
+                // the limit cone's rim around a's axis when the swing is limited.
+                glm::vec3 world_axis_b = glm::normalize(b.orientation * j.local_axis_b);
+                out.add_line(world_anchor_a, world_anchor_a + world_axis_a * k_axis_length, debug::colors::k_joint);
+                out.add_line(world_anchor_b, world_anchor_b + world_axis_b * k_axis_length, debug::colors::k_joint);
+                if (j.has_swing_limit()) {
+                    glm::vec3 p, q;
+                    util::orthonormal_basis(world_axis_a, p, q);
+                    const float limit = std::min(j.swing_limit, 1.55f);
+                    const float rim_r = std::sin(limit) * k_axis_length;
+                    const glm::vec3 rim_c = world_anchor_a + world_axis_a * (std::cos(limit) * k_axis_length);
+                    constexpr int k_segments = 12;
+                    for (int s = 0; s < k_segments; ++s) {
+                        float t0 = 6.2831853f * static_cast<float>(s) / k_segments;
+                        float t1 = 6.2831853f * static_cast<float>(s + 1) / k_segments;
+                        out.add_line(rim_c + (p * std::cos(t0) + q * std::sin(t0)) * rim_r,
+                                     rim_c + (p * std::cos(t1) + q * std::sin(t1)) * rim_r, debug::colors::k_joint);
+                    }
+                }
             }
         }
 
@@ -1010,6 +1160,11 @@ public:
                                             config_.max_linear_velocity);
             dynamics::update_world_inertia(b);
         });
+        if (!joints_.empty()) {
+            // Joint drift is corrected on the integrated poses -- see solve()'s note.
+            dynamics::solve_joints_post_integrate(bodies_, joints_, config_);
+            for_each_body([&](dynamics::BodyId, dynamics::Body& b) { dynamics::update_world_inertia(b); });
+        }
 
         in_step_ = false;
     }
@@ -1116,93 +1271,30 @@ private:
         return std::numeric_limits<float>::max();
     }
 
-    /**
-     * @brief Tests a single probe pose (as built by `probe_at(d, ...)`) against broadphase
-     *        candidates, via the SAME generic collision::generate_contacts() dispatcher
-     *        narrowphase_() itself uses -- not a bespoke overlap test, so box_cast()/
-     *        capsule_cast() get exactly the right pairwise math for whatever shape type the
-     *        candidate turns out to be, including a real contact normal, not an approximated
-     *        one. `id_a` is left invalid (the probe isn't a real body); `out.a` is never read.
-     *        Stops at the FIRST candidate found overlapping, same "any hit" semantics as
-     *        raycast_any() -- box_cast()/capsule_cast() only ever want the closest ALONG THE
-     *        SWEEP, which the caller (stepped_cast_ below) gets by shrinking `d`, not by this
-     *        function comparing multiple simultaneous candidates at one `d`.
-     */
-    template <typename ProbeAtFn>
-    bool test_probe_(ProbeAtFn&& probe_at, float d, uint32_t layer_mask, bool include_triggers,
-                      dynamics::BodyId& out_body, glm::vec3& out_normal) const {
-        collision::Shape probe;
-        glm::vec3 pos;
-        glm::quat rot;
-        probe_at(d, probe, pos, rot);
-        geometry::AABB bounds = collision::world_bounds(probe, pos, rot);
-
-        bool found = false;
-        auto visit = [&](void* user_data) {
-            if (found) return;
-            uint32_t i = user_data_to_index_(user_data);
-            if (!((layer_mask >> shapes_[i].layer) & 1u)) return;
-            if (!include_triggers && shapes_[i].is_trigger) return;
-            const dynamics::BodyId owner = shape_owner_[i];
-            const dynamics::Body& body = bodies_[owner.index];
-            collision::ContactManifold m;
-            if (collision::generate_contacts(dynamics::BodyId{}, probe, pos, rot,
-                                              owner, shapes_[i], body.position, body.orientation, m)) {
-                out_body = owner;
-                out_normal = -m.normal; // a(probe)->b(target); negate to point away from the target's surface
-                found = true;
-            }
-        };
-        dynamic_tree_.query(bounds, visit);
-        if (!found) static_tree_.query(bounds, visit);
-        return found;
+    /** @brief The query::QueryFilter equivalent of the original `(layer_mask, include_triggers)`
+     *         query parameters. */
+    static query::QueryFilter filter_(uint32_t layer_mask, bool include_triggers) {
+        query::QueryFilter filter;
+        filter.layer_mask = layer_mask;
+        filter.include_triggers = include_triggers;
+        return filter;
     }
 
     /**
-     * @brief Shared discretized-stepped-sweep implementation for box_cast()/capsule_cast() --
-     *        see either doc for the approximation this performs and why. Samples `probe_at(d,
-     *        Shape&, pos&, rot&)`'s pose at increasing `d` in steps derived from `min_extent`
-     *        (so it can't skip past a target thinner than the probe's own smallest dimension),
-     *        and on the first overlapping sample, binary-searches back toward the last known
-     *        clear sample to tighten the reported hit distance/point/normal.
+     * @brief Calls `fn(uint32_t shape_slot)` for every shape whose broadphase proxy (fat bounds)
+     *        overlaps world-space `bounds` and which `filter` accepts -- both trees, dynamic
+     *        first. The shared candidate pass behind the overlap queries, shape_cast() and
+     *        compute_penetration(); exact per-shape tests are the caller's.
      */
-    template <typename ProbeAtFn>
-    bool stepped_cast_(const glm::vec3& origin, const glm::vec3& dir, float max_distance, float min_extent,
-                        ProbeAtFn&& probe_at, uint32_t layer_mask, bool include_triggers,
-                        query::RaycastHit& hit) const {
-        if (max_distance <= 0.0f) return false;
-        float step = std::max(min_extent * 0.25f, 1e-3f);
-        int steps = std::max(1, static_cast<int>(std::ceil(max_distance / step)));
-        float actual_step = max_distance / static_cast<float>(steps);
-
-        float prev_d = 0.0f;
-        for (int i = 0; i <= steps; ++i) {
-            float d = (i == steps) ? max_distance : actual_step * static_cast<float>(i);
-            dynamics::BodyId body;
-            glm::vec3 normal;
-            if (test_probe_(probe_at, d, layer_mask, include_triggers, body, normal)) {
-                float lo = prev_d, hi = d;
-                for (int iter = 0; iter < 12 && hi - lo > 1e-4f; ++iter) {
-                    float mid = 0.5f * (lo + hi);
-                    dynamics::BodyId mid_body;
-                    glm::vec3 mid_normal;
-                    if (test_probe_(probe_at, mid, layer_mask, include_triggers, mid_body, mid_normal)) {
-                        hi = mid;
-                        body = mid_body;
-                        normal = mid_normal;
-                    } else {
-                        lo = mid;
-                    }
-                }
-                hit.point = origin + dir * hi;
-                hit.distance = hi;
-                hit.body = body;
-                hit.normal = normal;
-                return true;
-            }
-            prev_d = d;
-        }
-        return false;
+    template <typename Fn>
+    void query_aabb_(const geometry::AABB& bounds, const query::QueryFilter& filter, Fn&& fn) const {
+        auto visit = [&](void* user_data) {
+            uint32_t i = user_data_to_index_(user_data);
+            if (!filter.accepts(shapes_[i], shape_owner_[i])) return;
+            fn(i);
+        };
+        dynamic_tree_.query(bounds, visit);
+        static_tree_.query(bounds, visit);
     }
 
     /**
@@ -1370,6 +1462,7 @@ private:
                 if (!either_dynamic) continue;
                 if (!layer_matrix_.should_collide(shapes_[i].layer, shapes_[j].layer)) continue;
                 if (joint_blocks_collision_(id_i, id_j)) continue;
+                if (!ignored_pairs_.empty() && ignored_pairs_.count(pair_key_(id_i.index, id_j.index))) continue;
 
                 // CCD fast-pair gate: only bother with the (slightly pricier) speculative path
                 // when a body's OWN per-substep displacement exceeds its OWN smallest extent --
@@ -1405,9 +1498,34 @@ private:
         }
     }
 
-    /** @brief True if some valid HingeJoint connects `id_i`/`id_j` (either order) with
+    /** @brief Order-independent key for a body-index pair. */
+    static uint64_t pair_key_(uint32_t a, uint32_t b) {
+        const uint32_t lo = std::min(a, b), hi = std::max(a, b);
+        return (static_cast<uint64_t>(lo) << 32) | hi;
+    }
+
+    /** @brief Stores `j` (already fully filled in) in a free or new joint slot. */
+    dynamics::JointId insert_joint_(dynamics::Joint j) {
+        j.enabled = true;
+        j.valid = true;
+        uint32_t index;
+        if (!free_joint_indices_.empty()) {
+            index = free_joint_indices_.back();
+            free_joint_indices_.pop_back();
+            joints_[index] = j;
+        } else {
+            index = static_cast<uint32_t>(joints_.size());
+            joints_.push_back(j);
+            joint_generations_.push_back(0);
+            joint_alive_.push_back(false);
+        }
+        joint_alive_[index] = true;
+        return dynamics::JointId{index, joint_generations_[index]};
+    }
+
+    /** @brief True if some valid Joint connects `id_i`/`id_j` (either order) with
      *         `collide_connected == false` -- narrowphase_()'s cue to skip contact generation for
-     *         this pair entirely (see HingeJoint::collide_connected's own doc for why). A linear
+     *         this pair entirely (see Joint::collide_connected's own doc for why). A linear
      *         scan over joints_: v1's joint counts (a handful of doors per scene, not thousands)
      *         make an index unnecessary, matching this feature's "relatively simple" scope. */
     bool joint_blocks_collision_(dynamics::BodyId id_i, dynamics::BodyId id_j) const {
@@ -1705,7 +1823,9 @@ private:
      *         free_indices_ above, just for joints instead of bodies (see add_hinge_joint()'s
      *         doc). Joints have no 1:1 relationship with bodies_, so they get their own
      *         lifecycle, like shapes_. */
-    std::vector<dynamics::HingeJoint> joints_;
+    std::vector<dynamics::Joint> joints_;
+    /** @brief Body-index pairs set_pair_collision() turned off (pair_key_()). */
+    std::unordered_set<uint64_t> ignored_pairs_;
     std::vector<uint32_t> joint_generations_;
     std::vector<bool> joint_alive_;
     std::vector<uint32_t> free_joint_indices_;

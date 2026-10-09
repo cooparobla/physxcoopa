@@ -7,9 +7,7 @@
 #ifndef PHYSXCOOPA_COMPONENTS_HINGE_JOINT_H
 #define PHYSXCOOPA_COMPONENTS_HINGE_JOINT_H
 
-#include <physxcoopa/dynamics/joint.h>
-
-#include <coopa/scene/component.h>
+#include <physxcoopa/components/joint_component.h>
 
 #include <glm/glm.hpp>
 
@@ -40,17 +38,12 @@ namespace components {
  * follows -- a bare Rigidbody/Transform with no Collider isn't reachable from scene authoring
  * today, see RigidbodyComponent's own file doc for the identical existing limitation).
  */
-class HingeJointComponent : public coopa::scene::Component {
+class HingeJointComponent : public JointComponent {
 public:
     std::string type_name() const override { return "HingeJoint"; }
 
-    /** @brief Name of the other SceneObject this hinge connects to (Scene::find_object(),
-     *         resolved once at bind time). Empty means this component stays inert -- no joint
-     *         is ever created. */
-    std::string connected_object;
+    // connected_object, anchor and enable_collision: see JointComponent.
 
-    /** @brief Hinge anchor, in this component's own object's local frame. */
-    glm::vec3 anchor{0.0f};
     /** @brief Hinge axis, in this component's own object's local frame. Need not be unit
      *         length as authored -- normalized at bind time. */
     glm::vec3 axis{0.0f, 0.0f, 1.0f};
@@ -62,13 +55,6 @@ public:
     bool use_limits = false;
     float min_angle_deg = 0.0f;
     float max_angle_deg = 0.0f;
-
-    /** @brief Set only by PhysicsSystem's reconcile pass, once the joint is actually created. */
-    void set_joint_id(dynamics::JointId id) { joint_id_ = id; }
-    dynamics::JointId joint_id() const { return joint_id_; }
-
-private:
-    dynamics::JointId joint_id_;
 };
 
 } // namespace components

@@ -2,9 +2,10 @@
  * @file queries.h
  * @brief Scene queries: raycasts, casts, and overlap tests against everything currently in a
  *        PhysicsWorld. PhysicsWorld exposes the actual public API (raycast/raycast_all/
- *        sphere_cast/overlap_sphere/overlap_box); this file holds the shape-dispatch helpers
- *        those methods are built from, kept separate so world.h's own body isn't a wall of
- *        per-shape-type raycast/overlap code.
+ *        shape_cast/sphere_cast/overlap_sphere/overlap_box/compute_penetration); this file holds
+ *        the result/filter types and the raycast/overlap shape-dispatch helpers those methods
+ *        are built from (query/sweep.h holds the cast and penetration math), kept separate so
+ *        world.h's own body isn't a wall of per-shape-type code.
  *
  * PhysicsWorld has no dependency on coopa::scene (see world.h's file doc), so `RaycastHit`
  * carries a `BodyId`, not a `SceneObject*` -- gameplay code resolves a hit's owning
@@ -31,6 +32,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <vector>
 
 namespace coopa {
@@ -51,6 +53,57 @@ struct RaycastHit {
      *         body (more than one shape), this is what lets a caller resolve the exact CHILD
      *         collider touched, not just the body -- see PhysicsSystem::collider_for_shape_(). */
     uint32_t shape_index = 0xFFFFFFFFu;
+    /** @brief Shape casts only: the cast shape already overlapped this target at its start
+     *         pose (by more than query::k_sweep_tolerance) and the cast direction leads further
+     *         in -- `distance` is then 0 and `normal` is the direction that would separate them.
+     *         Always false for raycasts. See query/sweep.h's file doc for initial-overlap rules. */
+    bool started_inside = false;
+};
+
+/**
+ * @struct QueryFilter
+ * @brief Which shapes a PhysicsWorld query may report. Every query has an overload taking one;
+ *        the older `(layer_mask, include_triggers)` parameter pairs are shorthand for a filter
+ *        with just those two fields set.
+ *
+ * - `layer_mask`: bit `shape.layer` must be set (Unity's convention -- see PhysicsWorld's
+ *   query-section comment).
+ * - `include_triggers`: false skips trigger shapes.
+ * - `ignore`: one body to skip entirely, every shape of it -- the "don't hit myself" case
+ *   (a character's own capsule, the object a camera follows). Invalid (default) skips nothing.
+ * - `predicate`: optional final say, called per candidate shape's owning body after the checks
+ *   above; return false to skip it (e.g. a ragdoll skipping all of its own bones). Runs inside
+ *   the query, so it must not mutate the world.
+ */
+struct QueryFilter {
+    uint32_t layer_mask = ~0u;
+    bool include_triggers = true;
+    dynamics::BodyId ignore;
+    std::function<bool(dynamics::BodyId)> predicate;
+
+    /** @brief True if a shape with this `shape`'s layer/trigger flags, owned by `owner`, passes. */
+    bool accepts(const collision::Shape& shape, dynamics::BodyId owner) const {
+        if (!((layer_mask >> shape.layer) & 1u)) return false;
+        if (!include_triggers && shape.is_trigger) return false;
+        if (ignore.is_valid() && owner == ignore) return false;
+        if (predicate && !predicate(owner)) return false;
+        return true;
+    }
+};
+
+/**
+ * @struct Penetration
+ * @brief One overlap found by PhysicsWorld::compute_penetration(): moving the query shape by
+ *        `normal * depth` separates it from this target (`normal` is unit, pointing from the
+ *        target toward the query shape). A mesh target can produce several -- one per distinct
+ *        surface direction touched (a floor and a wall of the same mesh are two entries).
+ */
+struct Penetration {
+    glm::vec3 normal{0.0f, 0.0f, 1.0f};
+    float depth = 0.0f;
+    glm::vec3 point{0.0f};      ///< A representative contact point on the target.
+    dynamics::BodyId body;
+    uint32_t shape_index = 0xFFFFFFFFu; ///< Which of `body`'s shape slots (see RaycastHit::shape_index).
 };
 
 /**

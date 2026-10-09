@@ -19,6 +19,8 @@
 #include <physxcoopa/components/rigidbody.h>
 #include <physxcoopa/components/cloth.h>
 #include <physxcoopa/components/hinge_joint.h>
+#include <physxcoopa/components/ball_joint.h>
+#include <physxcoopa/components/cone_twist_joint.h>
 #include <physxcoopa/query/queries.h>
 #include <physxcoopa/geometry/ray.h>
 
@@ -33,7 +35,9 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -65,11 +69,12 @@ public:
     void on_attach(coopa::scene::Scene&) override { dirty_ = true; }
 
     void execute(coopa::scene::Scene& scene, const coopa::scene::FrameContext& ctx) override {
+        const auto start = std::chrono::steady_clock::now();
         world_.set_job_engine(ctx.jobs); // cheap pointer assignment; keeps the world in sync
                                           // even if the scene's JobEngine changes at runtime.
         if (dirty_) {
             regather_(scene);
-            regather_joints_(scene); // after regather_() -- every HingeJointComponent needs
+            regather_joints_(scene); // after regather_() -- every JointComponent needs
                                       // BOTH connected objects already bound to a body.
             regather_cloths_(scene);  // likewise: a ClothComponent's anchors name objects whose
                                       // Rigidbody must already be bound.
@@ -82,7 +87,13 @@ public:
         world_.step(ctx.delta_time);
         write_transforms_back_();
         dispatch_events_();
+        last_step_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
+
+    /** @brief Main-thread milliseconds the last execute() took, from regather to event
+     *         dispatch (the step itself, transform sync both ways, events) -- for diagnostics
+     *         such as the debug overlay. */
+    double last_step_ms() const { return last_step_ms_; }
 
     /**
      * @brief Re-gathers the Collider list on the next execute() call. Call after
@@ -154,6 +165,22 @@ private:
          *         update_changed_shapes_() for a compound body (see that function's doc) -- only by a full regather_()
          *         rebuild. */
         glm::vec3 center_offset{0.0f};
+        /** @brief Meaningful only when `is_primary`: index (into bindings_) of the primary binding
+         *         whose sync_owner is the NEAREST strict ancestor of this one's sync_owner, or -1
+         *         -- the body hierarchy a ragdoll's bones form (see write_transforms_back_()).
+         *         Rebuilt by link_body_hierarchy_() whenever bindings_ is. */
+        int32_t body_parent = -1;
+    };
+
+    /** @brief write_transforms_back_()'s per-binding scratch (see its doc). */
+    struct WriteBack {
+        bool active = false;
+        glm::vec3 pivot{0.0f};
+        glm::vec3 center{0.0f};
+        glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+        glm::mat4 old_world{1.0f};        ///< sync_owner's world matrix before this write-back.
+        glm::mat4 new_world{1.0f};        ///< ...and after it (old scale kept).
+        glm::mat4 parent_old_world{1.0f}; ///< sync_owner's parent's world matrix before it.
     };
 
     /** @brief Runs `body(begin, end, JobContext)` over `[0, bindings_.size())`, dispatched onto
@@ -264,18 +291,38 @@ private:
         }
 
         bindings_ = std::move(new_bindings);
+        link_body_hierarchy_();
+    }
+
+    /** @brief Fills every primary binding's Binding::body_parent from the scene hierarchy. */
+    void link_body_hierarchy_() {
+        std::unordered_map<const coopa::scene::SceneObject*, int32_t> primary_by_owner;
+        primary_by_owner.reserve(bindings_.size());
+        for (std::size_t k = 0; k < bindings_.size(); ++k) {
+            if (bindings_[k].is_primary && bindings_[k].sync_owner) {
+                primary_by_owner.emplace(bindings_[k].sync_owner, static_cast<int32_t>(k));
+            }
+        }
+        for (Binding& b : bindings_) {
+            b.body_parent = -1;
+            if (!b.is_primary || !b.sync_owner) continue;
+            for (const coopa::scene::SceneObject* p = b.sync_owner->parent(); p; p = p->parent()) {
+                auto it = primary_by_owner.find(p);
+                if (it != primary_by_owner.end()) { b.body_parent = it->second; break; }
+            }
+        }
     }
 
     /**
-     * @brief Diffs the scene's HingeJointComponent set against joint_bindings_ (identity-diffed
+     * @brief Diffs the scene's JointComponent (Hinge/Ball/ConeTwist) set against joint_bindings_ (identity-diffed
      *        by Component*, same spirit as regather_()'s Collider diffing) and creates/destroys
-     *        dynamics::HingeJoint entries to match. Runs AFTER regather_() so every
-     *        HingeJointComponent's own object and its `connected_object` are both guaranteed
+     *        dynamics::Joint entries to match. Runs AFTER regather_() so every
+     *        JointComponent's own object and its `connected_object` are both guaranteed
      *        already bound to a body, if they're bindable at all this frame.
      *
-     * A HingeJointComponent whose own object or `connected_object` has no bound Collider yet
+     * A JointComponent whose own object or `connected_object` has no bound Collider yet
      * (or `connected_object` doesn't resolve to a live SceneObject at all) is silently skipped,
-     * not an error -- create_hinge_joint_for_() returns an invalid JointId in that case, which
+     * not an error -- create_joint_for_() returns an invalid JointId in that case, which
      * is stored as-is; it simply stays inert until the next refresh() finds both sides bound.
      * A joint whose CONNECTED body is destroyed later (without this component itself being
      * removed) is left similarly inert -- PhysicsWorld::remove_body() already marks the
@@ -284,10 +331,10 @@ private:
      * added bookkeeping for what should be a rare scene-editing edge case.
      */
     void regather_joints_(coopa::scene::Scene& scene) {
-        std::vector<components::HingeJointComponent*> current = scene.get_components<components::HingeJointComponent>();
-        std::unordered_set<components::HingeJointComponent*> current_set(current.begin(), current.end());
+        std::vector<components::JointComponent*> current = scene.get_components<components::JointComponent>();
+        std::unordered_set<components::JointComponent*> current_set(current.begin(), current.end());
 
-        std::unordered_map<components::HingeJointComponent*, dynamics::JointId> old_by_component;
+        std::unordered_map<components::JointComponent*, dynamics::JointId> old_by_component;
         old_by_component.reserve(joint_bindings_.size());
         for (const auto& kv : joint_bindings_) old_by_component.emplace(kv.first, kv.second);
 
@@ -296,15 +343,15 @@ private:
             world_.remove_joint(kv.second);
         }
 
-        std::vector<std::pair<components::HingeJointComponent*, dynamics::JointId>> new_bindings;
+        std::vector<std::pair<components::JointComponent*, dynamics::JointId>> new_bindings;
         new_bindings.reserve(current.size());
-        for (components::HingeJointComponent* jc : current) {
+        for (components::JointComponent* jc : current) {
             auto it = old_by_component.find(jc);
             if (it != old_by_component.end()) {
                 new_bindings.push_back(*it); // already bound -- creation-time-only, see the class doc
                 continue;
             }
-            dynamics::JointId id = create_hinge_joint_for_(jc, scene);
+            dynamics::JointId id = create_joint_for_(jc, scene);
             jc->set_joint_id(id);
             new_bindings.emplace_back(jc, id);
         }
@@ -319,7 +366,7 @@ private:
      *        JointId (world_.add_hinge_joint() itself already no-ops safely on an invalid body)
      *        if anything isn't resolvable yet.
      */
-    dynamics::JointId create_hinge_joint_for_(components::HingeJointComponent* jc, coopa::scene::Scene& scene) {
+    dynamics::JointId create_joint_for_(components::JointComponent* jc, coopa::scene::Scene& scene) {
         if (jc->connected_object.empty()) return dynamics::JointId{};
         coopa::scene::SceneObject* owner = jc->owner;
         coopa::scene::SceneObject* connected = scene.find_object(jc->connected_object);
@@ -354,12 +401,9 @@ private:
         // body's OWN stored position/orientation, not re-derived from owner_trs/connected_trs.
         glm::vec3 owner_local_anchor_from_pivot = jc->anchor * owner_trs.scale;
         glm::vec3 world_anchor = owner_trs.position + owner_trs.rotation * owner_local_anchor_from_pivot;
-        glm::vec3 world_axis = glm::normalize(owner_trs.rotation * jc->axis);
-
         glm::vec3 owner_local_anchor = glm::inverse(owner_phys->orientation) * (world_anchor - owner_phys->position);
         glm::vec3 connected_local_anchor =
             glm::inverse(connected_phys->orientation) * (world_anchor - connected_phys->position);
-        glm::vec3 connected_local_axis = glm::inverse(connected_phys->orientation) * world_axis;
 
         // hinge_current_angle() (and thus the limit constraint) measures body b's rotation
         // relative to body a, about a's local axis -- so the CONNECTED object (the static/
@@ -368,9 +412,27 @@ private:
         // angle runs backwards relative to what min_angle_deg/max_angle_deg authors expect, and
         // an asymmetric limit range (e.g. [0, 90]) clamps the hinge rigid at the very first
         // instant of motion instead of letting it swing open.
-        return world_.add_hinge_joint(connected_body, owner_body, connected_local_anchor, owner_local_anchor,
-                                       connected_local_axis, jc->axis, jc->use_limits, glm::radians(jc->min_angle_deg),
-                                       glm::radians(jc->max_angle_deg));
+        const bool collide = jc->enable_collision;
+        if (auto* hinge = dynamic_cast<components::HingeJointComponent*>(jc)) {
+            glm::vec3 world_axis = glm::normalize(owner_trs.rotation * hinge->axis);
+            glm::vec3 connected_local_axis = glm::inverse(connected_phys->orientation) * world_axis;
+            glm::vec3 owner_local_axis = glm::inverse(owner_phys->orientation) * world_axis;
+            return world_.add_hinge_joint(connected_body, owner_body, connected_local_anchor, owner_local_anchor,
+                                           connected_local_axis, owner_local_axis, hinge->use_limits,
+                                           glm::radians(hinge->min_angle_deg), glm::radians(hinge->max_angle_deg),
+                                           collide);
+        }
+        if (auto* cone = dynamic_cast<components::ConeTwistJointComponent*>(jc)) {
+            // The twist axis is authored on the owner (the limb); add_cone_twist_joint() takes it
+            // in body a's (the connected side's) frame and derives b's from the current pose.
+            glm::vec3 world_axis = glm::normalize(owner_trs.rotation * cone->axis);
+            glm::vec3 connected_local_axis = glm::inverse(connected_phys->orientation) * world_axis;
+            return world_.add_cone_twist_joint(connected_body, owner_body, connected_local_anchor, owner_local_anchor,
+                                                connected_local_axis, glm::radians(cone->swing_limit_deg),
+                                                glm::radians(cone->twist_min_deg), glm::radians(cone->twist_max_deg),
+                                                collide);
+        }
+        return world_.add_ball_joint(connected_body, owner_body, connected_local_anchor, owner_local_anchor, collide);
     }
 
     /**
@@ -869,19 +931,35 @@ private:
     /**
      * @brief Writes each dynamic body's interpolated (or raw, per Body::interpolation)
      *        transform back, and records exactly what was written for next frame's
-     *        teleport-detection comparison. Job-parallel -- set_world_trs() may read a
-     *        parented transform's PARENT chain (to convert world->local), but prime_transforms_()
-     *        already walked (and thus cleaned) every bound transform's full ancestor chain this
-     *        frame, so every such read here is a pure, already-clean read -- see
-     *        prime_transforms_()'s doc. Same one-Transform-per-binding caveat as
-     *        sync_transforms_in_() applies to the WRITE side too. Skips every non-primary
-     *        binding, same reasoning as sync_transforms_in_()'s own doc.
+     *        teleport-detection comparison. Skips every non-primary binding, same reasoning as
+     *        sync_transforms_in_()'s own doc.
+     *
+     * A dynamic body can sit UNDER another dynamic body in the scene hierarchy (a ragdoll: every
+     * bone has its own body, and bones are children of bones). The Transform stores a LOCAL pose,
+     * so writing the child's world pose means knowing its parent's world matrix -- AFTER this very
+     * pass has moved the parent. Reading that lazily through parent->get_world_matrix() would be
+     * order-dependent (a child written before its parent lands relative to the stale parent, and
+     * next frame's teleport check then snaps the body back) and, on the job-parallel path, a race
+     * on the parent's cached matrix. So this runs in two passes:
+     *
+     *   1. Read-only: each dynamic primary binding's target world pose, its owner's current world
+     *      matrix and its parent's (all clean -- see prime_transforms_()). Nothing is written.
+     *   2. Write: each binding's NEW parent world matrix is derived from its nearest dynamic
+     *      body ancestor's pass-1 result (`ancestor_new * inverse(ancestor_old) * parent_old` --
+     *      exact, and it covers non-body objects between the two), never from a lazily evaluated
+     *      matrix, so the local pose it writes is correct in any order. Each iteration writes only
+     *      its own Transform (a write's dirty propagation to children is atomic flag stores), so
+     *      both passes are race-free on the job-parallel path.
      */
     void write_transforms_back_() {
         float alpha = world_.interpolation_alpha();
+        if (writeback_.size() != bindings_.size()) writeback_.resize(bindings_.size());
+
         for_range_([&](std::size_t begin, std::size_t end, const coopa::job::JobContext&) {
             for (std::size_t k = begin; k < end; ++k) {
                 Binding& b = bindings_[k];
+                WriteBack& w = writeback_[k];
+                w.active = false;
                 if (!b.is_primary) continue;
                 dynamics::Body* body = world_.get_body(b.body);
                 if (!body || body->type != dynamics::BodyType::Dynamic) continue;
@@ -901,12 +979,54 @@ private:
                 // inverse of the offset applied in sync_transforms_in_(). last_written_position
                 // stays in true-center space so next frame's teleport-detection comparison in
                 // sync_transforms_in_() lines up with the true_center it computes there.
-                glm::vec3 pivot_pos = center_pos - rot * b.center_offset;
+                w.active = true;
+                w.center = center_pos;
+                w.rotation = rot;
+                w.pivot = center_pos - rot * b.center_offset;
 
+                const coopa::util::Transform& transform = b.sync_owner->get_transform()->transform();
+                w.old_world = transform.get_world_matrix();
+                const glm::vec3 scale(glm::length(glm::vec3(w.old_world[0])), glm::length(glm::vec3(w.old_world[1])),
+                                      glm::length(glm::vec3(w.old_world[2])));
+                w.new_world = glm::translate(glm::mat4(1.0f), w.pivot) * glm::mat4_cast(rot) *
+                              glm::scale(glm::mat4(1.0f), scale);
+                const coopa::util::Transform* parent = transform.parent();
+                w.parent_old_world = parent ? parent->get_world_matrix() : glm::mat4(1.0f);
+            }
+        });
+
+        for_range_([&](std::size_t begin, std::size_t end, const coopa::job::JobContext&) {
+            for (std::size_t k = begin; k < end; ++k) {
+                const WriteBack& w = writeback_[k];
+                if (!w.active) continue;
+                Binding& b = bindings_[k];
                 coopa::util::Transform& transform = b.sync_owner->get_transform()->transform();
-                util::set_world_trs(transform, pivot_pos, rot);
-                body->last_written_position = center_pos;
-                body->last_written_orientation = rot;
+
+                int32_t anc = b.body_parent;
+                while (anc >= 0 && !writeback_[anc].active) anc = bindings_[anc].body_parent;
+
+                if (!transform.parent()) {
+                    transform.set_position(w.pivot);
+                    transform.set_rotation_quat(w.rotation);
+                } else {
+                    glm::mat4 parent_world = w.parent_old_world;
+                    if (anc >= 0) {
+                        const WriteBack& a = writeback_[anc];
+                        parent_world = a.new_world * glm::inverse(a.old_world) * w.parent_old_world;
+                    }
+                    const glm::mat4 local = glm::inverse(parent_world) *
+                                            (glm::translate(glm::mat4(1.0f), w.pivot) * glm::mat4_cast(w.rotation));
+                    glm::vec3 local_position, local_scale, skew;
+                    glm::quat local_rotation;
+                    glm::vec4 perspective;
+                    glm::decompose(local, local_scale, local_rotation, local_position, skew, perspective);
+                    transform.set_position(local_position);
+                    transform.set_rotation_quat(local_rotation);
+                }
+
+                dynamics::Body* body = world_.get_body(b.body);
+                body->last_written_position = w.center;
+                body->last_written_orientation = w.rotation;
             }
         });
     }
@@ -1048,92 +1168,174 @@ public:
         components::Collider* collider = nullptr;
         coopa::scene::SceneObject* object = nullptr;
         components::RigidbodyComponent* rigidbody = nullptr;
+        bool started_inside = false; ///< Casts only -- see query::RaycastHit::started_inside.
     };
 
-    bool raycast(const geometry::Ray& ray, RaycastHit& hit, uint32_t layer_mask = ~0u,
-                 bool include_triggers = true) const {
+    /**
+     * @brief Scene-level query filter: query::QueryFilter's layer mask and trigger switch, plus
+     *        "don't hit this" in scene terms. `ignore_collider` skips the BODY that collider is
+     *        bound to -- for a child collider of a compound Rigidbody that is the whole
+     *        rigidbody, every child included. `ignore_rigidbody` skips that rigidbody's body.
+     *        `predicate`, if set, gets the candidate body's PRIMARY Collider (collider_for()) and
+     *        returns false to skip it; bodies with no bound Collider pass untested.
+     */
+    struct QueryFilter {
+        uint32_t layer_mask = ~0u;
+        bool include_triggers = true;
+        const components::Collider* ignore_collider = nullptr;
+        const components::RigidbodyComponent* ignore_rigidbody = nullptr;
+        std::function<bool(const components::Collider&)> predicate;
+    };
+
+    /** @brief One overlap from compute_penetration() -- see query::Penetration; `collider` is the
+     *         exact Collider whose shape is penetrated. */
+    struct Penetration {
+        glm::vec3 normal{0.0f, 0.0f, 1.0f};
+        float depth = 0.0f;
+        glm::vec3 point{0.0f};
+        components::Collider* collider = nullptr;
+    };
+
+    bool raycast(const geometry::Ray& ray, RaycastHit& hit, const QueryFilter& filter) const {
         query::RaycastHit raw;
-        if (!world_.raycast(ray, raw, layer_mask, include_triggers)) return false;
+        if (!world_.raycast(ray, raw, world_filter_(filter))) return false;
         fill_hit_(raw, hit);
         return true;
+    }
+    bool raycast(const geometry::Ray& ray, RaycastHit& hit, uint32_t layer_mask = ~0u,
+                 bool include_triggers = true) const {
+        return raycast(ray, hit, scene_filter_(layer_mask, include_triggers));
     }
 
     /** @brief True if anything along `ray` is hit -- see PhysicsWorld::raycast_any()'s doc:
      *         first tree-traversal hit, not necessarily the closest. No Collider resolution
      *         (unlike every other query here) since the caller only asked whether, not what. */
+    bool raycast_any(const geometry::Ray& ray, const QueryFilter& filter) const {
+        return world_.raycast_any(ray, world_filter_(filter));
+    }
     bool raycast_any(const geometry::Ray& ray, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
         return world_.raycast_any(ray, layer_mask, include_triggers);
     }
 
-    std::vector<RaycastHit> raycast_all(const geometry::Ray& ray, uint32_t layer_mask = ~0u,
-                                         bool include_triggers = true) const {
+    std::vector<RaycastHit> raycast_all(const geometry::Ray& ray, const QueryFilter& filter) const {
         std::vector<RaycastHit> out;
-        for (const auto& raw : world_.raycast_all(ray, layer_mask, include_triggers)) {
+        for (const auto& raw : world_.raycast_all(ray, world_filter_(filter))) {
             RaycastHit hit;
             fill_hit_(raw, hit);
             out.push_back(hit);
         }
         return out;
     }
+    std::vector<RaycastHit> raycast_all(const geometry::Ray& ray, uint32_t layer_mask = ~0u,
+                                         bool include_triggers = true) const {
+        return raycast_all(ray, scene_filter_(layer_mask, include_triggers));
+    }
 
-    bool sphere_cast(const glm::vec3& origin, float radius, const glm::vec3& dir, float max_distance,
-                      RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+    /** @brief See PhysicsWorld::shape_cast() -- exact sweep of a convex shape, first hit only. */
+    bool shape_cast(const collision::Shape& shape, const glm::vec3& pos, const glm::quat& rot, const glm::vec3& dir,
+                    float max_distance, RaycastHit& hit, const QueryFilter& filter) const {
         query::RaycastHit raw;
-        if (!world_.sphere_cast(origin, radius, dir, max_distance, raw, layer_mask, include_triggers)) return false;
+        if (!world_.shape_cast(shape, pos, rot, dir, max_distance, raw, world_filter_(filter))) return false;
         fill_hit_(raw, hit);
         return true;
     }
+    // (No `= {}` defaults for the nested QueryFilter inside its own class -- separate overloads.)
+    bool shape_cast(const collision::Shape& shape, const glm::vec3& pos, const glm::quat& rot, const glm::vec3& dir,
+                    float max_distance, RaycastHit& hit) const {
+        return shape_cast(shape, pos, rot, dir, max_distance, hit, QueryFilter{});
+    }
 
-    /** @brief See PhysicsWorld::box_cast()'s doc for the discretized-stepped-sweep approximation. */
+    bool sphere_cast(const glm::vec3& origin, float radius, const glm::vec3& dir, float max_distance,
+                      RaycastHit& hit, const QueryFilter& filter) const {
+        query::RaycastHit raw;
+        if (!world_.sphere_cast(origin, radius, dir, max_distance, raw, world_filter_(filter))) return false;
+        fill_hit_(raw, hit);
+        return true;
+    }
+    bool sphere_cast(const glm::vec3& origin, float radius, const glm::vec3& dir, float max_distance,
+                      RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        return sphere_cast(origin, radius, dir, max_distance, hit, scene_filter_(layer_mask, include_triggers));
+    }
+
+    bool box_cast(const glm::vec3& origin, const glm::vec3& half_extents, const glm::quat& orientation,
+                  const glm::vec3& dir, float max_distance, RaycastHit& hit, const QueryFilter& filter) const {
+        query::RaycastHit raw;
+        if (!world_.box_cast(origin, half_extents, orientation, dir, max_distance, raw, world_filter_(filter)))
+            return false;
+        fill_hit_(raw, hit);
+        return true;
+    }
     bool box_cast(const glm::vec3& origin, const glm::vec3& half_extents, const glm::quat& orientation,
                   const glm::vec3& dir, float max_distance, RaycastHit& hit,
                   uint32_t layer_mask = ~0u, bool include_triggers = true) const {
+        return box_cast(origin, half_extents, orientation, dir, max_distance, hit,
+                        scene_filter_(layer_mask, include_triggers));
+    }
+
+    bool capsule_cast(const glm::vec3& origin, float radius, float half_height, int direction_axis,
+                       const glm::quat& orientation, const glm::vec3& dir, float max_distance,
+                       RaycastHit& hit, const QueryFilter& filter) const {
         query::RaycastHit raw;
-        if (!world_.box_cast(origin, half_extents, orientation, dir, max_distance, raw, layer_mask, include_triggers))
+        if (!world_.capsule_cast(origin, radius, half_height, direction_axis, orientation, dir, max_distance,
+                                  raw, world_filter_(filter)))
             return false;
         fill_hit_(raw, hit);
         return true;
     }
-
-    /** @brief See PhysicsWorld::capsule_cast()'s doc for the discretized-stepped-sweep approximation. */
     bool capsule_cast(const glm::vec3& origin, float radius, float half_height, int direction_axis,
                        const glm::quat& orientation, const glm::vec3& dir, float max_distance,
                        RaycastHit& hit, uint32_t layer_mask = ~0u, bool include_triggers = true) const {
-        query::RaycastHit raw;
-        if (!world_.capsule_cast(origin, radius, half_height, direction_axis, orientation, dir, max_distance,
-                                  raw, layer_mask, include_triggers))
-            return false;
-        fill_hit_(raw, hit);
-        return true;
+        return capsule_cast(origin, radius, half_height, direction_axis, orientation, dir, max_distance, hit,
+                            scene_filter_(layer_mask, include_triggers));
+    }
+
+    /** @brief See PhysicsWorld::compute_penetration() -- every overlap of a convex shape, as
+     *         minimum-translation vectors, resolved to the exact Collider penetrated. */
+    std::vector<Penetration> compute_penetration(const collision::Shape& shape, const glm::vec3& pos,
+                                                 const glm::quat& rot, const QueryFilter& filter) const {
+        std::vector<Penetration> out;
+        for (const query::Penetration& raw : world_.compute_penetration(shape, pos, rot, world_filter_(filter))) {
+            Penetration p;
+            p.normal = raw.normal;
+            p.depth = raw.depth;
+            p.point = raw.point;
+            p.collider = collider_for_shape_(raw.shape_index);
+            if (!p.collider) p.collider = collider_for(raw.body);
+            out.push_back(p);
+        }
+        return out;
+    }
+    std::vector<Penetration> compute_penetration(const collision::Shape& shape, const glm::vec3& pos,
+                                                 const glm::quat& rot) const {
+        return compute_penetration(shape, pos, rot, QueryFilter{});
     }
 
     std::vector<components::Collider*> overlap_sphere(const glm::vec3& center, float radius,
+                                                        const QueryFilter& filter) const {
+        return colliders_for_(world_.overlap_sphere(center, radius, world_filter_(filter)));
+    }
+    std::vector<components::Collider*> overlap_sphere(const glm::vec3& center, float radius,
                                                         uint32_t layer_mask = ~0u,
                                                         bool include_triggers = true) const {
-        std::vector<components::Collider*> out;
-        for (dynamics::BodyId id : world_.overlap_sphere(center, radius, layer_mask, include_triggers)) {
-            if (components::Collider* c = collider_for(id)) out.push_back(c);
-        }
-        return out;
+        return colliders_for_(world_.overlap_sphere(center, radius, layer_mask, include_triggers));
     }
 
+    std::vector<components::Collider*> overlap_box(const geometry::OBB& box, const QueryFilter& filter) const {
+        return colliders_for_(world_.overlap_box(box, world_filter_(filter)));
+    }
     std::vector<components::Collider*> overlap_box(const geometry::OBB& box, uint32_t layer_mask = ~0u,
                                                      bool include_triggers = true) const {
-        std::vector<components::Collider*> out;
-        for (dynamics::BodyId id : world_.overlap_box(box, layer_mask, include_triggers)) {
-            if (components::Collider* c = collider_for(id)) out.push_back(c);
-        }
-        return out;
+        return colliders_for_(world_.overlap_box(box, layer_mask, include_triggers));
     }
 
     std::vector<components::Collider*> overlap_capsule(const geometry::Capsule& capsule,
+                                                         const QueryFilter& filter) const {
+        return colliders_for_(world_.overlap_capsule(capsule, world_filter_(filter)));
+    }
+    std::vector<components::Collider*> overlap_capsule(const geometry::Capsule& capsule,
                                                          uint32_t layer_mask = ~0u,
                                                          bool include_triggers = true) const {
-        std::vector<components::Collider*> out;
-        for (dynamics::BodyId id : world_.overlap_capsule(capsule, layer_mask, include_triggers)) {
-            if (components::Collider* c = collider_for(id)) out.push_back(c);
-        }
-        return out;
+        return colliders_for_(world_.overlap_capsule(capsule, layer_mask, include_triggers));
     }
 
     /** @brief The PRIMARY Collider bound to `id`, or nullptr if `id` doesn't address a bound
@@ -1157,7 +1359,44 @@ private:
         return it != collider_by_shape_index_.end() ? it->second : nullptr;
     }
 
+    static QueryFilter scene_filter_(uint32_t layer_mask, bool include_triggers) {
+        QueryFilter filter;
+        filter.layer_mask = layer_mask;
+        filter.include_triggers = include_triggers;
+        return filter;
+    }
+
+    /** @brief Lowers a scene QueryFilter to the world's: both ignores become body ids (folded
+     *         into the predicate when both are set), the Collider predicate a BodyId one. */
+    query::QueryFilter world_filter_(const QueryFilter& filter) const {
+        query::QueryFilter out;
+        out.layer_mask = filter.layer_mask;
+        out.include_triggers = filter.include_triggers;
+        dynamics::BodyId ignore_a = filter.ignore_collider ? filter.ignore_collider->body_id() : dynamics::BodyId{};
+        dynamics::BodyId ignore_b = filter.ignore_rigidbody ? filter.ignore_rigidbody->body_id() : dynamics::BodyId{};
+        out.ignore = ignore_a.is_valid() ? ignore_a : ignore_b;
+        const bool second_ignore = ignore_a.is_valid() && ignore_b.is_valid() && ignore_a != ignore_b;
+        if (filter.predicate || second_ignore) {
+            out.predicate = [this, predicate = filter.predicate, second_ignore, ignore_b](dynamics::BodyId id) {
+                if (second_ignore && id == ignore_b) return false;
+                if (!predicate) return true;
+                const components::Collider* c = collider_for(id);
+                return !c || predicate(*c);
+            };
+        }
+        return out;
+    }
+
+    std::vector<components::Collider*> colliders_for_(const std::vector<dynamics::BodyId>& ids) const {
+        std::vector<components::Collider*> out;
+        for (dynamics::BodyId id : ids) {
+            if (components::Collider* c = collider_for(id)) out.push_back(c);
+        }
+        return out;
+    }
+
     void fill_hit_(const query::RaycastHit& raw, RaycastHit& out) const {
+        out.started_inside = raw.started_inside;
         out.point = raw.point;
         out.normal = raw.normal;
         out.distance = raw.distance;
@@ -1173,16 +1412,18 @@ private:
     std::unordered_map<uint32_t, components::Collider*> collider_by_index_;
     /** @brief Shape slot index -> the exact Collider owning it (collider_for_shape_()'s doc). */
     std::unordered_map<uint32_t, components::Collider*> collider_by_shape_index_;
-    /** @brief HingeJointComponent* -> the dynamics::HingeJoint it's currently bound to (see
+    /** @brief JointComponent* -> the dynamics::Joint it's currently bound to (see
      *         regather_joints_()'s doc); a flat vector, not a map, since it only ever needs
      *         full-scan diffing (same identity-diff pattern as bindings_'s own Collider set),
      *         never random lookup by component. */
-    std::vector<std::pair<components::HingeJointComponent*, dynamics::JointId>> joint_bindings_;
+    std::vector<std::pair<components::JointComponent*, dynamics::JointId>> joint_bindings_;
     /** @brief ClothComponent* -> the cloth::Cloth it's currently bound to; same flat-vector
      *         identity-diff shape as joint_bindings_ above, for the same reason. */
     std::vector<std::pair<components::ClothComponent*, cloth::ClothId>> cloth_bindings_;
     bool dirty_ = true;
+    double last_step_ms_ = 0.0;   ///< See last_step_ms().
     std::size_t parallel_threshold_ = 64;
+    std::vector<WriteBack> writeback_;
 };
 
 /**

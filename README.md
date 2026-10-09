@@ -3,7 +3,7 @@
 **A header-only C++20 library for real-time rigid-body and cloth physics.**
 
 physxcoopa simulates rigid bodies with box, sphere, capsule and triangle-mesh colliders,
-hinge joints, triggers and XPBD cloth, and builds navigation (A* and flow fields for crowds)
+hinge, ball and cone-twist joints, triggers and XPBD cloth, and builds navigation (A* and flow fields for crowds)
 from those same colliders. It has two layers. `PhysicsWorld` is a plain
 simulation you can drive from any program. `PhysicsSystem` is an optional adapter that binds
 the world to a [libcoopa](https://github.com/cooparobla/libcoopa) scene, so colliders and
@@ -40,7 +40,22 @@ debug geometry as plain line segments to draw however you like.
   a short time.
 - **Fast bodies.** Speculative contacts stop fast spheres and boxes from passing through thin
   walls. A speed cap covers the remaining cases.
-- **Hinge joints.** Optional angle limits. A zero range gives a rigid weld. No motors or springs.
+- **Joints.** Three types share one solver path (`dynamics::Joint`, `JointType`):
+  - **Hinge**: one rotational degree of freedom about an axis, optional angle limits; a zero
+    range gives a rigid weld.
+  - **Ball**: the anchors are held together, every rotation is free.
+  - **ConeTwist**: a ball joint whose twist axis may swing at most `swing_limit` away from its
+    rest direction (a cone) and twist within `[twist_min, twist_max]` -- shoulders, hips, necks.
+
+  The point constraint is solved as one 3x3 block (the lever arms of an off-centre anchor
+  couple the axes); limits are one-sided and speculative (a fast spin stops at the limit, not a
+  substep past it); drift is corrected on the integrated poses at the end of each substep;
+  joint passes alternate direction (symmetric Gauss-Seidel) so chains converge both ways; a
+  sleeping body jointed to an awake one is woken with it. Limits are measured from the rest
+  pose: the bodies' relative orientation when the joint is added, or any rest pose given to
+  `add_joint()`. Jointed pairs do not collide unless `collide_connected`;
+  `set_pair_collision(a, b, false)` turns any other pair off (a ragdoll's neighbouring bones).
+  No motors or springs.
 - **Per-axis freezing** of position and rotation, center-of-mass and inertia overrides, linear
   and angular drag.
 
@@ -49,11 +64,31 @@ debug geometry as plain line segments to draw however you like.
 - **Layers.** 32 collision layers with a layer matrix. Layers can have names.
 - **Events.** Collision and trigger enter, stay and exit. Collision events carry the contact
   points, normal, relative velocity and impulse.
-- **Queries.** `raycast`, `raycast_any`, `raycast_all`, `sphere_cast`, `box_cast`,
-  `capsule_cast`, `overlap_sphere`, `overlap_box` and `overlap_capsule`, each with a layer mask
-  and an option to skip triggers.
-- **Mesh colliders.** Meshes are welded, get a BVH, and correct internal edges, so a box slides
-  across a tiled floor without catching on seams.
+- **Queries.** `raycast`, `raycast_any`, `raycast_all`, `shape_cast`, `sphere_cast`,
+  `box_cast`, `capsule_cast`, `overlap_sphere`, `overlap_box`, `overlap_capsule` and
+  `compute_penetration`. Each takes a `query::QueryFilter`: a layer mask, an option to skip
+  triggers, one body to ignore, and an optional predicate. The older
+  `(layer_mask, include_triggers)` overloads still work.
+- **Exact shape casts.** Sphere and capsule casts use conservative advancement on exact
+  closest distances. Box casts use a swept separating-axis test against boxes and triangles.
+  Casts are exact against every collider type, meshes included. Hits report the shape slot
+  that was hit and a `started_inside` flag.
+- **Penetration.** `compute_penetration` returns one minimum-translation vector per overlapped
+  surface. A character motor uses it to resolve overlaps before sweeping.
+- **Mesh colliders.** Meshes are welded and get a BVH. Contacts, casts and penetration tests
+  only test the triangles the BVH returns. Internal edges are corrected, so a box slides across
+  a tiled floor without catching on seams.
+
+### Character motor
+- **`character::move()`** moves a kinematic capsule by a desired displacement and reports where
+  it ended up: grounded or not, the ground normal, body and (for a kinematic ground) velocity,
+  ceiling hits and every surface touched. It is pure algorithm over the queries above, with no
+  scene types and no state between calls.
+- **Each move** depenetrates, then collides and slides with a skin gap, steps up ledges no taller
+  than `step_height`, treats slopes steeper than `slope_limit_deg` as walls (and slides down
+  them), and snaps down to the ground by `snap_distance` while grounded.
+- A gameplay controller on top of it (velocity, jumps, platforms, pushing) lives in toyengine's
+  `CharacterController`. See [`physxcoopa/character/README.md`](physxcoopa/character/README.md).
 
 ### Cloth
 - **XPBD cloth** with many small substeps. Stretch and bend constraints, tethers, Coulomb
@@ -92,7 +127,7 @@ debug geometry as plain line segments to draw however you like.
 - **Debug drawing.** Collider wireframes, contacts, joints and broadphase nodes as colored line
   segments.
 - **Scene components.** `BoxCollider`, `SphereCollider`, `CapsuleCollider`, `MeshCollider`,
-  `Rigidbody`, `HingeJoint` and `Cloth`, with YAML parsers and Unity-style collision callbacks.
+  `Rigidbody`, `HingeJoint`, `BallJoint`, `ConeTwistJoint` and `Cloth`, with YAML parsers and Unity-style collision callbacks.
 
 ## Getting started
 
@@ -167,6 +202,18 @@ float z = world.get_body(id)->position.z;  // about 0.5: the ball rests on the f
 query::RaycastHit hit;
 geometry::Ray ray{{0.0f, 0.0f, 10.0f}, {0.0f, 0.0f, -1.0f}, 100.0f};
 if (world.raycast(ray, hit)) { /* hit.point, hit.normal, hit.distance, hit.body */ }
+
+// Sweep a capsule forward, ignoring the body it belongs to.
+query::QueryFilter filter;
+filter.ignore = id;
+filter.include_triggers = false;
+collision::Shape capsule = collision::Shape::make_capsule(0.3f, 0.6f);
+if (world.shape_cast(capsule, {0, 0, 1}, glm::quat(1, 0, 0, 0), {1, 0, 0}, 5.0f, hit, filter)) {
+    // hit.distance: how far it can move; hit.normal points back toward the capsule
+}
+for (const query::Penetration& p : world.compute_penetration(capsule, {0, 0, 1}, glm::quat(1, 0, 0, 0), filter)) {
+    // move by p.normal * p.depth to separate from p.body
+}
 ```
 
 You set a body's mass, inverse mass and inverse inertia yourself. `dynamics/inertia.h` has
@@ -250,6 +297,10 @@ crate->get_component<components::BoxCollider>()->on_collision_enter.connect(
 
 system::PhysicsSystem::RaycastHit hit;   // resolves to collider, object and rigidbody
 if (physics->raycast(geometry::Ray{{0, 0, 10}, {0, 0, -1}, 100.0f}, hit)) { /* hit.object */ }
+
+system::PhysicsSystem::QueryFilter filter;   // scene-level filter
+filter.ignore_rigidbody = crate->get_component<components::RigidbodyComponent>();
+physics->sphere_cast({0, 0, 2}, 0.25f, {1, 0, 0}, 10.0f, hit, filter);  // skips the crate
 ```
 
 For code that must run once per fixed substep, derive from `components::FixedUpdateBehaviour`
@@ -268,7 +319,9 @@ Every key is optional.
 | `CapsuleCollider` | `radius`, `height` (total, including the caps), `direction` (0, 1 or 2 for X, Y or Z; default 2) |
 | `MeshCollider` | `mesh_path` (loads `meshes/<name>.yaml`, a `vertices:`/`faces:` mesh), `convex` |
 | `Rigidbody` | `mass`, `drag`, `angular_drag`, `use_gravity`, `is_kinematic`, `interpolation` (`Interpolate` or `None`), `freeze_position`, `freeze_rotation`, `velocity`, `angular_velocity` |
-| `HingeJoint` | `connected_object`, `anchor` and `axis` (in this object's local frame), `limits: { min, max }` (degrees) |
+| `HingeJoint` | `connected_object`, `anchor` and `axis` (in this object's local frame), `limits: { min, max }` (degrees; or flat `use_limits`, `min_angle`, `max_angle`), `enable_collision` |
+| `BallJoint` | `connected_object`, `anchor` (this object's local frame), `enable_collision` |
+| `ConeTwistJoint` | `connected_object`, `anchor`, `axis` (the twist axis, this object's local frame), `swing_limit` (cone half-angle in degrees; negative = free), `twist: { min, max }` (or `twist_min` / `twist_max`; min > max = free), `enable_collision` |
 | `NavAgent` | `agent_type`, `speed`, `acceleration`, `angular_speed`, `stopping_distance`, `slowdown_distance`, `radius`, `separation_weight`, `base_offset`, `update_rotation`, `forward` (`Y`, `-Y`, `X`, `-X`), `avoid_areas`, `heuristic_weight`, and one of `destination` (A\* to a point), `destination_object` (chase an object by A\*), `flow_target` (follow that object's shared flow field) |
 | `NavModifier` | `area`, `walkable`, `ignore`, `carve` (dynamic bodies carve while asleep), `apply_to_children` |
 | `NavVolume` | `size`, `center`, `area` (`NotWalkable` cuts a hole) |
@@ -378,13 +431,14 @@ physxcoopa/
 ├── geometry/      AABB, ray, sphere, OBB, capsule, triangle mesh, mesh BVH
 ├── collision/     shapes, SAT and clipping, contact manifolds, mesh contacts, events
 ├── broadphase/    dynamic AABB tree, layer matrix, pair cache
-├── dynamics/      bodies, inertia, integrator, islands, hinge joints, materials, solver
+├── dynamics/      bodies, inertia, integrator, islands, joints (hinge/ball/cone-twist), materials, solver
 ├── cloth/         cloth data, grid builder, collision, XPBD solver
-├── query/         raycast, shape cast and overlap helpers
+├── query/         query filter, raycast and overlap helpers, exact sweeps and penetration
+├── character/     kinematic capsule character motor (collide-and-slide, steps, slopes, snap)
 ├── debug/         DebugDraw line output
 ├── nav/           navigation: voxelized walkable surface, A*, flow fields, crowds
 ├── loaders/       asset loaders for triangle meshes and physics materials
-├── components/    scene components: colliders, Rigidbody, HingeJoint, Cloth, FixedUpdateBehaviour, Nav*
+├── components/    scene components: colliders, Rigidbody, Hinge/Ball/ConeTwistJoint, Cloth, FixedUpdateBehaviour, Nav*
 ├── nav_yaml.h     register_nav_components() (called by register_physics_components())
 └── system/        PhysicsSystem, NavSystem and their install functions
 test.cpp           the test suite
@@ -397,6 +451,10 @@ itself uses only glm and libcoopa's signals, logger and job engine.
 
 - **Queries during a substep.** Run queries between steps. Inside an `on_substep` callback the
   bodies are mid-solve.
+- **Casts that start in contact.** If a cast starts touching or overlapping a collider, it
+  reports a hit at distance 0 only when it moves further into that collider. Moving away from
+  it or sliding along it is ignored. For meshes this is decided per triangle. Resolve overlaps
+  with `compute_penetration` first. Mesh-shaped casts are not supported.
 - **Changing bodies during a substep.** From `on_substep` you can apply forces and set
   velocities. `create_body()` and `destroy_body()` are deferred to the start of the next substep.
 - **Mesh colliders are static or kinematic.** A `MeshCollider` on a dynamic `Rigidbody` throws
@@ -404,6 +462,10 @@ itself uses only glm and libcoopa's signals, logger and job engine.
 - **Physics runs before animation.** At its default order (100), physics reads transforms
   before animation (300) writes them. To let animation drive kinematic bodies, install the
   system at a later order, for example `install_physics_system(scene, 325)`.
+- **Hierarchical bodies.** A body may sit under another body in the scene hierarchy (a
+  ragdoll's bones). The write-back derives each child's local pose from its nearest body
+  ancestor's NEW pose (two passes: read every target, then write), so the result is correct in
+  any order and race-free on the job-parallel path.
 - **Joints and cloth bind once.** Changing a hinge's anchor or a cloth's grid or anchors after
   binding has no effect until the component is re-added. A cloth's runtime parameters, such as
   wind and friction, can change at any time through `ClothComponent::cloth_mut()->params`.
