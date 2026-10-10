@@ -1,9 +1,0 @@
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/CMakeFiles/physxcoopa.dir
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/CMakeFiles/test.dir
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/CMakeFiles/edit_cache.dir
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/CMakeFiles/rebuild_cache.dir
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/libcoopa-build/CMakeFiles/coopa_test_main.dir
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/libcoopa-build/CMakeFiles/libcoopa.dir
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/libcoopa-build/CMakeFiles/test.dir
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/libcoopa-build/CMakeFiles/edit_cache.dir
-/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/libcoopa-build/CMakeFiles/rebuild_cache.dir

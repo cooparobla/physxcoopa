@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/cmake_install.cmake",
-		"/Users/tblaney/Code/toyengine/libs/physxcoopa/build-tests/libcoopa-build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

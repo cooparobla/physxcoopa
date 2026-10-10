@@ -1,2 +1,0 @@
-/usr/bin/ar qc libcoopa_test_main.a CMakeFiles/coopa_test_main.dir/coopa/testing/test_main.cpp.o
-/usr/bin/ranlib libcoopa_test_main.a
