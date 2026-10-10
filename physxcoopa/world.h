@@ -286,7 +286,7 @@ public:
     /** @brief Minimum item count (bodies for bounds/pairs, pairs for narrowphase) before a
      *         stage dispatches to job_engine() instead of running inline on the calling
      *         thread -- mirrors the should_parallelize_() idiom used elsewhere in this
-     *         workspace (see toyengine's PixelRenderPipeline). */
+     *         workspace (see toyengine's ToyRenderPipeline). */
     void set_parallel_threshold(std::size_t n) { parallel_threshold_ = n; }
     std::size_t parallel_threshold() const { return parallel_threshold_; }
 
@@ -1285,7 +1285,7 @@ private:
      * @brief Runs `body(begin, end, JobContext)` over `[0, count)`, dispatched onto job_engine()
      *        when one is installed and `count` clears parallel_threshold_, otherwise run inline
      *        on the calling thread as a single [0, count) chunk -- the same should_parallelize_
-     *        idiom PixelRenderPipeline uses. `body` must write only through index-addressed
+     *        idiom ToyRenderPipeline uses. `body` must write only through index-addressed
      *        state (its own chunk's slice of a pre-sized scratch vector, or a per-worker
      *        bucket keyed by JobContext::worker_index) -- never through a shared container
      *        that isn't safe for concurrent mutation.
