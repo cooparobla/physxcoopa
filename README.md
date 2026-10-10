@@ -413,13 +413,27 @@ advance cloth. Events from `step()` collect over the whole frame and clear on th
 ## Testing
 
 ```bash
-ctest --test-dir build        # or run ./build/physxcoopa directly
+ctest --test-dir build -j8               # one ctest entry per suite: physxcoopa_<suite>
+./build/physxcoopa --suite cloth_solver  # one suite; `--list` lists every test, -v is verbose
 ```
 
-`test.cpp` holds 107 headless tests. They cover narrowphase math, stacking, friction, restitution,
-kinematic platforms, sleep, mesh colliders, queries, triggers, joints, scene binding, materials,
-settings, cloth, determinism, and navigation (voxelization, A\* across floors and links, area
-costs, incremental rebuilds, flow fields, crowds, and the scene system).
+The tests are headless and live in `tests/`, one suite per system in `tests/<suite>_test.cpp`,
+written against libcoopa's test framework (`coopa/testing/test.h`). Shared builders (ground,
+boxes, hand-built meshes, cloth sheets, nav worlds) are in `tests/support/`.
+
+| Suite | Covers |
+| --- | --- |
+| `geometry` | ray/AABB, segment closest points, bases, closed-form inertia |
+| `physics_world` | free fall vs. the integrator's closed form, handles, impulse/force API, `on_substep`, determinism (repeat and serial vs. job-parallel), debug draw |
+| `contact_solver` | restitution, kinematic pushing, tumbling to rest, CCD, stacking, friction, mass ratios, capsules |
+| `sleep` | sleeping, kinematic wake rules, joint islands |
+| `narrowphase` / `broadphase` | SAT contacts, BVH mesh contacts vs. brute force, internal edges; AABB tree vs. brute force, pair and layer filtering |
+| `queries` | exact raycasts, overlaps, sweeps, `QueryFilter`, `compute_penetration` |
+| `character_motor` | step-up and slope limit |
+| `contact_events` / `joints` | trigger and collision callbacks; hinge, ball and cone-twist joints |
+| `physics_system` / `physics_config` | scene binding and runtime changes; materials and settings YAML |
+| `cloth_solver` / `cloth_collision` | XPBD solver, anchors, determinism, binding; collider projection and mesh rules |
+| `nav_build` / `nav_path` / `nav_flow` / `nav_crowd` / `nav_system` | baking, A\*, flow fields, crowds, and the scene system |
 
 ## Project layout
 
@@ -441,7 +455,7 @@ physxcoopa/
 ├── components/    scene components: colliders, Rigidbody, Hinge/Ball/ConeTwistJoint, Cloth, FixedUpdateBehaviour, Nav*
 ├── nav_yaml.h     register_nav_components() (called by register_physics_components())
 └── system/        PhysicsSystem, NavSystem and their install functions
-test.cpp           the test suite
+tests/             the test suites (tests/support/: shared fixtures)
 ```
 
 Only `system/`, `components/`, `physx_yaml.h` and `nav_yaml.h` use libcoopa's scene module. `PhysicsWorld`

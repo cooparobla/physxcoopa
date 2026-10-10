@@ -34,9 +34,15 @@ target_link_libraries(physxcoopa_lib INTERFACE coopa::lib)
 # target above, not a second `physxcoopa` binary/ctest entry mixed into its
 # own build. ---
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    add_executable(physxcoopa test.cpp)
-    target_link_libraries(physxcoopa PRIVATE coopa::physx)
+    # One suite per tests/<suite>_test.cpp (see libcoopa's coopa/testing/test.h); each runs as
+    # its own ctest entry `physxcoopa_<suite>`, so `ctest -j` runs them in parallel.
+    file(GLOB PHYSXCOOPA_TEST_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/*.cpp)
+    add_executable(physxcoopa ${PHYSXCOOPA_TEST_SOURCES})
+    target_include_directories(physxcoopa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(physxcoopa PRIVATE coopa::physx coopa::test_main)
 
     enable_testing()
-    add_test(NAME physxcoopa_tests COMMAND physxcoopa)
+    coopa_add_test_suites(physxcoopa PREFIX physxcoopa SOURCES ${PHYSXCOOPA_TEST_SOURCES} LABELS unit)
 endif()

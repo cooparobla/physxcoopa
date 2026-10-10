@@ -1,0 +1,20 @@
+physxcoopa_broadphase 4 0.0184587
+physxcoopa_character_motor 4 0.0116504
+physxcoopa_cloth_collision 4 0.212998
+physxcoopa_cloth_solver 4 0.335852
+physxcoopa_contact_events 4 0.0160287
+physxcoopa_contact_solver 4 0.189158
+physxcoopa_geometry 4 0.0171094
+physxcoopa_joints 4 0.0205816
+physxcoopa_narrowphase 4 0.170528
+physxcoopa_nav_build 4 0.0342269
+physxcoopa_nav_crowd 4 1.03646
+physxcoopa_nav_flow 4 0.282039
+physxcoopa_nav_path 4 0.22513
+physxcoopa_nav_system 4 0.0204843
+physxcoopa_physics_config 4 0.011461
+physxcoopa_physics_system 4 0.0986533
+physxcoopa_physics_world 4 0.552319
+physxcoopa_queries 4 0.0102635
+physxcoopa_sleep 4 0.0107849
+---
