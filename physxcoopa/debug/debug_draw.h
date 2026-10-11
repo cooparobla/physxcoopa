@@ -16,6 +16,7 @@
 #include <physxcoopa/geometry/triangle_mesh.h>
 
 #include <glm/glm.hpp>
+#include <algorithm>
 #include <glm/gtc/constants.hpp>
 
 #include <cmath>
@@ -149,6 +150,18 @@ struct DebugDraw {
      *         collider meshes v1 targets; a large terrain mesh would want frustum culling
      *         here first -- not needed yet, so not built. */
     void add_mesh(const geometry::TriangleMesh& mesh, const glm::mat4& transform, uint32_t color) {
+        if (const geometry::HeightGrid* grid = mesh.height_grid()) {
+            // A heightfield has millions of triangles: draw its grid lines, thinned to ~128 a side.
+            const int step_i = std::max(1, (grid->nx() - 1) / 128), step_j = std::max(1, (grid->ny() - 1) / 128);
+            auto w = [&](int i, int j) { return glm::vec3(transform * glm::vec4(grid->vertex(i, j), 1.0f)); };
+            for (int j = 0; j < grid->ny(); j += step_j) {
+                for (int i = 0; i + step_i < grid->nx(); i += step_i) add_line(w(i, j), w(i + step_i, j), color);
+            }
+            for (int i = 0; i < grid->nx(); i += step_i) {
+                for (int j = 0; j + step_j < grid->ny(); j += step_j) add_line(w(i, j), w(i, j + step_j), color);
+            }
+            return;
+        }
         for (size_t tri = 0; tri < mesh.triangle_count(); ++tri) {
             glm::vec3 v0, v1, v2;
             mesh.triangle_vertices(static_cast<uint32_t>(tri), v0, v1, v2);

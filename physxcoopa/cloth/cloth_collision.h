@@ -198,7 +198,7 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
         }
 
         case collision::ShapeType::TriangleMesh: {
-            if (!s.mesh || s.mesh->bvh().empty()) return false;
+            if (!s.mesh || s.mesh->empty()) return false;
 
             // Work in the mesh's own local frame: one inverse transform of the query point beats
             // transforming every candidate triangle, and the BVH is built in local space anyway.
@@ -236,7 +236,7 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
                     float best_t = seg_len;
                     uint32_t crossed_tri = 0;
                     bool crossed = false;
-                    s.mesh->bvh().raycast(ray, [&](uint32_t tri) {
+                    s.mesh->raycast(ray, [&](uint32_t tri) {
                         glm::vec3 v0, v1, v2;
                         s.mesh->triangle_vertices(tri, v0, v1, v2);
                         float t = 0.0f;
@@ -256,7 +256,7 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
                         // Which side is "out" is READ FROM THE MOTION, not guessed from a normal --
                         // so this carries none of the internal-edge ambiguity that forces
                         // mesh_contact.h to consult TriangleAdjacency for rigid contacts.
-                        glm::vec3 face = util::safe_normalize(s.mesh->normals()[crossed_tri]);
+                        glm::vec3 face = util::safe_normalize(s.mesh->triangle_normal(crossed_tri));
                         if (glm::dot(local_start - local_hit, face) < 0.0f) face = -face;
 
                         const glm::vec3 local_fixed = local_hit + face * local_thickness;
@@ -285,7 +285,7 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
             // teleport a particle in an inside corner straight through the wall.
             bool any_front = false;
 
-            s.mesh->bvh().query(query, [&](uint32_t tri) {
+            s.mesh->query(query, [&](uint32_t tri) {
                 glm::vec3 v0, v1, v2;
                 s.mesh->triangle_vertices(tri, v0, v1, v2);
                 const glm::vec3 closest = collision::closest_point_on_triangle(local_p, v0, v1, v2);
@@ -295,7 +295,7 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
 
                 // >= 0 so a particle lying exactly ON the surface counts as outside, leaving the
                 // existing behaviour for that case untouched.
-                if (glm::dot(delta, s.mesh->normals()[tri]) >= 0.0f) any_front = true;
+                if (glm::dot(delta, s.mesh->triangle_normal(tri)) >= 0.0f) any_front = true;
 
                 if (d2 > best_d2) return;
                 best_d2 = d2;
@@ -313,7 +313,7 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
                 // direction from (particle - closest point) here -- which is what an outside
                 // particle uses -- would point back into the solid and cement the penetration at
                 // exactly `thickness` on the wrong side.
-                best_normal = util::safe_normalize(s.mesh->normals()[best_tri]);
+                best_normal = util::safe_normalize(s.mesh->triangle_normal(best_tri));
             } else if (best_d2 > util::k_epsilon * util::k_epsilon) {
                 // The separation direction itself, which -- unlike the face normal -- is also the
                 // right exit direction in the triangle's edge and vertex regions.
@@ -321,7 +321,7 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
             } else {
                 // Exactly on the surface: the separation direction is undefined, so fall back to
                 // the face normal, signed to push the particle off the side it is on.
-                const glm::vec3 face = util::safe_normalize(s.mesh->normals()[best_tri]);
+                const glm::vec3 face = util::safe_normalize(s.mesh->triangle_normal(best_tri));
                 best_normal = (glm::dot(best_delta, face) < 0.0f) ? -face : face;
             }
 

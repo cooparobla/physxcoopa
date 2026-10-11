@@ -267,7 +267,7 @@ inline void mesh_contact_candidates(const Shape& shape, const glm::vec3& pos, co
     out.clear();
     geometry::AABB probe = world_bounds(shape, pos, rot);
     if (shape.type == ShapeType::Box) probe = probe.expand(1.5f * glm::length(shape.half_extents));
-    mesh_shape.mesh->bvh().query(mesh_local_bounds(probe, mesh_transform), [&](uint32_t tri) { out.push_back(tri); });
+    mesh_shape.mesh->query(mesh_local_bounds(probe, mesh_transform), [&](uint32_t tri) { out.push_back(tri); });
     std::sort(out.begin(), out.end());
 }
 
@@ -291,8 +291,8 @@ inline void mesh_triangle_contacts(const Shape& shape, const glm::vec3& pos, con
     glm::vec3 v0 = glm::vec3(mesh_transform * glm::vec4(lv0, 1.0f));
     glm::vec3 v1 = glm::vec3(mesh_transform * glm::vec4(lv1, 1.0f));
     glm::vec3 v2 = glm::vec3(mesh_transform * glm::vec4(lv2, 1.0f));
-    glm::vec3 face_normal = glm::normalize(mesh_world_rot * mesh.normals()[tri]);
-    const geometry::TriangleAdjacency& adjacency = mesh.adjacency()[tri];
+    glm::vec3 face_normal = glm::normalize(mesh_world_rot * mesh.triangle_normal(tri));
+    const geometry::TriangleAdjacency adjacency = mesh.triangle_adjacency(tri);
 
     // Shared per-point path: classify where on this triangle the point landed, correct the
     // normal via adjacency, and emit. `raw_normal` is the fallback used only for a genuine
@@ -310,7 +310,7 @@ inline void mesh_triangle_contacts(const Shape& shape, const glm::vec3& pos, con
             uint32_t neighbor_tri = adjacency.neighbor[edge];
             if (neighbor_tri != geometry::k_no_neighbor) {
                 has_neighbor = true;
-                neighbor_normal = glm::normalize(mesh_world_rot * mesh.normals()[neighbor_tri]);
+                neighbor_normal = glm::normalize(mesh_world_rot * mesh.triangle_normal(neighbor_tri));
             }
         }
 

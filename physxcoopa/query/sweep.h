@@ -501,9 +501,9 @@ inline glm::vec3 sweep_mesh_normal_(const glm::vec3& raw, const glm::vec3& on_tr
                                     const geometry::TriangleMesh& mesh, const glm::quat& mesh_world_rot, uint32_t tri) {
     int edge = collision::classify_triangle_edge_(collision::barycentric_(on_tri, v0, v1, v2));
     if (edge < 0) return raw; // face interior (raw is already +-face_normal) or a vertex
-    uint32_t neighbor = mesh.adjacency()[tri].neighbor[edge];
+    uint32_t neighbor = mesh.triangle_neighbor(tri, edge);
     if (neighbor == geometry::k_no_neighbor) return raw;
-    glm::vec3 neighbor_normal = glm::normalize(mesh_world_rot * mesh.normals()[neighbor]);
+    glm::vec3 neighbor_normal = glm::normalize(mesh_world_rot * mesh.triangle_normal(neighbor));
     if (glm::dot(face_normal, neighbor_normal) <= 0.999f) return raw;
     return glm::dot(raw, face_normal) >= 0.0f ? face_normal : -face_normal;
 }
@@ -535,14 +535,14 @@ inline bool sweep_mesh(const collision::Shape& shape, const glm::vec3& pos, cons
 
     bool found = false;
     float best = max_distance;
-    mesh.bvh().sweep(local_start, local_ray, [&](uint32_t tri) {
+    mesh.sweep(local_start, local_ray, [&](uint32_t tri) {
         if (found && best <= 0.0f) return; // nothing can beat a distance-0 hit
         glm::vec3 lv0, lv1, lv2;
         mesh.triangle_vertices(tri, lv0, lv1, lv2);
         glm::vec3 v0 = glm::vec3(mesh_transform * glm::vec4(lv0, 1.0f));
         glm::vec3 v1 = glm::vec3(mesh_transform * glm::vec4(lv1, 1.0f));
         glm::vec3 v2 = glm::vec3(mesh_transform * glm::vec4(lv2, 1.0f));
-        glm::vec3 face_normal = glm::normalize(mesh_world_rot * mesh.normals()[tri]);
+        glm::vec3 face_normal = glm::normalize(mesh_world_rot * mesh.triangle_normal(tri));
 
         float toi = 0.0f;
         glm::vec3 n(0.0f, 0.0f, 1.0f), p(0.0f);

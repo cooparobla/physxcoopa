@@ -140,7 +140,7 @@ inline bool raycast_shape(const geometry::Ray& ray, const collision::Shape& shap
             bool found = false;
             float best_t = local_ray.max_distance;
             uint32_t best_tri = 0;
-            shape.mesh->bvh().raycast(local_ray, [&](uint32_t tri) {
+            shape.mesh->raycast(local_ray, [&](uint32_t tri) {
                 glm::vec3 v0, v1, v2;
                 shape.mesh->triangle_vertices(tri, v0, v1, v2);
                 float candidate_t;
@@ -152,7 +152,7 @@ inline bool raycast_shape(const geometry::Ray& ray, const collision::Shape& shap
             });
             if (!found) return false;
             t = best_t;
-            normal = glm::normalize(mesh_rot * shape.mesh->normals()[best_tri]);
+            normal = glm::normalize(mesh_rot * shape.mesh->triangle_normal(best_tri));
             return true;
         }
     }

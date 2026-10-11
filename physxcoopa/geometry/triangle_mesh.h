@@ -9,12 +9,15 @@
 #define PHYSXCOOPA_GEOMETRY_TRIANGLE_MESH_H
 
 #include <physxcoopa/geometry/aabb.h>
+#include <physxcoopa/geometry/height_grid.h>
 #include <physxcoopa/geometry/mesh_bvh.h>
+#include <physxcoopa/geometry/ray.h>
 
 #include <glm/glm.hpp>
 
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <vector>
 
 namespace coopa {
@@ -67,6 +70,67 @@ public:
         bvh_.build(vertices_, indices_);
     }
 
+    /**
+     * @brief A mesh whose triangles are a height grid's (geometry/height_grid.h): nothing is
+     *        stored per triangle, and vertices()/indices()/normals()/adjacency()/bvh() are empty
+     *        -- reach it through the accessors below (triangle_vertices(), triangle_normal(),
+     *        triangle_neighbor(), query(), raycast(), sweep()), which every collision path uses.
+     */
+    static TriangleMesh from_height_grid(std::shared_ptr<const HeightGrid> grid) {
+        TriangleMesh m;
+        m.grid_ = std::move(grid);
+        if (m.grid_) m.bounds_ = m.grid_->bounds();
+        return m;
+    }
+
+    /** @brief The grid behind a heightfield mesh (null for a stored mesh). */
+    const HeightGrid* height_grid() const { return grid_.get(); }
+
+    /** @brief True when there is no triangle to collide with. */
+    bool empty() const { return grid_ ? false : bvh_.empty(); }
+
+    /** @brief Triangle `tri`'s unit face normal. */
+    glm::vec3 triangle_normal(uint32_t tri) const { return grid_ ? grid_->triangle_normal(tri) : normals_[tri]; }
+
+    /** @brief The triangle sharing edge `edge` (vertex edge -> edge+1) of `tri`, or k_no_neighbor. */
+    uint32_t triangle_neighbor(uint32_t tri, int edge) const {
+        if (grid_) {
+            uint32_t n[3];
+            grid_->triangle_neighbors(tri, n);
+            return n[edge];
+        }
+        return adjacency_[tri].neighbor[edge];
+    }
+
+    /** @brief `tri`'s three neighbours (see TriangleAdjacency). */
+    TriangleAdjacency triangle_adjacency(uint32_t tri) const {
+        TriangleAdjacency a;
+        if (grid_) grid_->triangle_neighbors(tri, a.neighbor);
+        else a = adjacency_[tri];
+        return a;
+    }
+
+    /** @brief fn(tri) for every triangle whose bounds overlap `bounds` (local space). */
+    template <typename Fn>
+    void query(const AABB& bounds, Fn&& fn) const {
+        if (grid_) grid_->query(bounds, fn);
+        else bvh_.query(bounds, fn);
+    }
+
+    /** @brief fn(tri) for every triangle whose bounds the ray reaches (local space). */
+    template <typename Fn>
+    void raycast(const Ray& ray, Fn&& fn) const {
+        if (grid_) grid_->raycast(ray, fn);
+        else bvh_.raycast(ray, fn);
+    }
+
+    /** @brief fn(tri) for every triangle `box` could touch moving along `ray` (see MeshBVH::sweep). */
+    template <typename Fn>
+    void sweep(const AABB& box, const Ray& ray, Fn&& fn) const {
+        if (grid_) grid_->sweep(box, ray, fn);
+        else bvh_.sweep(box, ray, fn);
+    }
+
     /** @brief Welded vertex positions. */
     const std::vector<glm::vec3>& vertices() const { return vertices_; }
 
@@ -80,10 +144,14 @@ public:
     const std::vector<TriangleAdjacency>& adjacency() const { return adjacency_; }
 
     /** @brief Number of triangles in the mesh. */
-    size_t triangle_count() const { return indices_.size() / 3; }
+    size_t triangle_count() const { return grid_ ? grid_->triangle_count() : indices_.size() / 3; }
 
     /** @brief The three vertex positions of triangle `tri`. */
     void triangle_vertices(uint32_t tri, glm::vec3& v0, glm::vec3& v1, glm::vec3& v2) const {
+        if (grid_) {
+            grid_->triangle_vertices(tri, v0, v1, v2);
+            return;
+        }
         v0 = vertices_[indices_[tri * 3 + 0]];
         v1 = vertices_[indices_[tri * 3 + 1]];
         v2 = vertices_[indices_[tri * 3 + 2]];
@@ -111,6 +179,7 @@ private:
     std::vector<TriangleAdjacency> adjacency_;
     AABB bounds_;
     MeshBVH bvh_;
+    std::shared_ptr<const HeightGrid> grid_;
 };
 
 } // namespace geometry

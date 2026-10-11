@@ -303,7 +303,7 @@ inline void emit_triangles(const SourceShape& src, const geometry::AABB& clip, s
                 local.max = glm::max(local.max, l);
             }
             const geometry::TriangleMesh& mesh = *s.mesh;
-            mesh.bvh().query(local, [&](uint32_t tri) {
+            mesh.query(local, [&](uint32_t tri) {
                 glm::vec3 v0, v1, v2;
                 mesh.triangle_vertices(tri, v0, v1, v2);
                 detail::push_tri_if_overlaps_(out, center + r * (v0 * scale), center + r * (v1 * scale),
