@@ -1,7 +1,10 @@
 /**
  * @file narrowphase_test.cpp
  * @brief Contact generation: box-box SAT (face and edge-edge features, exact depths), BVH-narrowed
- *        mesh contacts against a brute-force oracle, and internal-edge correction on a tiled mesh floor.
+ *        mesh contacts against a brute-force oracle, internal-edge correction on a tiled mesh floor,
+ *        and box-on-mesh support: no phantom contacts from a wall below a ledge, triangle vertices
+ *        holding a box up on a triangle smaller than its face, and a box settling flat on a finely
+ *        tessellated floor.
  */
 #include <coopa/testing/test.h>
 
@@ -163,3 +166,90 @@ COOPA_TEST(box_slides_across_internal_mesh_edge_without_a_bump) {
     ASSERT_NEAR(final_b->position.z, half_extent, 0.05f); // stayed flush on the floor throughout
     ASSERT_TRUE(max_vz_jump < 1.0f); // no discontinuity crossing the internal edge
 }
+
+namespace {
+
+/** @brief A ledge: a flat top (x in [-2,0], z = 0, facing +z) and the wall under its edge (x = 0, facing +x). */
+geometry::TriangleMesh make_ledge() {
+    return make_mesh_with_adjacency({glm::vec3(-2.0f, -2.0f, 0.0f), glm::vec3(0.0f, -2.0f, 0.0f), glm::vec3(0.0f, 2.0f, 0.0f),
+                                     glm::vec3(-2.0f, 2.0f, 0.0f), glm::vec3(0.0f, -2.0f, -2.0f), glm::vec3(0.0f, 2.0f, -2.0f)},
+                                    {1, 4, 5, 1, 5, 2, 0, 1, 2, 0, 2, 3});   // wall first: it is met first
+}
+
+/** @brief A floor of `n` x `n` quads over [-2,2]^2 at z = 0 -- many triangles under one box. */
+geometry::TriangleMesh make_tiled_floor(int n) {
+    std::vector<glm::vec3> v;
+    std::vector<uint32_t> idx;
+    const float step = 4.0f / static_cast<float>(n);
+    for (int j = 0; j <= n; ++j)
+        for (int i = 0; i <= n; ++i) v.push_back(glm::vec3(-2.0f + i * step, -2.0f + j * step, 0.0f));
+    for (int j = 0; j < n; ++j) {
+        for (int i = 0; i < n; ++i) {
+            const uint32_t a = j * (n + 1) + i, b = a + 1, c = a + n + 2, d = a + n + 1;
+            idx.insert(idx.end(), {a, b, c, a, c, d});
+        }
+    }
+    return make_mesh_with_adjacency(std::move(v), std::move(idx));
+}
+
+} // namespace
+
+/**
+ * A box resting on a ledge, overhanging its edge: its corners are behind the plane of the wall
+ * below, within the old corner footprint, by most of the box's width. Only the top supports it --
+ * the wall (whose plane the box's centre is behind) must not push it sideways off the ledge.
+ */
+COOPA_TEST(box_on_a_ledge_gets_no_push_from_the_wall_below) {
+    geometry::TriangleMesh ledge = make_ledge();
+    const collision::Shape mesh_shape = collision::Shape::make_mesh(&ledge);
+    const collision::Shape box = collision::Shape::make_box(glm::vec3(0.5f));
+    collision::ContactManifold m;
+    ASSERT_TRUE(collision::generate_mesh_contacts(box, glm::vec3(-0.4f, 0.0f, 0.49f), glm::quat(1, 0, 0, 0), mesh_shape,
+                                                  glm::vec3(0.0f), glm::quat(1, 0, 0, 0), m));
+    ASSERT_NEAR(m.normal.z, 1.0f, 1e-3f);
+    for (uint8_t i = 0; i < m.count; ++i) ASSERT_NEAR(m.points[i].penetration, 0.01f, 1e-3f);
+}
+
+/** A box sunk 1 cm onto a triangle much smaller than its face: no corner is over it, its vertices hold the box up. */
+COOPA_TEST(box_on_a_small_triangle_is_held_by_its_vertices) {
+    geometry::TriangleMesh tri = make_mesh_with_adjacency(
+        {glm::vec3(-0.1f, -0.1f, 0.0f), glm::vec3(0.1f, -0.1f, 0.0f), glm::vec3(0.0f, 0.1f, 0.0f)}, {0, 1, 2});
+    const collision::Shape mesh_shape = collision::Shape::make_mesh(&tri);
+    const collision::Shape box = collision::Shape::make_box(glm::vec3(0.5f));
+    collision::ContactManifold m;
+    ASSERT_TRUE(collision::generate_mesh_contacts(box, glm::vec3(0.0f, 0.0f, 0.49f), glm::quat(1, 0, 0, 0), mesh_shape,
+                                                  glm::vec3(0.0f), glm::quat(1, 0, 0, 0), m));
+    ASSERT_TRUE(m.count == 3);
+    ASSERT_NEAR(m.normal.z, 1.0f, 1e-3f);
+    for (uint8_t i = 0; i < m.count; ++i) ASSERT_NEAR(m.points[i].penetration, 0.01f, 1e-3f);
+}
+
+/**
+ * Dropped tilted onto a floor of 0.25 m tiles -- each corner within reach of several triangles --
+ * a box comes to rest flat and still, where it landed, instead of balancing on an edge,
+ * tumbling or sinking.
+ */
+COOPA_TEST(box_settles_flat_on_a_finely_tessellated_floor) {
+    geometry::TriangleMesh floor_mesh = make_tiled_floor(16);
+    PhysicsWorld world;
+    dynamics::Body floor_body;
+    floor_body.type = dynamics::BodyType::Static;
+    world.add_body(floor_body, collision::Shape::make_mesh(&floor_mesh));
+
+    const float half = 0.6f;
+    dynamics::Body box;
+    box.position = glm::vec3(0.1f, -0.2f, 1.5f);
+    box.orientation = glm::normalize(glm::quat(glm::vec3(0.17f, 0.35f, 0.52f)));
+    box.mass = 40.0f;
+    box.inv_mass = 1.0f / box.mass;
+    box.inv_inertia_local = dynamics::box_inverse_inertia(glm::vec3(half), box.mass);
+    dynamics::BodyId id = world.add_body(box, collision::Shape::make_box(glm::vec3(half)));
+
+    step_world(world, 300);
+    const dynamics::Body* b = world.get_body(id);
+    ASSERT_TRUE(best_up_alignment(b->orientation) > 0.999f);
+    ASSERT_NEAR(b->position.z, half, 0.02f);
+    ASSERT_TRUE(glm::length(glm::vec2(b->position)) < 1.0f);
+    ASSERT_TRUE(glm::length(b->linear_velocity) < 0.05f && glm::length(b->angular_velocity) < 0.05f);
+}
+

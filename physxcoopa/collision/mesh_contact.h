@@ -137,7 +137,26 @@ inline bool sphere_or_capsule_vs_triangle_contact_(const Shape& shape, const glm
  * into the finite triangle) and the internal-edge correction below, same as the sphere/capsule
  * path.
  *
- * @param emit Called as `emit(on_shape, on_tri, penetration)` for each embedded corner.
+ * One-sided: a triangle whose plane the box's CENTRE is behind contributes nothing. The
+ * per-corner plane test has no idea which side the box came from, so without this a box resting
+ * on a ledge reads its corners as "behind" every wall face below that ledge (and every tilted
+ * face of a rounded lip) -- by up to the box's whole size, within the generous footprint -- and
+ * each such corner pushes the box sideways out of a wall it never touched. On a mesh with cliffs
+ * (a tile terrain's chunk colliders) that fed energy in every step until the box flew off. A box
+ * genuinely pressed into a surface keeps its centre in front of it; only one that has already
+ * tunnelled past its middle loses the contact, which the corner test could not resolve sanely
+ * anyway.
+ *
+ * The contact point is the CORNER (moved halfway out along the face normal), not the closest
+ * point on the triangle: with the generous footprint a corner may be accepted by a triangle it
+ * is not over (the next one along, or the border triangle of a neighbouring mesh), and the
+ * triangle's clamped closest point would then put a support where the box has none -- enough to
+ * hold a box balanced on an edge on perfectly flat ground.
+ *
+ * @param emit Called as `emit(corner_index, corner, penetration, offset)` for each embedded
+ *             corner. `corner_index` (0-7) has bit 0 set for the +x half-extent, bit 1 for +y,
+ *             bit 2 for +z; `offset` is how far the corner's plane projection lies outside the
+ *             triangle (0 when the corner is over it).
  */
 template <typename Fn>
 inline void box_vs_triangle_contacts_(const Shape& shape, const glm::vec3& pos, const glm::quat& rot,
@@ -148,6 +167,7 @@ inline void box_vs_triangle_contacts_(const Shape& shape, const glm::vec3& pos, 
     box.axes(ax, ay, az);
     const glm::vec3& he = box.half_extents;
     float footprint_limit = glm::length(he);
+    if (glm::dot(box.center - v0, face_normal) <= 0.0f) return;   // behind the face: see the doc
 
     for (int sx = -1; sx <= 1; sx += 2) {
         for (int sy = -1; sy <= 1; sy += 2) {
@@ -167,7 +187,8 @@ inline void box_vs_triangle_contacts_(const Shape& shape, const glm::vec3& pos, 
                 glm::vec3 plane_point = corner - signed_dist * face_normal;
                 if (glm::length(plane_point - on_tri) > footprint_limit) continue;
 
-                emit(corner, on_tri, -signed_dist);
+                emit(static_cast<uint32_t>(((sx + 1) / 2) | (((sy + 1) / 2) << 1) | (((sz + 1) / 2) << 2)), corner,
+                     -signed_dist, glm::length(plane_point - on_tri));
             }
         }
     }
@@ -319,11 +340,13 @@ inline void mesh_triangle_contacts(const Shape& shape, const glm::vec3& pos, con
     };
 
     if (shape.type == ShapeType::Box) {
-        uint32_t corner_index = 0;
+        // A box's normal is always the face normal: the internal-edge correction, given the face
+        // normal as the raw direction, returns it in every case. The low 3 bits of the feature id
+        // name the box CORNER, so generate_mesh_contacts() can keep one contact per corner.
         box_vs_triangle_contacts_(shape, pos, rot, v0, v1, v2, face_normal,
-                                   [&](const glm::vec3&, const glm::vec3& on_tri, float penetration) {
-                                       uint32_t feature_id = (tri << 3) | (corner_index++ & 0x7u);
-                                       emit_point(on_tri, penetration, face_normal, feature_id);
+                                   [&](uint32_t corner_index, const glm::vec3& corner, float penetration, float) {
+                                       emit(corner + face_normal * (penetration * 0.5f), face_normal, penetration,
+                                            (tri << 3) | (corner_index & 0x7u));
                                    });
     } else {
         glm::vec3 on_shape, on_tri;
@@ -334,6 +357,147 @@ inline void mesh_triangle_contacts(const Shape& shape, const glm::vec3& pos, con
         glm::vec3 raw_normal = dist > util::k_epsilon ? diff / dist : face_normal;
         emit_point(on_tri, penetration, raw_normal, tri);
     }
+}
+
+/**
+ * @brief generate_mesh_contacts() for a Box: the two feature pairs that support a box on a
+ *        triangle mesh, reduced to a well-spread 4-point manifold.
+ *
+ * - **Box corners over a triangle**: a corner behind the triangle's plane whose projection
+ *   lies inside the triangle. Exactly inside -- not within box_vs_triangle_contacts_()'s
+ *   footprint -- because a corner within the footprint of a triangle it is NOT over is behind
+ *   that triangle's EXTENDED plane: on a rounded lip or a step a metre away that is a phantom
+ *   contact, which props a resting box up on an edge or kicks it sideways.
+ * - **Triangle vertices inside the box**: what holds a box up on a triangle smaller than its
+ *   face (a pillar top, a fine tessellation) when no corner is over any triangle. Depth: how far
+ *   the box reaches behind the triangle's plane.
+ *
+ * A triangle whose plane the box's centre is behind contributes nothing (see
+ * box_vs_triangle_contacts_()). Each corner keeps its least-penetrating triangle and each mesh
+ * vertex its first; the manifold is then the deepest point, the point farthest from it, the one
+ * farthest from that line and the one farthest from all three -- the usual spread reduction,
+ * in candidate order so it is deterministic -- under the penetration-weighted mean normal.
+ * Feature ids: a corner is its index (0-7), a vertex 8 + its first triangle * 3 + slot.
+ */
+inline bool generate_box_mesh_contacts_(const Shape& shape, const glm::vec3& pos, const glm::quat& rot,
+                                        const geometry::TriangleMesh& mesh, const glm::mat4& mesh_transform,
+                                        const glm::quat& mesh_world_rot, ContactManifold& out, bool use_bvh,
+                                        const Shape& mesh_shape) {
+    struct Candidate {
+        glm::vec3 point{0.0f}, normal{0.0f}, key{0.0f};
+        float     penetration = 0.0f;
+        uint32_t  feature_id = 0;
+    };
+    const geometry::OBB box = world_obb(shape, pos, rot);
+    glm::vec3 ax, ay, az;
+    box.axes(ax, ay, az);
+    const glm::vec3& he = box.half_extents;
+    glm::vec3 corner[8];
+    for (uint32_t c = 0; c < 8; ++c) {
+        corner[c] = box.center + ((c & 1u) ? he.x : -he.x) * ax + ((c & 2u) ? he.y : -he.y) * ay +
+                    ((c & 4u) ? he.z : -he.z) * az;
+    }
+    const float inside_eps = 1e-4f * std::max(1.0f, glm::length(he));
+
+    Candidate corners[8];
+    bool corner_valid[8] = {};
+    std::vector<Candidate> vertices;   // small: the vertices of the few triangles under a box
+
+    auto test = [&](uint32_t tri) {
+        glm::vec3 lv[3];
+        mesh.triangle_vertices(tri, lv[0], lv[1], lv[2]);
+        glm::vec3 v[3];
+        for (int k = 0; k < 3; ++k) v[k] = glm::vec3(mesh_transform * glm::vec4(lv[k], 1.0f));
+        const glm::vec3 n = glm::normalize(mesh_world_rot * mesh.triangle_normal(tri));
+        if (glm::dot(box.center - v[0], n) <= 0.0f) return;   // behind the face
+
+        float depth = 0.0f;   // how far the box reaches behind this triangle's plane
+        float dist[8];
+        for (uint32_t c = 0; c < 8; ++c) {
+            dist[c] = glm::dot(corner[c] - v[0], n);
+            depth = std::max(depth, -dist[c]);
+        }
+        if (depth <= 0.0f) return;
+
+        // Corners over the triangle.
+        for (uint32_t c = 0; c < 8; ++c) {
+            if (dist[c] >= 0.0f) continue;
+            const glm::vec3 plane_point = corner[c] - dist[c] * n;
+            const glm::vec3 bary = barycentric_(plane_point, v[0], v[1], v[2]);
+            if (bary.x < -1e-4f || bary.y < -1e-4f || bary.z < -1e-4f) continue;
+            const float pen = -dist[c];
+            if (corner_valid[c] && corners[c].penetration <= pen) continue;
+            corner_valid[c] = true;
+            corners[c] = Candidate{corner[c] + n * (pen * 0.5f), n, corner[c], pen, c};
+        }
+        // Triangle vertices inside the box.
+        for (int k = 0; k < 3; ++k) {
+            const glm::vec3 d = v[k] - box.center;
+            if (std::abs(glm::dot(d, ax)) > he.x + inside_eps || std::abs(glm::dot(d, ay)) > he.y + inside_eps ||
+                std::abs(glm::dot(d, az)) > he.z + inside_eps) continue;
+            bool seen = false;
+            for (const Candidate& c : vertices) seen = seen || glm::length(c.key - v[k]) < inside_eps;
+            if (seen) continue;
+            vertices.push_back(Candidate{v[k] - n * (depth * 0.5f), n, v[k], depth, 8u + tri * 3u + static_cast<uint32_t>(k)});
+        }
+    };
+    if (use_bvh) {
+        thread_local std::vector<uint32_t> candidates;
+        mesh_contact_candidates(shape, pos, rot, mesh_shape, mesh_transform, candidates);
+        for (uint32_t tri : candidates) test(tri);
+    } else {
+        for (size_t tri = 0; tri < mesh.triangle_count(); ++tri) test(static_cast<uint32_t>(tri));
+    }
+
+    std::vector<Candidate> all;
+    for (uint32_t c = 0; c < 8; ++c) if (corner_valid[c]) all.push_back(corners[c]);
+    all.insert(all.end(), vertices.begin(), vertices.end());
+    if (all.empty()) return false;
+
+    // Reduce to four well-spread points.
+    std::size_t pick[4];
+    std::size_t picked = 0;
+    auto taken = [&](std::size_t i) { return std::find(pick, pick + picked, i) != pick + picked; };
+    auto best = [&](auto&& score) {
+        std::size_t arg = all.size();
+        float top = -1.0f;
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            if (taken(i)) continue;
+            const float sc = score(all[i]);
+            if (sc > top + 1e-6f) { top = sc; arg = i; }
+        }
+        if (arg < all.size() && top > 1e-6f) pick[picked++] = arg;
+    };
+    {
+        std::size_t deepest = 0;
+        for (std::size_t i = 1; i < all.size(); ++i) {
+            if (all[i].penetration > all[deepest].penetration + 1e-6f) deepest = i;
+        }
+        pick[picked++] = deepest;
+    }
+    const glm::vec3 p0 = all[pick[0]].point;
+    best([&](const Candidate& c) { return glm::length(c.point - p0); });
+    if (picked == 2) {
+        const glm::vec3 p1 = all[pick[1]].point;
+        best([&](const Candidate& c) { return glm::length(glm::cross(p1 - p0, c.point - p0)); });
+    }
+    if (picked == 3) {
+        const glm::vec3 p1 = all[pick[1]].point, p2 = all[pick[2]].point;
+        best([&](const Candidate& c) {
+            return std::min({glm::length(c.point - p0), glm::length(c.point - p1), glm::length(c.point - p2)});
+        });
+    }
+    std::sort(pick, pick + picked);
+
+    glm::vec3 normal(0.0f);
+    for (std::size_t i = 0; i < picked; ++i) {
+        const Candidate& c = all[pick[i]];
+        out.add_point(c.point, c.penetration, c.feature_id);
+        normal += c.normal * std::max(c.penetration, 1e-4f);
+    }
+    const float len = glm::length(normal);
+    out.normal = len > 1e-6f ? normal / len : all[pick[0]].normal;
+    return true;
 }
 
 /**
@@ -359,6 +523,10 @@ inline bool generate_mesh_contacts(const Shape& shape, const glm::vec3& pos, con
 
     const glm::mat4 mesh_transform = mesh_world_transform(mesh_shape, mesh_pos, mesh_rot);
     const glm::quat mesh_world_rot = mesh_rot * mesh_shape.local_rotation;
+
+    if (shape.type == ShapeType::Box) {
+        return generate_box_mesh_contacts_(shape, pos, rot, mesh, mesh_transform, mesh_world_rot, out, use_bvh, mesh_shape);
+    }
 
     bool any_hit = false;
     glm::vec3 best_normal(0.0f, 0.0f, 1.0f);

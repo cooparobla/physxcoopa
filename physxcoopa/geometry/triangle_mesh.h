@@ -1,8 +1,10 @@
 /**
  * @file triangle_mesh.h
  * @brief Format-agnostic static triangle mesh: welded vertices, per-triangle normals and
- *        edge adjacency. Construction is from raw arrays only -- asset loading (weld,
- *        fan-triangulation, BVH construction) is physxcoopa::loaders::TriangleMeshLoader.
+ *        edge adjacency. Construction is from raw arrays only: from_triangles() welds and
+ *        builds adjacency from an unwelded triangle list (runtime geometry -- a streamed
+ *        terrain chunk, say); asset loading is physxcoopa::loaders::TriangleMeshLoader, which
+ *        parses and fan-triangulates a mesh YAML and then calls from_triangles().
  */
 
 #ifndef PHYSXCOOPA_GEOMETRY_TRIANGLE_MESH_H
@@ -15,14 +17,34 @@
 
 #include <glm/glm.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace coopa {
 namespace physx {
 namespace geometry {
+
+namespace detail {
+
+/** @brief Packs two triangle-vertex indices into an order-independent 64-bit edge key. */
+inline uint64_t edge_key(uint32_t a, uint32_t b) {
+    uint32_t lo = a < b ? a : b;
+    uint32_t hi = a < b ? b : a;
+    return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+}
+
+/** @brief Packs a quantized 3D grid cell into a 64-bit key for the welding spatial hash. */
+inline uint64_t cell_key(int32_t x, int32_t y, int32_t z) {
+    auto to_u = [](int32_t v) { return static_cast<uint64_t>(static_cast<uint32_t>(v)) & 0x1FFFFFu; };
+    return (to_u(x) << 42) | (to_u(y) << 21) | to_u(z);
+}
+
+} // namespace detail
 
 /** @brief Sentinel neighbour-triangle index meaning "no neighbour" (boundary edge). */
 inline constexpr uint32_t k_no_neighbor = 0xFFFFFFFFu;
@@ -68,6 +90,115 @@ public:
           adjacency_(std::move(adjacency)) {
         bounds_ = compute_bounds_();
         bvh_.build(vertices_, indices_);
+    }
+
+    /**
+     * @brief Builds a collision mesh from an UNWELDED triangle list: welds coincident vertices
+     *        (epsilon relative to the mesh's own bounds), drops triangles welding made
+     *        degenerate, and computes face normals, edge adjacency and the BVH.
+     *
+     * Welding is not an optimisation: render and exported meshes split vertices per face
+     * corner (or per normal), and edge adjacency only finds shared edges between welded
+     * vertices. An edge owned by more than two triangles is left unconnected.
+     *
+     * @param positions          Vertex positions (any duplication).
+     * @param indices            Triangle list, 3 indices per triangle, into `positions`.
+     * @param non_manifold_edges Optional: receives the number of edges left unconnected
+     *                           because more than two triangles share them.
+     */
+    static TriangleMesh from_triangles(const std::vector<glm::vec3>& positions, const std::vector<uint32_t>& indices,
+                                       size_t* non_manifold_edges = nullptr) {
+        if (non_manifold_edges) *non_manifold_edges = 0;
+        if (positions.empty() || indices.size() < 3) return TriangleMesh();
+
+        // --- Weld via a spatial hash ---
+        glm::vec3 bounds_min(positions[0]), bounds_max(positions[0]);
+        for (const auto& v : positions) {
+            bounds_min = glm::min(bounds_min, v);
+            bounds_max = glm::max(bounds_max, v);
+        }
+        const float diagonal = glm::length(bounds_max - bounds_min);
+        const float epsilon = diagonal > 0.0f ? diagonal * 1e-4f : 1e-5f;
+        const float cell_size = epsilon > 0.0f ? epsilon : 1e-5f;
+
+        std::vector<glm::vec3> welded;
+        std::vector<uint32_t> remap(positions.size());
+        std::unordered_multimap<uint64_t, uint32_t> spatial_hash; // cell key -> welded index
+        spatial_hash.reserve(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i) {
+            const glm::vec3& p = positions[i];
+            const glm::ivec3 cell(static_cast<int32_t>(std::floor(p.x / cell_size)),
+                                  static_cast<int32_t>(std::floor(p.y / cell_size)),
+                                  static_cast<int32_t>(std::floor(p.z / cell_size)));
+            uint32_t found = UINT32_MAX;
+            for (int dx = -1; dx <= 1 && found == UINT32_MAX; ++dx) {
+                for (int dy = -1; dy <= 1 && found == UINT32_MAX; ++dy) {
+                    for (int dz = -1; dz <= 1 && found == UINT32_MAX; ++dz) {
+                        auto range = spatial_hash.equal_range(detail::cell_key(cell.x + dx, cell.y + dy, cell.z + dz));
+                        for (auto it = range.first; it != range.second; ++it) {
+                            if (glm::length(welded[it->second] - p) <= epsilon) {
+                                found = it->second;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (found == UINT32_MAX) {
+                found = static_cast<uint32_t>(welded.size());
+                welded.push_back(p);
+                spatial_hash.emplace(detail::cell_key(cell.x, cell.y, cell.z), found);
+            }
+            remap[i] = found;
+        }
+
+        // --- Remap triangles, dropping any made degenerate by welding ---
+        std::vector<uint32_t> out_indices;
+        out_indices.reserve(indices.size());
+        for (size_t t = 0; t + 2 < indices.size(); t += 3) {
+            const uint32_t a = remap[indices[t + 0]];
+            const uint32_t b = remap[indices[t + 1]];
+            const uint32_t c = remap[indices[t + 2]];
+            if (a == b || b == c || a == c) continue;
+            const glm::vec3 n = glm::cross(welded[b] - welded[a], welded[c] - welded[a]);
+            if (glm::length(n) <= 1e-8f) continue;
+            out_indices.push_back(a);
+            out_indices.push_back(b);
+            out_indices.push_back(c);
+        }
+        const size_t triangle_count = out_indices.size() / 3;
+
+        // --- Face normals ---
+        std::vector<glm::vec3> normals(triangle_count);
+        for (size_t t = 0; t < triangle_count; ++t) {
+            const glm::vec3& a = welded[out_indices[t * 3 + 0]];
+            const glm::vec3& b = welded[out_indices[t * 3 + 1]];
+            const glm::vec3& c = welded[out_indices[t * 3 + 2]];
+            normals[t] = glm::normalize(glm::cross(b - a, c - a));
+        }
+
+        // --- Edge adjacency: edge key -> owning (triangle, edge slot) occurrences ---
+        std::vector<TriangleAdjacency> adjacency(triangle_count);
+        std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> edge_owners;
+        edge_owners.reserve(triangle_count * 2);
+        for (uint32_t t = 0; t < triangle_count; ++t) {
+            for (uint32_t e = 0; e < 3; ++e) {
+                const uint32_t v0 = out_indices[t * 3 + e];
+                const uint32_t v1 = out_indices[t * 3 + (e + 1) % 3];
+                edge_owners[detail::edge_key(v0, v1)].push_back({t, e});
+            }
+        }
+        for (const auto& entry : edge_owners) {
+            const auto& owners = entry.second;
+            if (owners.size() == 2) {
+                adjacency[owners[0].first].neighbor[owners[0].second] = owners[1].first;
+                adjacency[owners[1].first].neighbor[owners[1].second] = owners[0].first;
+            } else if (owners.size() > 2 && non_manifold_edges) {
+                ++*non_manifold_edges;
+            }
+            // owners.size() == 1: boundary edge, k_no_neighbor is already the default.
+        }
+        return TriangleMesh(std::move(welded), std::move(out_indices), std::move(normals), std::move(adjacency));
     }
 
     /**

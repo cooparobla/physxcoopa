@@ -77,7 +77,11 @@ debug geometry as plain line segments to draw however you like.
   surface. A character motor uses it to resolve overlaps before sweeping.
 - **Mesh colliders.** Meshes are welded and get a BVH. Contacts, casts and penetration tests
   only test the triangles the BVH returns. Internal edges are corrected, so a box slides across
-  a tiled floor without catching on seams.
+  a tiled floor without catching on seams. A box rests on a mesh by its corners that are over a
+  triangle plus the triangle vertices inside it, reduced to four well-spread points; a face the
+  box's centre is behind is ignored, so a ledge's wall never pushes a box off it. Runtime
+  geometry needs no asset: `TriangleMesh::from_triangles()` welds and builds adjacency, and
+  `MeshCollider::set_mesh()` takes the result by `shared_ptr`.
 
 ### Character motor
 - **`character::move()`** moves a kinematic capsule by a desired displacement and reports where
