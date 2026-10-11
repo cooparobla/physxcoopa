@@ -53,6 +53,11 @@ public:
     bool is_kinematic = false;
     dynamics::Interpolation interpolation = dynamics::Interpolation::Interpolate;
     uint32_t constraints = dynamics::kConstraintNone;
+    /** @brief How hard the host engine's weather wind pushes this body (kg/m: roughly 0.6 x the
+     *         area it shows the wind, m^2). 0 = ignores the wind (the default). Read by the host
+     *         (toyengine's WindSystem), which applies influence * |rel| * rel each substep, rel =
+     *         the wind minus the body's horizontal velocity. */
+    float wind_influence = 0.0f;
 
     /** @brief Initial linear/angular velocity, applied once when PhysicsSystem's reconcile
      *         pass creates this Rigidbody's body (Dynamic bodies only -- a Kinematic body's

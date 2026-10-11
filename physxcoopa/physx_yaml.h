@@ -214,6 +214,7 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
             if (node.contains("mass")) rb->mass = node.at("mass").get_value<float>();
             if (node.contains("drag")) rb->drag = node.at("drag").get_value<float>();
             if (node.contains("angular_drag")) rb->angular_drag = node.at("angular_drag").get_value<float>();
+            if (node.contains("wind_influence")) rb->wind_influence = node.at("wind_influence").get_value<float>();
             if (node.contains("use_gravity")) rb->use_gravity = node.at("use_gravity").get_value<bool>();
             if (node.contains("is_kinematic")) rb->is_kinematic = node.at("is_kinematic").get_value<bool>();
             if (node.contains("interpolation")) {
@@ -308,6 +309,7 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
             p.external_acceleration = detail::read_vec3_(node, "external_acceleration", p.external_acceleration);
             p.wind = detail::read_vec3_(node, "wind", p.wind);
             if (node.contains("wind_turbulence")) p.wind_turbulence = node.at("wind_turbulence").get_value<float>();
+            if (node.contains("weather_wind")) cc->weather_wind = node.at("weather_wind").get_value<float>();
             if (node.contains("air_drag")) p.air_drag = node.at("air_drag").get_value<float>();
             if (node.contains("air_lift")) p.air_lift = node.at("air_lift").get_value<float>();
             if (node.contains("self_collision")) p.self_collision = node.at("self_collision").get_value<bool>();

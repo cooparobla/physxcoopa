@@ -101,6 +101,10 @@ public:
     float mass = 1.0f;              /**< Total sheet mass in kg, split evenly across particles. */
     bool shear = true;              /**< Emit diagonal shear constraints; see GridClothDesc. */
     cloth::ClothParams params;      /**< Solver tunables; see cloth/cloth.h. */
+    /** @brief How much of the host engine's weather wind (gusts included) blows this cloth, on
+     *         top of `params.wind`: 1 = all of it (the default), 0 = only the authored wind. Read
+     *         by the host (toyengine's WindSystem), which writes the live cloth's params.wind. */
+    float weather_wind = 1.0f;
     std::vector<ClothAnchorSpec> anchors; /**< Pinned regions, resolved at bind time. */
 
     /** @brief Set only by PhysicsSystem's reconcile pass, once the cloth is actually created. */
