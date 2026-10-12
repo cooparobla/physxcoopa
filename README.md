@@ -58,6 +58,12 @@ debug geometry as plain line segments to draw however you like.
   No motors or springs.
 - **Per-axis freezing** of position and rotation, center-of-mass and inertia overrides, linear
   and angular drag.
+- **Gravity sources** (planets). `add_gravity_source({centre, strength, radius, range})` adds a
+  point pull: `strength` up to `radius`, falling off with the square of the distance beyond it,
+  none past `range` (0: everywhere). `gravity_at(p)` is the strongest source acting at `p`, else
+  the uniform gravity; `up_at(p)` points away from that source (even one at zero strength). Every
+  body integrates the pull at its own position, cloth the pull at its centre. With no sources --
+  every scene that does not add one -- the step is exactly the uniform-gravity step.
 
 ### Collision and queries
 - **Broadphase.** Two dynamic AABB trees (static and moving) and a persistent pair cache.
@@ -91,6 +97,9 @@ debug geometry as plain line segments to draw however you like.
 - **Each move** depenetrates, then collides and slides with a skin gap, steps up ledges no taller
   than `step_height`, treats slopes steeper than `slope_limit_deg` as walls (and slides down
   them), and snaps down to the ground by `snap_distance` while grounded.
+- **Any up.** `MoveOptions::up` (default +Z) sets which way is up for the move -- the walkable
+  test, step-up, snap and the capsule's orientation -- so a capsule can walk round a planet with
+  `up = world.up_at(position)`.
 - A gameplay controller on top of it (velocity, jumps, platforms, pushing) lives in toyengine's
   `CharacterController`. See [`physxcoopa/character/README.md`](physxcoopa/character/README.md).
 

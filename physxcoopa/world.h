@@ -1053,7 +1053,67 @@ public:
     // --- Configuration ---
 
     void set_gravity(const glm::vec3& g) { gravity_ = g; }
+    /** @brief The uniform gravity: what acts wherever no gravity source does. */
     const glm::vec3& gravity() const { return gravity_; }
+
+    /**
+     * @struct GravitySource
+     * @brief A body that pulls toward its centre -- a planet. Inside `radius` the pull is
+     *        `strength` (m/s^2); beyond it, it falls off with the square of the distance; past
+     *        `range` (0: everywhere) it stops.
+     */
+    struct GravitySource {
+        glm::vec3 centre{0.0f};
+        float strength = 9.81f;   ///< Acceleration at (and under) the surface, m/s^2.
+        float radius = 1.0f;      ///< Surface radius: full strength up to here.
+        float range = 0.0f;       ///< Reach; 0 is unlimited.
+    };
+
+    /** @brief Adds a gravity source; returns its id. */
+    uint32_t add_gravity_source(const GravitySource& source) {
+        const uint32_t id = next_gravity_id_++;
+        gravity_sources_.push_back({id, source});
+        return id;
+    }
+    /** @brief Moves or re-tunes a source (a planet that moves, say). False if it is gone. */
+    bool update_gravity_source(uint32_t id, const GravitySource& source) {
+        for (auto& entry : gravity_sources_) {
+            if (entry.first == id) { entry.second = source; return true; }
+        }
+        return false;
+    }
+    void remove_gravity_source(uint32_t id) {
+        gravity_sources_.erase(std::remove_if(gravity_sources_.begin(), gravity_sources_.end(),
+                                              [id](const auto& e) { return e.first == id; }),
+                               gravity_sources_.end());
+    }
+    std::size_t gravity_source_count() const { return gravity_sources_.size(); }
+
+    /**
+     * @brief The gravity acting at a point: the strongest source pulling there, or the uniform
+     *        `gravity()` where none reaches. With no sources (every flat scene) it is exactly
+     *        `gravity()`.
+     */
+    glm::vec3 gravity_at(const glm::vec3& p) const {
+        if (gravity_sources_.empty()) return gravity_;
+        glm::vec3 up;
+        return field_at_(p, up);
+    }
+
+    /**
+     * @brief Which way is up at a point: away from the source acting there (even one pulling
+     *        with zero strength, as a planet does until its ground is ready), else against the
+     *        uniform gravity (+Z where nothing pulls).
+     */
+    glm::vec3 up_at(const glm::vec3& p) const {
+        if (!gravity_sources_.empty()) {
+            glm::vec3 up;
+            field_at_(p, up);
+            if (glm::length(up) > 0.5f) return up;
+        }
+        const float len = glm::length(gravity_);
+        return len > 1e-6f ? -gravity_ / len : glm::vec3(0.0f, 0.0f, 1.0f);
+    }
 
     util::PhysicsConfig& config() { return config_; }
     const util::PhysicsConfig& config() const { return config_; }
@@ -1124,9 +1184,16 @@ public:
 
         in_step_ = true;
 
-        for_each_body([&](dynamics::BodyId, dynamics::Body& b) {
-            dynamics::apply_gravity(b, gravity_);
-        });
+        if (gravity_sources_.empty()) {
+            for_each_body([&](dynamics::BodyId, dynamics::Body& b) {
+                dynamics::apply_gravity(b, gravity_);
+            });
+        } else {
+            // Each body under whatever pulls where it is (a planet's centre, say).
+            for_each_body([&](dynamics::BodyId, dynamics::Body& b) {
+                dynamics::apply_gravity(b, gravity_at(b.position));
+            });
+        }
         for_each_body([&](dynamics::BodyId, dynamics::Body& b) {
             dynamics::integrate_forces(b, h);
         });
@@ -1658,7 +1725,8 @@ private:
                 continue;
             }
 
-            cloth::solve_cloth(c, cloth_colliders_, gravity_, frame_substeps,
+            cloth::solve_cloth(c, cloth_colliders_,
+                               gravity_sources_.empty() ? gravity_ : gravity_at(cloth_centre_(c)), frame_substeps,
                                config_.cloth_iterations, dt, cloth_scratch_);
 
             // --- Sleep bookkeeping ---
@@ -1759,6 +1827,39 @@ private:
     coopa::debug::Logger logger_;
 
     glm::vec3 gravity_{0.0f, 0.0f, util::k_gravity_z};
+    std::vector<std::pair<uint32_t, GravitySource>> gravity_sources_;   ///< See add_gravity_source().
+
+    /// gravity_at() over the sources: the strongest acting at `p` (or the uniform gravity), and in
+    /// `up` the unit direction away from that source's centre (zero when none acts).
+    glm::vec3 field_at_(const glm::vec3& p, glm::vec3& up) const {
+        float best = 0.0f;
+        glm::vec3 pull = gravity_;
+        up = glm::vec3(0.0f);
+        bool found = false;
+        for (const auto& entry : gravity_sources_) {
+            const GravitySource& g = entry.second;
+            const glm::vec3 d = g.centre - p;
+            const float r = glm::length(d);
+            if (g.range > 0.0f && r > g.range) continue;
+            if (r < 1e-6f) continue;   // at the very centre there is no "down"
+            const float a = r <= g.radius ? g.strength : g.strength * (g.radius / r) * (g.radius / r);
+            if (!found || a > best) {
+                best = a;
+                pull = d / r * a;
+                up = -d / r;
+                found = true;
+            }
+        }
+        return found ? pull : gravity_;
+    }
+    uint32_t next_gravity_id_ = 1;
+
+    /** @brief A cloth's mean particle position, where a gravity source is read for it. */
+    static glm::vec3 cloth_centre_(const cloth::Cloth& c) {
+        glm::vec3 sum(0.0f);
+        for (const cloth::ClothParticle& p : c.particles) sum += p.position;
+        return c.particles.empty() ? sum : sum / static_cast<float>(c.particles.size());
+    }
 
     std::vector<dynamics::Body> bodies_;
     std::vector<uint32_t> generations_;

@@ -112,6 +112,13 @@ struct MoveOptions {
      *         leaves the ground. Without it, an upward move still probes when `was_grounded`
      *         (a character carried up by a lift stays grounded on it). */
     bool jumping = false;
+    /**
+     * @brief Which way is up for this move (unit length): what "horizontal", "ground", "step up"
+     *        and the capsule's axis are measured against. +Z, the world's up, by default; a
+     *        character on a planet passes the planet's up where it stands
+     *        (`PhysicsWorld::up_at()`). At exactly +Z the motor runs its original arithmetic.
+     */
+    glm::vec3 up = k_up;
 };
 
 /**
@@ -145,6 +152,17 @@ inline bool is_walkable(const glm::vec3& normal, const MotorSettings& s) {
     return glm::dot(normal, k_up) >= std::cos(glm::radians(std::clamp(s.slope_limit_deg, 0.0f, 89.9f))) - 1e-4f;
 }
 
+/** @brief `is_walkable()` against an `up` of the caller's (a planet's, say). */
+inline bool is_walkable(const glm::vec3& normal, const MotorSettings& s, const glm::vec3& up) {
+    return glm::dot(normal, up) >= std::cos(glm::radians(std::clamp(s.slope_limit_deg, 0.0f, 89.9f))) - 1e-4f;
+}
+
+/** @brief The rotation that stands the motor's Z-axis capsule along `up` (identity for +Z). */
+inline glm::quat motor_orientation(const glm::vec3& up) {
+    if (up == k_up) return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    return glm::quat(k_up, glm::normalize(up));   // the shortest arc from +Z to up
+}
+
 namespace detail {
 
 struct Ctx {
@@ -152,13 +170,21 @@ struct Ctx {
     const collision::Shape shape;
     const query::QueryFilter& filter;
     const MotorSettings& s;
+    glm::vec3 up = k_up;                                   ///< The move's up (MoveOptions::up).
+    glm::quat orientation{1.0f, 0.0f, 0.0f, 0.0f};         ///< The capsule stood along `up`.
 };
 
 inline bool cast(const Ctx& c, const glm::vec3& pos, const glm::vec3& dir, float dist, query::RaycastHit& hit) {
-    return c.world.shape_cast(c.shape, pos, glm::quat(1.0f, 0.0f, 0.0f, 0.0f), dir, dist, hit, c.filter);
+    return c.world.shape_cast(c.shape, pos, c.orientation, dir, dist, hit, c.filter);
 }
 
 inline glm::vec3 horizontal(const glm::vec3& v) { return glm::vec3(v.x, v.y, 0.0f); }
+
+/** @brief `v` less its part along `up` -- exactly `horizontal(v)` for +Z. */
+inline glm::vec3 horizontal(const glm::vec3& v, const glm::vec3& up) {
+    if (up == k_up) return horizontal(v);
+    return v - up * glm::dot(v, up);
+}
 
 /**
  * @brief Whether `hit` (a contact under/beside the capsule centred at `center`) is ground the
@@ -167,24 +193,25 @@ inline glm::vec3 horizontal(const glm::vec3& v) { return glm::vec3(v.x, v.y, 0.0
  */
 inline bool ground_at(const Ctx& c, const query::RaycastHit& hit, const glm::vec3& center, glm::vec3& normal,
                       float* surface_height = nullptr) {
-    if (is_walkable(hit.normal, c.s)) {
+    const glm::vec3& up = c.up;
+    if (is_walkable(hit.normal, c.s, up)) {
         normal = hit.normal;
-        if (surface_height) *surface_height = glm::dot(hit.point, k_up);
+        if (surface_height) *surface_height = glm::dot(hit.point, up);
         return true;
     }
-    if (glm::dot(hit.normal, k_up) <= 0.02f) return false; // a wall or a ceiling, not an edge
-    glm::vec3 out = horizontal(hit.point - center);
+    if (glm::dot(hit.normal, up) <= 0.02f) return false; // a wall or a ceiling, not an edge
+    glm::vec3 out = horizontal(hit.point - center, up);
     const float len = glm::length(out);
     out = len > 1e-5f ? out / len : glm::vec3(0.0f);
     geometry::Ray ray;
-    ray.origin = hit.point + out * 0.02f + k_up * 0.05f;
-    ray.direction = -k_up;
+    ray.origin = hit.point + out * 0.02f + up * 0.05f;
+    ray.direction = -up;
     ray.max_distance = 0.1f;
     query::RaycastHit rh;
     if (!c.world.raycast(ray, rh, c.filter)) return false;
-    if (!is_walkable(rh.normal, c.s)) return false;
+    if (!is_walkable(rh.normal, c.s, up)) return false;
     normal = rh.normal;
-    if (surface_height) *surface_height = glm::dot(rh.point, k_up);
+    if (surface_height) *surface_height = glm::dot(rh.point, up);
     return true;
 }
 
@@ -239,31 +266,36 @@ inline SlideOut slide(const Ctx& c, glm::vec3 pos, glm::vec3 delta, bool horizon
         mh.remaining = len - travel;
         mh.body = hit.body;
         mh.shape_index = hit.shape_index;
-        mh.walkable = is_walkable(hit.normal, c.s);
+        mh.walkable = is_walkable(hit.normal, c.s, c.up);
         out.hits.push_back(mh);
 
         glm::vec3 n = hit.normal;
-        const float n_up = glm::dot(n, k_up);
-        if (n_up < -0.3f && glm::dot(dir, k_up) > 0.0f) out.hit_ceiling = true;
+        const float n_up = glm::dot(n, c.up);
+        if (n_up < -0.3f && glm::dot(dir, c.up) > 0.0f) out.hit_ceiling = true;
 
         if (horizontal_phase) {
-            if (is_walkable(n, c.s)) {
+            if (is_walkable(n, c.s, c.up)) {
                 // A ramp: follow it, keeping the horizontal speed (walking up a ramp isn't slower).
-                const float h_len = glm::length(horizontal(remaining));
+                const float h_len = glm::length(horizontal(remaining, c.up));
                 glm::vec3 p = remaining - n * glm::dot(remaining, n);
-                const float p_len = glm::length(horizontal(p));
+                const float p_len = glm::length(horizontal(p, c.up));
                 remaining = p_len > 1e-6f ? p * (h_len / p_len) : glm::vec3(0.0f);
             } else {
                 out.blocked = true;
-                const glm::vec3 nh = horizontal(n);
+                const glm::vec3 nh = horizontal(n, c.up);
                 if (glm::length(nh) > 1e-4f) n = glm::normalize(nh); // steep slope -> vertical wall
                 remaining = clip_into(remaining, n);
                 // Never let a wall or ceiling lift the character.
-                if (remaining.z > 0.0f) remaining.z = 0.0f;
+                if (c.up == k_up) {
+                    if (remaining.z > 0.0f) remaining.z = 0.0f;
+                } else {
+                    const float lift = glm::dot(remaining, c.up);
+                    if (lift > 0.0f) remaining -= c.up * lift;
+                }
             }
         } else {
             glm::vec3 ground_n;
-            if (glm::dot(dir, k_up) < 0.0f && ground_at(c, hit, pos, ground_n)) {
+            if (glm::dot(dir, c.up) < 0.0f && ground_at(c, hit, pos, ground_n)) {
                 out.hits.back().walkable = true;
                 out.landed = true;
                 break;
@@ -307,8 +339,9 @@ inline MoveResult move(const PhysicsWorld& world, const glm::vec3& position, con
                        const MoveOptions& options = {}) {
     query::QueryFilter f = filter;
     f.include_triggers = false;
-    const detail::Ctx c{world, motor_capsule(settings), f, settings};
-    const glm::quat identity(1.0f, 0.0f, 0.0f, 0.0f);
+    const glm::vec3 k_up = options.up;   // this move's up; shadows the world's +Z below
+    const detail::Ctx c{world, motor_capsule(settings), f, settings, k_up, motor_orientation(k_up)};
+    const glm::quat identity = c.orientation;
 
     MoveResult r;
     glm::vec3 pos = position;
@@ -325,7 +358,7 @@ inline MoveResult move(const PhysicsWorld& world, const glm::vec3& position, con
         r.depenetration += push;
     }
 
-    const glm::vec3 horiz = detail::horizontal(displacement);
+    const glm::vec3 horiz = detail::horizontal(displacement, k_up);
     const float vert = glm::dot(displacement, k_up);
 
     // 2./3. Horizontal slide, with a step-up retry when blocked.
@@ -345,8 +378,8 @@ inline MoveResult move(const PhysicsWorld& world, const glm::vec3& position, con
                 const float min_step = 2.0f * settings.skin + 0.01f;
                 const glm::vec3 b_horiz = h_len < min_step ? horiz * (min_step / h_len) : horiz;
                 detail::SlideOut b = detail::slide(c, pos + k_up * rise, b_horiz, true);
-                const float progress_a = glm::length(detail::horizontal(a.pos - pos));
-                const float progress_b = glm::length(detail::horizontal(b.pos - pos));
+                const float progress_a = glm::length(detail::horizontal(a.pos - pos, k_up));
+                const float progress_b = glm::length(detail::horizontal(b.pos - pos, k_up));
                 query::RaycastHit down_hit;
                 glm::vec3 land_n;
                 float ledge = 0.0f;
