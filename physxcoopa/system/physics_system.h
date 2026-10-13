@@ -100,9 +100,12 @@ public:
      *        adding/removing a Collider (or its owning SceneObject) at runtime -- exactly
      *        the same contract AnimationSystem::refresh() documents.
      *
-     * Safe under a missed call: the next real refresh only ever *erases* entries absent
-     * from the fresh gather; a forgotten refresh after destroying an object leaks a body
-     * until the next refresh, it never dereferences a stale pointer.
+     * Required, not advisory: every per-binding pass dereferences Binding::collider and its
+     * owner (prime_transforms_() takes that object's Transform), so a binding left over from a
+     * destroyed collider is a read of freed memory. Destroying a Collider -- or the
+     * SceneObject carrying one -- without calling this is a use-after-free waiting for the
+     * next step. (Collider::instance_id() keeps a RECYCLED collider address from being
+     * mistaken for the one that was freed, but it cannot conjure a gather nobody asked for.)
      */
     void refresh() { dirty_ = true; }
 
@@ -140,6 +143,13 @@ private:
      */
     struct Binding {
         components::Collider* collider = nullptr;
+        /** @brief `collider`'s Collider::instance_id() when this binding was built.
+         *
+         * What tells "the same collider" from "another collider that happens to sit where the
+         * last one was freed" -- which a streaming world produces constantly, and which, taken
+         * for the same collider, had this reuse a body and a `sync_owner` belonging to an
+         * object that no longer exists. */
+        std::uint64_t collider_id = 0;
         dynamics::BodyId body;
         /** @brief This collider's own shape slot within `body` (PhysicsWorld::shape_at()'s
          *         return type) -- always valid; for a single (non-compound) binding this is
@@ -259,7 +269,12 @@ private:
             bool all_old = true;
             for (auto* col : members) {
                 auto it = old_by_collider.find(col);
-                if (it == old_by_collider.end()) { all_old = false; continue; }
+                // The id, not just the pointer: an entry left by a collider freed since last
+                // frame can be found again under the address its replacement was given.
+                if (it == old_by_collider.end() || it->second.collider_id != col->instance_id()) {
+                    all_old = false;
+                    continue;
+                }
                 old_body_indices.insert(it->second.body.index);
             }
 
@@ -284,7 +299,10 @@ private:
         // Destroy bodies for colliders that no longer exist at all -- remove_body() no-ops on
         // an already-dead BodyId, so this is safe even where a rebuild above already handled it.
         for (const auto& kv : old_by_collider) {
-            if (current_set.find(kv.first) != current_set.end()) continue;
+            const auto live = current_set.find(kv.first);
+            // Present by address but a different instance: the collider this body was built
+            // for is gone, so the body goes with it (the replacement gets its own above).
+            if (live != current_set.end() && (*live)->instance_id() == kv.second.collider_id) continue;
             collider_by_index_.erase(kv.second.body.index);
             collider_by_shape_index_.erase(kv.second.shape_index);
             world_.remove_body(kv.second.body);
@@ -857,6 +875,7 @@ private:
 
             Binding b;
             b.collider = children[i].col;
+            b.collider_id = children[i].col->instance_id();
             b.body = id;
             b.shape_index = slot;
             b.last_revision = children[i].col->revision();

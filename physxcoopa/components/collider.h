@@ -18,6 +18,7 @@
 
 #include <glm/glm.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -105,6 +106,17 @@ public:
     /** @brief Bumped by every setter above (and by a subclass's own shape-parameter setters). */
     uint32_t revision() const { return revision_; }
 
+    /**
+     * @brief This collider instance's identity, unique for the life of the process.
+     *
+     * Its ADDRESS is not an identity: a destroyed collider's block is routinely handed straight
+     * back to the next one, which a world that streams collider objects in and out does many
+     * times a second. Anything that caches state per collider across frames -- PhysicsSystem's
+     * bindings -- must compare this, or it will mistake a new collider for the one that was
+     * freed and keep bookkeeping (a body, an owning object) that belongs to a dead object.
+     */
+    std::uint64_t instance_id() const { return instance_id_; }
+
     /** @brief The physics body this collider is currently bound to, or an invalid id before
      *         PhysicsSystem's first reconcile pass. Set only by PhysicsSystem. */
     dynamics::BodyId body_id() const { return body_id_; }
@@ -127,6 +139,13 @@ protected:
     void bump_revision_() { ++revision_; }
 
 private:
+    /** @brief Hands out instance_id(); monotonic, and atomic because colliders are built on
+     *         whatever thread loads or spawns their object. */
+    static std::uint64_t next_instance_id_() {
+        static std::atomic<std::uint64_t> counter{1};
+        return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
     bool is_trigger_ = false;
     bool enabled_ = true;
     uint32_t layer_ = 0;
@@ -136,6 +155,7 @@ private:
 
     uint32_t revision_ = 0;
     dynamics::BodyId body_id_;
+    const std::uint64_t instance_id_ = next_instance_id_();
 };
 
 } // namespace components
