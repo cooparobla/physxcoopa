@@ -516,3 +516,70 @@ COOPA_TEST(hierarchical_bodies_write_back_correct_local_poses_in_parallel) {
         ASSERT_NEAR(glm::length(p1 - p0), 0.5f, 0.03f);
     }
 }
+
+/**
+ * A kinematic body's velocity is derived from how far its Transform moved, so there is no way to
+ * tell a platform travelling fast from a body that was simply PUT somewhere -- a spawn dropped on
+ * the ground, a character teleported, an animated bone whose clip cut to a new pose. The derived
+ * figure for a placement is the distance over one frame, which is hundreds of m/s, and the solver
+ * believes it: whatever dynamic body is in contact gets launched. Past
+ * PhysicsConfig::max_kinematic_speed, the move is read as the placement it is -- the body is
+ * placed, and its velocity left at zero.
+ */
+COOPA_TEST(a_placed_kinematic_body_reports_no_velocity) {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsKinematicTeleportTest");
+    auto obj = std::make_unique<SceneObject>("platform");
+    obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f));
+    obj->add_component<components::BoxCollider>()->set_size(glm::vec3(1.0f));
+    auto* rb = obj->add_component<components::RigidbodyComponent>();
+    rb->is_kinematic = true;
+    rb->use_gravity = false;
+    scene.add_root_object(std::move(obj));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    const float dt = util::k_default_fixed_dt;
+    scene.update(dt);
+
+    SceneObject* platform = scene.find_object("platform");
+    coopa::util::Transform& t = platform->get_transform()->transform();
+    const dynamics::BodyId id = platform->get_component<components::BoxCollider>()->body_id();
+    ASSERT_TRUE(id.is_valid());
+
+    // Driven: 3 m/s along +x is a platform moving, and the derivation is what makes a character
+    // standing on it ride along.
+    t.set_position(glm::vec3(3.0f * dt, 0.0f, 0.0f));
+    scene.update(dt);
+    ASSERT_VEC_NEAR(sys->world().get_body(id)->linear_velocity, glm::vec3(3.0f, 0.0f, 0.0f), 1e-3f);
+
+    // Placed: 40 m in one frame is 2400 m/s, which is nothing moving -- it is a teleport.
+    t.set_position(glm::vec3(0.0f, 40.0f, 0.0f));
+    scene.update(dt);
+    const dynamics::Body* body = sys->world().get_body(id);
+    ASSERT_VEC_NEAR(body->linear_velocity, glm::vec3(0.0f), 1e-6f);
+    ASSERT_VEC_NEAR(body->angular_velocity, glm::vec3(0.0f), 1e-6f);
+    ASSERT_VEC_NEAR(body->position, glm::vec3(0.0f, 40.0f, 0.0f), 1e-4f);   // but it IS there
+
+    // ...and it is moving again on the next ordinary step, from where it was placed.
+    t.set_position(glm::vec3(0.0f, 40.0f + 2.0f * dt, 0.0f));
+    scene.update(dt);
+    ASSERT_VEC_NEAR(sys->world().get_body(id)->linear_velocity, glm::vec3(0.0f, 2.0f, 0.0f), 1e-3f);
+
+    // A spin no body turns at is the same story: both velocities go, not just the one that broke
+    // its cap, since a placement moves and turns at once.
+    t.set_position(glm::vec3(0.0f, 40.0f + 2.0f * dt, 0.0f));
+    t.set_rotation_quat(glm::angleAxis(2.0f, glm::vec3(0.0f, 0.0f, 1.0f)));
+    scene.update(dt);
+    body = sys->world().get_body(id);
+    ASSERT_VEC_NEAR(body->linear_velocity, glm::vec3(0.0f), 1e-6f);
+    ASSERT_VEC_NEAR(body->angular_velocity, glm::vec3(0.0f), 1e-6f);
+
+    // Turning the detection off restores the raw derivation.
+    sys->world().config().max_kinematic_speed = 0.0f;
+    sys->world().config().max_kinematic_spin = 0.0f;
+    t.set_position(glm::vec3(0.0f, 0.0f, 0.0f));
+    scene.update(dt);
+    ASSERT_TRUE(glm::length(sys->world().get_body(id)->linear_velocity) > 100.0f);
+}

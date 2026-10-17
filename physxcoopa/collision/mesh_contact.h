@@ -16,6 +16,13 @@
  * - Box: every corner tested directly against the triangle's plane, one contact per embedded
  *   corner -- box_vs_triangle_contacts_.
  *
+ * Either test also answers the case a shape should never be in but ends up in anyway: through
+ * the surface, with nothing on the far side of a terrain's skin to push it back. A shape whose
+ * core (or, for a box, centre) has crossed a face it is directly under is EMBEDDED, and gets one
+ * contact out along that face's normal by the whole distance it reaches past it. Without it such
+ * a shape reports no contact at all and simply keeps going, which is what a body falling through
+ * the ground is.
+ *
  * Either way, the resulting normal is then corrected: if the shape approaches from genuinely
  * outside the triangle's face (the common case -- resting/sliding on a surface), use the
  * triangle's OWN face normal rather than the raw closest-point direction, which is what stops
@@ -143,9 +150,10 @@ inline bool sphere_or_capsule_vs_triangle_contact_(const Shape& shape, const glm
  * face of a rounded lip) -- by up to the box's whole size, within the generous footprint -- and
  * each such corner pushes the box sideways out of a wall it never touched. On a mesh with cliffs
  * (a tile terrain's chunk colliders) that fed energy in every step until the box flew off. A box
- * genuinely pressed into a surface keeps its centre in front of it; only one that has already
- * tunnelled past its middle loses the contact, which the corner test could not resolve sanely
- * anyway.
+ * genuinely pressed into a surface keeps its centre in front of it; one that has already
+ * tunnelled past its middle is embedded rather than resting, which the corner test cannot
+ * resolve sanely at all -- generate_box_mesh_contacts_() handles that case on its own, with a
+ * single recovery contact out along the face normal.
  *
  * The contact point is the CORNER (moved halfway out along the face normal), not the closest
  * point on the triangle: with the generous footprint a corner may be accepted by a triangle it
@@ -351,7 +359,26 @@ inline void mesh_triangle_contacts(const Shape& shape, const glm::vec3& pos, con
     } else {
         glm::vec3 on_shape, on_tri;
         float penetration = 0.0f;
-        if (!sphere_or_capsule_vs_triangle_contact_(shape, pos, rot, v0, v1, v2, on_shape, on_tri, penetration)) return;
+        const bool touching =
+            sphere_or_capsule_vs_triangle_contact_(shape, pos, rot, v0, v1, v2, on_shape, on_tri, penetration);
+        // Which side of the face the shape's CORE is on. The distance the test above measures is
+        // unsigned, so once the core crosses the surface the penetration it reports shrinks back
+        // towards zero while the raw direction flips to point INTO the mesh -- a shape pushed
+        // out of the ground downwards, and then nothing to report at all once it is a radius
+        // past. Signed, the same two cases the box path has: pressed in, or embedded.
+        const float core_side = glm::dot(on_shape - v0, face_normal);
+        if (core_side < 0.0f) {
+            // Embedded, and only worth a contact if the core is genuinely under THIS triangle --
+            // not merely behind its extended plane, which a shape standing beside a step is.
+            const glm::vec3 under = on_shape - core_side * face_normal;
+            const glm::vec3 bary = barycentric_(under, v0, v1, v2);
+            if (bary.x < -1e-4f || bary.y < -1e-4f || bary.z < -1e-4f) return;
+            const float radius = shape.type == ShapeType::Sphere ? shape.radius : shape.capsule_radius;
+            const float exit = radius - core_side;   // the whole way out, core_side <= 0
+            emit(under + face_normal * (exit * 0.5f), face_normal, exit, tri);
+            return;
+        }
+        if (!touching) return;
         glm::vec3 diff = on_shape - on_tri; // points from triangle toward shape
         float dist = glm::length(diff);
         glm::vec3 raw_normal = dist > util::k_epsilon ? diff / dist : face_normal;
@@ -372,12 +399,26 @@ inline void mesh_triangle_contacts(const Shape& shape, const glm::vec3& pos, con
  *   face (a pillar top, a fine tessellation) when no corner is over any triangle. Depth: how far
  *   the box reaches behind the triangle's plane.
  *
- * A triangle whose plane the box's centre is behind contributes nothing (see
+ * A triangle whose plane the box's centre is behind contributes neither (see
  * box_vs_triangle_contacts_()). Each corner keeps its least-penetrating triangle and each mesh
  * vertex its first; the manifold is then the deepest point, the point farthest from it, the one
  * farthest from that line and the one farthest from all three -- the usual spread reduction,
  * in candidate order so it is deterministic -- under the penetration-weighted mean normal.
  * Feature ids: a corner is its index (0-7), a vertex 8 + its first triangle * 3 + slot.
+ *
+ * - **Recovery**, and only when neither feature pair found anything at all: a box whose CENTRE
+ *   has ended up behind a face it is directly under is embedded in the mesh, and both tests
+ *   above are blind to it -- a corner behind the plane needs the centre in front to count, and
+ *   a mesh vertex inside the box needs the triangle to have been tested at all. Without this it
+ *   stays embedded for ever: nothing in the step after it reports a contact either, so a body
+ *   that tunnelled once (one fast frame, a spawn inside geometry, a joint pulling a bone
+ *   through) simply keeps sinking. One contact is emitted, pushing out along the face normal of
+ *   whichever containing triangle is the SHORTEST way out, by the full distance the box reaches
+ *   behind that face -- the solver's per-iteration correction cap (PhysicsConfig::
+ *   max_linear_correction) is what keeps that from being a pop. Containment is the centre's
+ *   projection landing INSIDE the triangle, not merely behind its extended plane, so a box
+ *   resting in front of a step is never pushed out through the step. Feature id: the triangle,
+ *   with the top bit set, so it never aliases a corner's or a vertex's.
  */
 inline bool generate_box_mesh_contacts_(const Shape& shape, const glm::vec3& pos, const glm::quat& rot,
                                         const geometry::TriangleMesh& mesh, const glm::mat4& mesh_transform,
@@ -402,6 +443,8 @@ inline bool generate_box_mesh_contacts_(const Shape& shape, const glm::vec3& pos
     Candidate corners[8];
     bool corner_valid[8] = {};
     std::vector<Candidate> vertices;   // small: the vertices of the few triangles under a box
+    Candidate recovery;                // the shortest way out for an embedded box; see the doc
+    bool recovery_valid = false;
 
     auto test = [&](uint32_t tri) {
         glm::vec3 lv[3];
@@ -409,7 +452,21 @@ inline bool generate_box_mesh_contacts_(const Shape& shape, const glm::vec3& pos
         glm::vec3 v[3];
         for (int k = 0; k < 3; ++k) v[k] = glm::vec3(mesh_transform * glm::vec4(lv[k], 1.0f));
         const glm::vec3 n = glm::normalize(mesh_world_rot * mesh.triangle_normal(tri));
-        if (glm::dot(box.center - v[0], n) <= 0.0f) return;   // behind the face
+        const float center_dist = glm::dot(box.center - v[0], n);
+        if (center_dist <= 0.0f) {
+            // Behind the face. Embedded if the centre is under this triangle itself, which is
+            // the one case worth a contact -- see this function's doc.
+            const glm::vec3 under = box.center - center_dist * n;
+            const glm::vec3 bary = barycentric_(under, v[0], v[1], v[2]);
+            if (bary.x < -1e-4f || bary.y < -1e-4f || bary.z < -1e-4f) return;
+            const float support = std::abs(glm::dot(he.x * ax, n)) + std::abs(glm::dot(he.y * ay, n)) +
+                                  std::abs(glm::dot(he.z * az, n));
+            const float exit = support - center_dist;
+            if (recovery_valid && recovery.penetration <= exit) return;
+            recovery_valid = true;
+            recovery = Candidate{under, n, under, exit, 0x80000000u | tri};
+            return;
+        }
 
         float depth = 0.0f;   // how far the box reaches behind this triangle's plane
         float dist[8];
@@ -452,7 +509,12 @@ inline bool generate_box_mesh_contacts_(const Shape& shape, const glm::vec3& pos
     std::vector<Candidate> all;
     for (uint32_t c = 0; c < 8; ++c) if (corner_valid[c]) all.push_back(corners[c]);
     all.insert(all.end(), vertices.begin(), vertices.end());
-    if (all.empty()) return false;
+    if (all.empty()) {
+        if (!recovery_valid) return false;
+        out.add_point(recovery.point, recovery.penetration, recovery.feature_id);
+        out.normal = recovery.normal;
+        return true;
+    }
 
     // Reduce to four well-spread points.
     std::size_t pick[4];

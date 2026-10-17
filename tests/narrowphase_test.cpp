@@ -253,3 +253,99 @@ COOPA_TEST(box_settles_flat_on_a_finely_tessellated_floor) {
     ASSERT_TRUE(glm::length(b->linear_velocity) < 0.05f && glm::length(b->angular_velocity) < 0.05f);
 }
 
+
+/**
+ * A box whose CENTRE has ended up under a mesh floor is embedded, and is given the one contact
+ * that gets it out: along the floor's own normal, by the whole distance it reaches past it.
+ * Without that there is nothing to report at all -- every corner test needs the centre in front
+ * of the face -- so a body that sank once (a hard contact resolving, a joint dragging a bone
+ * through, a spawn inside geometry) simply keeps sinking, which is what a ragdoll falling
+ * through the ground actually is.
+ *
+ * As far as the box can still reach, which is its own bounds: a body already further under than
+ * its own size is past recovering here, and is instead kept from ever getting there by the speed
+ * limit a limp body is held under (toy::scene::Ragdoll::max_limp_speed).
+ */
+COOPA_TEST(box_embedded_under_a_mesh_floor_is_pushed_back_out) {
+    geometry::TriangleMesh floor_mesh = make_tiled_floor(8);
+    const collision::Shape mesh_shape = collision::Shape::make_mesh(&floor_mesh);
+    const float half = 0.11f;                                  // a ragdoll bone's size
+    const collision::Shape box = collision::Shape::make_box(glm::vec3(half));
+
+    collision::ContactManifold m;
+    ASSERT_TRUE(collision::generate_mesh_contacts(box, glm::vec3(0.3f, -0.4f, -0.1f), glm::quat(1, 0, 0, 0),
+                                                  mesh_shape, glm::vec3(0.0f), glm::quat(1, 0, 0, 0), m));
+    ASSERT_TRUE(m.count == 1);
+    ASSERT_NEAR(m.normal.z, 1.0f, 1e-3f);                      // out of the floor, not along it
+    ASSERT_NEAR(m.points[0].penetration, 0.1f + half, 1e-3f);  // the whole way out
+
+    // The BVH-narrowed path and the brute-force scan agree, as everywhere else in this file.
+    collision::ContactManifold brute;
+    ASSERT_TRUE(collision::generate_mesh_contacts(box, glm::vec3(0.3f, -0.4f, -0.1f), glm::quat(1, 0, 0, 0),
+                                                  mesh_shape, glm::vec3(0.0f), glm::quat(1, 0, 0, 0), brute, false));
+    ASSERT_TRUE(brute.count == m.count);
+    ASSERT_NEAR(brute.points[0].penetration, m.points[0].penetration, 1e-5f);
+
+    // And it is recovery only: a box under the floor but not under any triangle of it (out past
+    // the mesh's edge, falling past the cliff) is not dragged back in.
+    collision::ContactManifold off;
+    ASSERT_FALSE(collision::generate_mesh_contacts(box, glm::vec3(3.0f, 0.0f, -0.1f), glm::quat(1, 0, 0, 0),
+                                                   mesh_shape, glm::vec3(0.0f), glm::quat(1, 0, 0, 0), off));
+}
+
+/**
+ * The same embedded box, in a world: it is lifted back onto the floor and settles there, rather
+ * than resting inside the ground for ever.
+ */
+COOPA_TEST(an_embedded_box_climbs_back_onto_the_floor) {
+    geometry::TriangleMesh floor_mesh = make_tiled_floor(8);
+    PhysicsWorld world;
+    dynamics::Body floor_body;
+    floor_body.type = dynamics::BodyType::Static;
+    world.add_body(floor_body, collision::Shape::make_mesh(&floor_mesh));
+
+    const float half = 0.11f;
+    dynamics::Body sunk;
+    sunk.position = glm::vec3(0.3f, -0.4f, -0.1f);
+    sunk.mass = 1.2f;
+    sunk.inv_mass = 1.0f / sunk.mass;
+    sunk.inv_inertia_local = dynamics::box_inverse_inertia(glm::vec3(half), sunk.mass);
+    dynamics::BodyId id = world.add_body(sunk, collision::Shape::make_box(glm::vec3(half)));
+
+    step_world(world, 240);
+    const dynamics::Body* b = world.get_body(id);
+    ASSERT_NEAR(b->position.z, half, 0.02f);
+    ASSERT_TRUE(glm::length(b->linear_velocity) < 0.05f);
+}
+
+/**
+ * The same recovery for a capsule, which is what a character stands on a mesh floor with. Its
+ * core is the segment between the cap centres, so "through the surface" means the segment itself
+ * has crossed: from there the unsigned closest-point test reports a penetration that SHRINKS the
+ * further in it goes, under a direction that points back INTO the mesh -- a character pushed
+ * down through the ground, and then nothing at all once it is a radius past.
+ */
+COOPA_TEST(capsule_embedded_under_a_mesh_floor_is_pushed_back_out) {
+    geometry::TriangleMesh floor_mesh = make_tiled_floor(8);
+    const collision::Shape mesh_shape = collision::Shape::make_mesh(&floor_mesh);
+    const collision::Shape capsule = collision::Shape::make_capsule(0.3f, 0.5f);   // radius, half-height
+
+    // Standing on the floor: held up, out of it.
+    collision::ContactManifold rest;
+    ASSERT_TRUE(collision::generate_mesh_contacts(capsule, glm::vec3(0.0f, 0.0f, 0.78f), glm::quat(1, 0, 0, 0),
+                                                  mesh_shape, glm::vec3(0.0f), glm::quat(1, 0, 0, 0), rest));
+    ASSERT_NEAR(rest.normal.z, 1.0f, 1e-3f);
+    ASSERT_NEAR(rest.points[0].penetration, 0.02f, 1e-3f);
+
+    // Core 0.2 m under it: still out, and by the whole way (radius + how far past).
+    collision::ContactManifold sunk;
+    ASSERT_TRUE(collision::generate_mesh_contacts(capsule, glm::vec3(0.0f, 0.0f, -0.7f), glm::quat(1, 0, 0, 0),
+                                                  mesh_shape, glm::vec3(0.0f), glm::quat(1, 0, 0, 0), sunk));
+    ASSERT_NEAR(sunk.normal.z, 1.0f, 1e-3f);
+    ASSERT_NEAR(sunk.points[0].penetration, 0.5f, 1e-3f);
+
+    // Past the mesh's edge there is nothing to come back to.
+    collision::ContactManifold off;
+    ASSERT_FALSE(collision::generate_mesh_contacts(capsule, glm::vec3(3.0f, 0.0f, -0.7f), glm::quat(1, 0, 0, 0),
+                                                   mesh_shape, glm::vec3(0.0f), glm::quat(1, 0, 0, 0), off));
+}

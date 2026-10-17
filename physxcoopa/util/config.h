@@ -88,6 +88,34 @@ struct PhysicsConfig {
      *         enough simultaneously that neither's per-body gate alone tells the full story). */
     float max_linear_velocity = 200.0f;
 
+    /**
+     * @brief Speed (m/s) above which a KINEMATIC body's frame-to-frame move is read as a
+     *        teleport rather than a motion: the body is placed, and its velocity left at zero.
+     *
+     * A kinematic body has no velocity of its own -- PhysicsSystem::sync_transforms_in_()
+     * derives it from how far whatever drives the Transform moved it since last frame, and
+     * that derivation cannot tell a platform travelling fast from a body that was simply PUT
+     * somewhere else: a spawn placed on the ground, a character teleported, an animated bone
+     * whose clip cut to a new pose, a streamed object repositioned. The derived figure for a
+     * placement is as large as the distance divided by a frame -- hundreds or thousands of m/s
+     * -- and the solver treats it as real: anything dynamic in contact is launched (and a
+     * ragdoll going limp that same frame INHERITS it, see toy::scene::Ragdoll), which is how a
+     * corpse ends up through the floor and half a map away.
+     *
+     * 60 m/s: well past anything a platform, a lift or an animated limb does, well under the
+     * smallest placement worth calling one. Speed, not distance, so a long frame (a chunk
+     * load, a stall) does not read a body's ordinary motion as a teleport. 0 or less turns the
+     * detection off and restores the raw derivation.
+     *
+     * @see max_kinematic_spin, the same rule for rotation.
+     */
+    float max_kinematic_speed = 60.0f;
+
+    /** @brief Angular speed (rad/s) above which a kinematic body's turn is read as a teleport
+     *         -- see max_kinematic_speed, whose doc covers both. ~8 turns a second. Either
+     *         figure being exceeded zeroes both, since a placement moves and turns at once. */
+    float max_kinematic_spin = 50.0f;
+
     /** @brief Use the exact exponential-map quaternion integration step instead of the
      *         default first-order form, which visibly gains energy on fast spinners. */
     bool use_exact_quaternion_integration = false;

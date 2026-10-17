@@ -122,6 +122,8 @@ inline PhysicsSettings parse_physics_settings(const fkyaml::node& node) {
         if (s.contains("sleep_time")) settings.solver.sleep_time = s.at("sleep_time").get_value<float>();
         if (s.contains("max_substeps")) settings.solver.max_substeps = s.at("max_substeps").get_value<uint32_t>();
         if (s.contains("max_linear_velocity")) settings.solver.max_linear_velocity = s.at("max_linear_velocity").get_value<float>();
+        if (s.contains("max_kinematic_speed")) settings.solver.max_kinematic_speed = s.at("max_kinematic_speed").get_value<float>();
+        if (s.contains("max_kinematic_spin")) settings.solver.max_kinematic_spin = s.at("max_kinematic_spin").get_value<float>();
     }
 
     // Cloth lives under its own key rather than inside `solver:` because its two knobs govern a

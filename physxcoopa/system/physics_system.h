@@ -109,6 +109,50 @@ public:
      */
     void refresh() { dirty_ = true; }
 
+    /**
+     * @brief Unbinds every Collider in `object`'s subtree NOW: their bodies leave the world and
+     *        their bindings are dropped, before the objects themselves are destroyed.
+     *
+     * refresh() is not sufficient for a runtime despawn, and the difference is pure ordering.
+     * refresh() only marks the system dirty; the re-gather that drops a dead collider's binding
+     * runs in this system's own slot (order 100). A game destroying an object from a component
+     * update (order 200) or a deferred scene command (end of frame) therefore leaves the
+     * binding, and the body, live across the START of the next frame -- and the character motor
+     * queries the physics world at order 50, resolving whatever the broadphase hands back
+     * through collider_for(). That read lands on a freed Collider.
+     *
+     * So anything that destroys a collider-bearing object at runtime should call this first and
+     * destroy afterwards. refresh() is still the right call for a collider ADDED at runtime, or
+     * for parameter changes.
+     *
+     * @param object Root of the subtree to unbind. Harmless if it carries no colliders.
+     */
+    void detach(const coopa::scene::SceneObject& object) {
+        std::size_t removed = 0;
+        for (std::size_t i = bindings_.size(); i-- > 0;) {
+            const Binding& b = bindings_[i];
+            if (b.collider == nullptr || b.collider->owner == nullptr) continue;
+            if (!is_in_subtree_(b.collider->owner, &object)) continue;
+            auto index_it = collider_by_index_.find(b.body.index);
+            // Only if it is still OUR entry: a compound body produces one binding per collider
+            // and the index map holds the primary, so the erase must not take an entry a body
+            // created since then has claimed.
+            if (index_it != collider_by_index_.end() && index_it->second != nullptr &&
+                is_in_subtree_(index_it->second->owner, &object)) {
+                collider_by_index_.erase(index_it);
+            }
+            collider_by_shape_index_.erase(b.shape_index);
+            world_.remove_body(b.body);
+            b.collider->set_body_id(dynamics::BodyId{});
+            bindings_.erase(bindings_.begin() + static_cast<std::ptrdiff_t>(i));
+            ++removed;
+        }
+        if (removed == 0) return;
+        // Every index-addressed link into bindings_ (Binding::body_parent, the write-back
+        // scratch) is stale now; the re-gather rebuilds them, and nothing reads them before it.
+        dirty_ = true;
+    }
+
     PhysicsWorld& world() { return world_; }
     const PhysicsWorld& world() const { return world_; }
 
@@ -310,6 +354,15 @@ private:
 
         bindings_ = std::move(new_bindings);
         link_body_hierarchy_();
+    }
+
+    /** @brief Whether `node` is `root` or sits anywhere under it. */
+    static bool is_in_subtree_(const coopa::scene::SceneObject* node,
+                               const coopa::scene::SceneObject* root) {
+        for (const coopa::scene::SceneObject* o = node; o != nullptr; o = o->parent()) {
+            if (o == root) return true;
+        }
+        return false;
     }
 
     /** @brief Fills every primary binding's Binding::body_parent from the scene hierarchy. */
@@ -915,9 +968,20 @@ private:
 
                 if (body->type == dynamics::BodyType::Kinematic) {
                     if (dt > util::k_epsilon) {
-                        body->linear_velocity = (true_center - body->last_written_position) / dt;
-                        body->angular_velocity = derive_angular_velocity_(
+                        const glm::vec3 linear = (true_center - body->last_written_position) / dt;
+                        const glm::vec3 angular = derive_angular_velocity_(
                             body->last_written_orientation, trs.rotation, dt);
+                        // A placement, not a motion: see PhysicsConfig::max_kinematic_speed.
+                        // Both go to zero together, since a body that was PUT somewhere was put
+                        // there at an orientation too.
+                        const util::PhysicsConfig& cfg = world_.config();
+                        const bool teleported =
+                            (cfg.max_kinematic_speed > 0.0f &&
+                             glm::length(linear) > cfg.max_kinematic_speed) ||
+                            (cfg.max_kinematic_spin > 0.0f &&
+                             glm::length(angular) > cfg.max_kinematic_spin);
+                        body->linear_velocity = teleported ? glm::vec3(0.0f) : linear;
+                        body->angular_velocity = teleported ? glm::vec3(0.0f) : angular;
                     }
                     body->position = true_center;
                     body->orientation = trs.rotation;
@@ -1364,6 +1428,11 @@ public:
      *         overlap_capsule() both use this; raycast-family queries use collider_for_shape_()
      *         instead, which resolves the EXACT child (see query::RaycastHit::shape_index's doc). */
     components::Collider* collider_for(dynamics::BodyId id) const {
+        // The generation first: collider_by_index_ is keyed by body INDEX, and an index is
+        // recycled as soon as its body is destroyed. Gameplay code holds BodyIds across frames
+        // (CharacterController::ground_body_ is one), so a stale id must resolve to nothing
+        // rather than to whichever collider now occupies the slot.
+        if (!world_.is_valid(id)) return nullptr;
         auto it = collider_by_index_.find(id.index);
         return it != collider_by_index_.end() ? it->second : nullptr;
     }
