@@ -244,7 +244,11 @@ private:
     void for_range_(Fn&& body) {
         coopa::job::JobEngine* jobs = world_.job_engine();
         if (jobs && bindings_.size() >= parallel_threshold_) {
-            jobs->parallel_for_blocking(bindings_.size(), 0, std::forward<Fn>(body));
+            // Normal help floor: this loop is frame-critical and often trivial (a few dozen
+            // bindings), so a thread that descended to Low here would pick up a background
+            // chunk-mesh or bake job and bill its whole cost to the physics step.
+            jobs->parallel_for_blocking(bindings_.size(), 0, std::forward<Fn>(body), 0,
+                                        coopa::job::Priority::Normal, coopa::job::Priority::Normal);
         } else {
             coopa::job::JobContext ctx{};
             body(std::size_t{0}, bindings_.size(), ctx);

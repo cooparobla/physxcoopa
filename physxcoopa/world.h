@@ -1360,7 +1360,10 @@ private:
     template <typename Fn>
     void for_range_(std::size_t count, Fn&& body) {
         if (jobs_ && count >= parallel_threshold_) {
-            jobs_->parallel_for_blocking(count, 0, std::forward<Fn>(body));
+            // Normal help floor -- see PhysicsSystem::for_range_(): the solver's own passes are
+            // frame-critical, so the waiting thread must not run background Low work here.
+            jobs_->parallel_for_blocking(count, 0, std::forward<Fn>(body), 0,
+                                         coopa::job::Priority::Normal, coopa::job::Priority::Normal);
         } else {
             coopa::job::JobContext ctx{};
             body(std::size_t{0}, count, ctx);

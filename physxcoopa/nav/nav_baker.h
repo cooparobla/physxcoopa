@@ -68,6 +68,23 @@ public:
         needs_full_build_ = true;
     }
 
+    /**
+     * @brief Changes only how incremental rebuilds are PACED, without re-arming a full build.
+     *
+     * `rebuild_delay` and `max_concurrent_rebuilds` decide when a dirty tile is picked up and how
+     * many go at once; neither changes the geometry a tile bakes to, so unlike set_settings()
+     * this needs no rebuild. For a host that wants the navmesh finished as fast as it can be
+     * rather than spread over gameplay frames -- a loading screen holding a scene until its world
+     * is built -- and then put back.
+     *
+     * @param rebuild_delay Seconds a dirty tile waits before it is rebuilt; 0 rebuilds at once.
+     * @param max_concurrent_rebuilds Tiles that may be rebuilding together; <= 0 leaves it.
+     */
+    void set_rebuild_pacing(float rebuild_delay, int max_concurrent_rebuilds) {
+        settings_.rebuild_delay = std::max(0.0f, rebuild_delay);
+        if (max_concurrent_rebuilds > 0) settings_.max_concurrent_rebuilds = max_concurrent_rebuilds;
+    }
+
     // --- Inputs -----------------------------------------------------------------------------
 
     /** @brief Replaces the source set, dirtying every tile an added, removed or changed source touches. */

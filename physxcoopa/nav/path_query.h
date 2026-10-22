@@ -655,7 +655,8 @@ inline void find_paths(const NavMesh& mesh, std::span<PathRequest> requests, coo
         }
     };
     if (jobs && requests.size() > 1) {
-        jobs->parallel_for_blocking(requests.size(), 1, run);
+        jobs->parallel_for_blocking(requests.size(), 1, run, 0, coopa::job::Priority::Normal,
+                                    coopa::job::Priority::Normal);
     } else {
         run(0, requests.size());
     }

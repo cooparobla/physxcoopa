@@ -97,6 +97,26 @@ public:
 
     const char* system_name() const override { return "Navigation"; }
 
+    /**
+     * @brief Not warm until the navmesh is built and no tile rebuild is outstanding.
+     *
+     * Only participates when the build will actually happen while a scene warms: the first full
+     * build otherwise waits for a NavAgent to exist (see execute()), which for a scene that
+     * spawns its agents from gameplay is well after the reveal -- so a scene that wants its
+     * navmesh built behind the loading screen sets `build_without_agents`. Reporting
+     * `participates` without that would hold the screen up until the warm-up timed out.
+     */
+    coopa::scene::WarmupState warm_up_state() const override {
+        coopa::scene::WarmupState ws;
+        ws.participates = settings_.enabled && (settings_.build_without_agents || baker_.built());
+        if (!ws.participates) return ws;
+        ws.what = "navigation";
+        ws.warm = baker_.built() && !baker_.busy();
+        ws.remaining = static_cast<int>(baker_.dirty_tile_count());
+        ws.progress = ws.warm ? 1.0f : (baker_.built() ? 0.5f : 0.0f);
+        return ws;
+    }
+
     void execute(coopa::scene::Scene& scene, const coopa::scene::FrameContext& ctx) override {
         if (!settings_.enabled) return;
         auto* physics = dynamic_cast<PhysicsSystem*>(scene.find_system("Physics"));
@@ -170,6 +190,15 @@ public:
 
     /** @brief Forces a full rebuild on the next frame. */
     void rebuild() { baker_.set_settings(settings_.build); }
+
+    /** @brief Pace incremental rebuilds differently without a full rebuild -- NavBaker::set_rebuild_pacing(). */
+    void set_rebuild_pacing(float rebuild_delay, int max_concurrent_rebuilds) {
+        baker_.set_rebuild_pacing(rebuild_delay, max_concurrent_rebuilds);
+    }
+    /** @brief Seconds between collider/volume/link rescans (NavSettings::source_scan_interval). */
+    void set_source_scan_interval(float seconds) {
+        settings_.source_scan_interval = std::max(0.0f, seconds);
+    }
 
     /** @brief Blocks until background tile and flow-field builds have landed (tests, loading). */
     void flush() {
