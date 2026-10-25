@@ -13,6 +13,7 @@
 #include <physxcoopa/components/capsule_collider.h>
 #include <physxcoopa/components/mesh_collider.h>
 #include <physxcoopa/components/rigidbody.h>
+#include <physxcoopa/components/vehicle.h>
 #include <physxcoopa/components/hinge_joint.h>
 #include <physxcoopa/components/ball_joint.h>
 #include <physxcoopa/components/cone_twist_joint.h>
@@ -141,6 +142,45 @@ inline uint32_t read_freeze_flags_(const fkyaml::node& node, const std::string& 
     return constraints;
 }
 
+/** @brief `node[key]` as a float if present, else `fallback`. */
+inline float read_float_(const fkyaml::node& node, const char* key, float fallback) {
+    return node.contains(key) ? node.at(key).get_value<float>() : fallback;
+}
+
+/** @brief A DifferentialType name (`open` / `limited_slip` / `locked`), else `fallback`. */
+inline vehicle::DifferentialType read_differential_(const fkyaml::node& node, const char* key,
+                                                     vehicle::DifferentialType fallback) {
+    if (!node.contains(key)) return fallback;
+    const std::string v = node.at(key).get_value<std::string>();
+    if (v == "open") return vehicle::DifferentialType::Open;
+    if (v == "limited_slip") return vehicle::DifferentialType::LimitedSlip;
+    if (v == "locked") return vehicle::DifferentialType::Locked;
+    return fallback;
+}
+
+/** @brief Per-wheel overrides on top of whatever the preset put in this slot. */
+inline void read_wheel_overrides_(const fkyaml::node& node, vehicle::WheelConfig& w) {
+    w.anchor = read_vec3_(node, "anchor", w.anchor);
+    w.radius = read_float_(node, "radius", w.radius);
+    w.width = read_float_(node, "width", w.width);
+    w.mass = read_float_(node, "mass", w.mass);
+    w.rest_length = read_float_(node, "rest_length", w.rest_length);
+    w.travel = read_float_(node, "travel", w.travel);
+    w.stiffness = read_float_(node, "stiffness", w.stiffness);
+    w.natural_frequency = read_float_(node, "natural_frequency", w.natural_frequency);
+    w.damping_ratio = read_float_(node, "damping_ratio", w.damping_ratio);
+    w.rebound_ratio = read_float_(node, "rebound_ratio", w.rebound_ratio);
+    w.drive_share = read_float_(node, "drive_share", w.drive_share);
+    w.brake_share = read_float_(node, "brake_share", w.brake_share);
+    w.handbrake_share = read_float_(node, "handbrake_share", w.handbrake_share);
+    if (node.contains("steered")) w.steered = node.at("steered").get_value<bool>();
+    if (node.contains("anti_roll_group")) w.anti_roll_group = node.at("anti_roll_group").get_value<int>();
+    if (node.contains("side")) {
+        w.side = node.at("side").get_value<std::string>() == "right" ? vehicle::WheelSide::Right
+                                                                     : vehicle::WheelSide::Left;
+    }
+}
+
 /** @brief The keys every joint component shares beyond connected_object/anchor. */
 inline void read_joint_common_(const fkyaml::node& node, components::JointComponent& jc) {
     if (node.contains("enable_collision")) jc.enable_collision = node.at("enable_collision").get_value<bool>();
@@ -215,6 +255,14 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
             if (node.contains("drag")) rb->drag = node.at("drag").get_value<float>();
             if (node.contains("angular_drag")) rb->angular_drag = node.at("angular_drag").get_value<float>();
             if (node.contains("wind_influence")) rb->wind_influence = node.at("wind_influence").get_value<float>();
+            // Where the mass really sits, as an offset from the collider's centre. The single
+            // most useful dial a scene has for how a body behaves and, until now, the only one
+            // of Rigidbody's that YAML could not reach: a vehicle rolls over when its lateral
+            // acceleration passes half-track / centre-of-mass height, so a tall box whose mass
+            // sits at its geometric centre tips at well under 1 g.
+            if (node.contains("center_of_mass")) {
+                rb->center_of_mass_override = detail::read_vec3_(node, "center_of_mass", glm::vec3(0.0f));
+            }
             if (node.contains("use_gravity")) rb->use_gravity = node.at("use_gravity").get_value<bool>();
             if (node.contains("is_kinematic")) rb->is_kinematic = node.at("is_kinematic").get_value<bool>();
             if (node.contains("interpolation")) {
@@ -330,6 +378,105 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
                     cc->anchors.push_back(spec);
                 }
             }
+        });
+
+    // A driveable vehicle (vehicle/vehicle_sim.h) on this object's Rigidbody chassis -- inert
+    // until install_vehicle_system(). `preset:` picks a tuning and every other key overrides one
+    // of its values, so a scene writes the handful it cares about and nothing else.
+    SceneLoader::register_component_parser("Vehicle",
+        [](const fkyaml::node& node, SceneObject& obj, const SceneLoader::ParseContext&) {
+            auto* vc = obj.add_component<components::VehicleComponent>();
+
+            if (node.contains("preset")) vc->preset = node.at("preset").get_value<std::string>();
+            vc->config = vehicle::preset(vc->preset);
+
+            vehicle::VehicleConfig& c = vc->config;
+            if (node.contains("steer_mode")) {
+                c.steer_mode = node.at("steer_mode").get_value<std::string>() == "differential"
+                                   ? vehicle::SteerMode::Differential
+                                   : vehicle::SteerMode::Ackermann;
+            }
+            c.max_steer_deg = detail::read_float_(node, "max_steer_deg", c.max_steer_deg);
+            c.min_steer_deg = detail::read_float_(node, "min_steer_deg", c.min_steer_deg);
+            c.steer_falloff_speed = detail::read_float_(node, "steer_falloff_speed", c.steer_falloff_speed);
+            c.steer_rate_deg = detail::read_float_(node, "steer_rate_deg", c.steer_rate_deg);
+            c.steer_return_rate_deg = detail::read_float_(node, "steer_return_rate_deg", c.steer_return_rate_deg);
+            c.brake_torque = detail::read_float_(node, "brake_torque", c.brake_torque);
+            c.handbrake_torque = detail::read_float_(node, "handbrake_torque", c.handbrake_torque);
+            c.anti_roll = detail::read_float_(node, "anti_roll", c.anti_roll);
+            c.drag = detail::read_float_(node, "drag", c.drag);
+            c.downforce = detail::read_float_(node, "downforce", c.downforce);
+            c.air_righting = detail::read_float_(node, "air_righting", c.air_righting);
+            c.air_damping = detail::read_float_(node, "air_damping", c.air_damping);
+            c.nominal_wheel_load = detail::read_float_(node, "nominal_wheel_load", c.nominal_wheel_load);
+            c.recover_time = detail::read_float_(node, "recover_time", c.recover_time);
+            c.recover_lift = detail::read_float_(node, "recover_lift", c.recover_lift);
+            c.auto_recover_time = detail::read_float_(node, "auto_recover_time", c.auto_recover_time);
+
+            if (node.contains("tire")) {
+                const auto& t = node.at("tire");
+                c.tire.grip = detail::read_float_(t, "grip", c.tire.grip);
+                c.tire.lateral_grip = detail::read_float_(t, "lateral_grip", c.tire.lateral_grip);
+                c.tire.peak_slip_ratio = detail::read_float_(t, "peak_slip_ratio", c.tire.peak_slip_ratio);
+                c.tire.peak_slip_angle = detail::read_float_(t, "peak_slip_angle", c.tire.peak_slip_angle);
+                c.tire.plateau = detail::read_float_(t, "plateau", c.tire.plateau);
+                c.tire.falloff = detail::read_float_(t, "falloff", c.tire.falloff);
+                c.tire.rolling_resistance = detail::read_float_(t, "rolling_resistance", c.tire.rolling_resistance);
+                c.tire.load_sensitivity = detail::read_float_(t, "load_sensitivity", c.tire.load_sensitivity);
+            }
+            if (node.contains("engine")) {
+                const auto& e = node.at("engine");
+                c.engine.idle_rpm = detail::read_float_(e, "idle_rpm", c.engine.idle_rpm);
+                c.engine.max_rpm = detail::read_float_(e, "max_rpm", c.engine.max_rpm);
+                c.engine.peak_torque = detail::read_float_(e, "peak_torque", c.engine.peak_torque);
+                c.engine.peak_rpm = detail::read_float_(e, "peak_rpm", c.engine.peak_rpm);
+                c.engine.torque_at_idle = detail::read_float_(e, "torque_at_idle", c.engine.torque_at_idle);
+                c.engine.torque_at_max = detail::read_float_(e, "torque_at_max", c.engine.torque_at_max);
+                c.engine.braking = detail::read_float_(e, "braking", c.engine.braking);
+                c.engine.response = detail::read_float_(e, "response", c.engine.response);
+            }
+            if (node.contains("gearbox")) {
+                const auto& g = node.at("gearbox");
+                if (g.contains("forward_ratios")) {
+                    c.gearbox.forward_ratios.clear();
+                    for (const auto& r : g.at("forward_ratios")) {
+                        c.gearbox.forward_ratios.push_back(r.get_value<float>());
+                    }
+                }
+                c.gearbox.reverse_ratio = detail::read_float_(g, "reverse_ratio", c.gearbox.reverse_ratio);
+                c.gearbox.final_drive = detail::read_float_(g, "final_drive", c.gearbox.final_drive);
+                c.gearbox.efficiency = detail::read_float_(g, "efficiency", c.gearbox.efficiency);
+                if (g.contains("automatic")) c.gearbox.automatic = g.at("automatic").get_value<bool>();
+                c.gearbox.shift_up_rpm = detail::read_float_(g, "shift_up_rpm", c.gearbox.shift_up_rpm);
+                c.gearbox.shift_down_rpm = detail::read_float_(g, "shift_down_rpm", c.gearbox.shift_down_rpm);
+                c.gearbox.shift_time = detail::read_float_(g, "shift_time", c.gearbox.shift_time);
+            }
+            if (node.contains("drive")) {
+                const auto& d = node.at("drive");
+                c.drive.differential = detail::read_differential_(d, "differential", c.drive.differential);
+                c.drive.limited_slip = detail::read_float_(d, "limited_slip", c.drive.limited_slip);
+                c.drive.coupling = detail::read_float_(d, "coupling", c.drive.coupling);
+            }
+
+            // `wheels:` is positional against the preset's own wheel list: entry i overrides
+            // wheel i and names the child object drawn there. More entries than the preset has
+            // wheels APPEND new ones (a bespoke layout), which is why the resize is unconditional.
+            if (node.contains("wheels")) {
+                const auto& list = node.at("wheels");
+                std::size_t i = 0;
+                for (const auto& w : list) {
+                    if (i >= c.wheels.size()) {
+                        c.wheels.push_back(c.wheels.empty() ? vehicle::WheelConfig{} : c.wheels.back());
+                    }
+                    detail::read_wheel_overrides_(w, c.wheels[i]);
+                    vc->wheel_objects.resize(i + 1);
+                    if (w.contains("object")) vc->wheel_objects[i] = w.at("object").get_value<std::string>();
+                    ++i;
+                }
+            }
+
+            if (node.contains("player_input")) vc->player_input = node.at("player_input").get_value<bool>();
+            if (node.contains("active")) vc->active = node.at("active").get_value<bool>();
         });
 
     // NavAgent / NavModifier / NavVolume / NavLink -- inert until install_nav_system().

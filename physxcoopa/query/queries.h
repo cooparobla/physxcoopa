@@ -12,8 +12,16 @@
  * SceneObject/Collider itself (e.g. via a small BodyId->Collider map the way PhysicsSystem
  * already tracks Collider->BodyId) if it needs one; PhysicsWorld itself never sees that type.
  *
- * These queries are only valid between phases, not from inside `on_substep` -- a raycast
- * issued from a substep callback would observe mid-solve, not-yet-integrated state.
+ * These queries are meant to be used between phases. What a query issued from inside
+ * `on_substep` observes is worth stating exactly, because one caller depends on it: the substep
+ * callback fires after `generate_manifolds_()`, which begins by refitting the broadphase (see
+ * PhysicsWorld::step_fixed()), so every body's POSE and the trees indexing them are consistent
+ * with each other -- it is the VELOCITIES that are pre-solve, and any contact resolved by this
+ * substep that has not happened yet. A query whose answer depends on this substep's solve will
+ * therefore be a substep stale; one that only asks where the geometry is will not.
+ *
+ * The vehicle sim (vehicle/vehicle_sim.h) relies on that deliberately: its suspension raycasts
+ * want exactly the pre-solve pose, since the forces they produce are what the solve then acts on.
  */
 
 #ifndef PHYSXCOOPA_QUERY_QUERIES_H

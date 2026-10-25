@@ -22,6 +22,7 @@ PhysicsSystem::execute(scene, ctx)
 | File | Purpose |
 |---|---|
 | [`physics_system.h`](physics_system.h) | `PhysicsSystem : ISceneSystem` (registered at `UpdatePhase::Physics = 100` by default) and `install_physics_system(scene[, settings][, order])`. Also exposes scene-level `raycast()` / `raycast_all()` whose hits resolve to the `Collider`, `SceneObject` and `RigidbodyComponent`. Owns the `PhysicsWorld`; every method above is a private step of `execute()`. The reconcile pass runs `regather_()` → `regather_joints_()` → `regather_cloths_()` in that order: a joint needs both connected objects already bound to a body, and a `ClothComponent`'s anchors name objects whose `Rigidbody` must likewise already be bound. |
+| [`vehicle_system.h`](vehicle_system.h) | `VehicleSystem` + `install_vehicle_system()` -- two stages. Order **96** (before Physics at 100) binds each `Vehicle` to its chassis body, moves its wheel anchors into the body's centre-of-mass frame, and holds one connection to `PhysicsWorld::on_substep` for the whole scene. Order **150** (after Physics) places the wheel visuals from the step just run and emits the frame's signals. |
 
 **PhysicsSystem's transform reads/writes always use `Transform::get_world_matrix()`** (the
 lazy-recomputing accessor), never the non-recomputing `world_matrix()` — physics runs

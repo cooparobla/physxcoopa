@@ -667,8 +667,11 @@ public:
 
     // --- Queries ---
     //
-    // Only valid between phases, not from inside on_substep (mid-solve, not-yet-integrated
-    // state). Every query takes a query::QueryFilter (layer mask, trigger inclusion, one body to
+    // Meant to be used between phases. From inside on_substep they see poses and a broadphase
+    // that are consistent with each other (generate_manifolds_() refits the trees just before the
+    // emit) but velocities and contacts that this substep has not solved yet -- see queries.h's
+    // file doc for the full statement, and vehicle/vehicle_sim.h for the caller that wants it.
+    // Every query takes a query::QueryFilter (layer mask, trigger inclusion, one body to
     // ignore, an optional predicate -- see its doc); the `(layer_mask, include_triggers)`
     // overloads are the original shorthand and behave exactly like a filter with only those two
     // fields set. `layer_mask` follows Unity's convention: bit `shape.layer` of the mask, not the

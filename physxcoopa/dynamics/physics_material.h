@@ -38,6 +38,18 @@ struct PhysicsMaterial {
     CombineMode friction_combine = CombineMode::Average;
     CombineMode restitution_combine = CombineMode::Average;
 
+    /**
+     * @brief Rolling-resistance coefficient a wheel pays on this surface, as a fraction of the
+     *        load it carries. Read only by the vehicle sim (vehicle/vehicle_sim.h); contacts,
+     *        casts and the solver ignore it entirely.
+     *
+     * Separate from `dynamic_friction` because the two are independent in the surfaces that
+     * matter: mud is slippery AND draggy (low friction, high rolling resistance), ice is
+     * slippery and not draggy at all. 0.015 is hard tarmac, 0.05 loose gravel, 0.15 deep mud
+     * or soft snow.
+     */
+    float rolling_resistance = 0.015f;
+
     /** @brief The material used by a Collider with no PhysicsMaterial assigned. */
     static const PhysicsMaterial& default_material() {
         static const PhysicsMaterial instance{};

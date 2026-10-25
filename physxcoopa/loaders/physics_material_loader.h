@@ -56,6 +56,7 @@ inline dynamics::CombineMode parse_combine_mode_(const fkyaml::node& node, const
  * dynamic_friction: 0.05
  * static_friction: 0.08
  * restitution: 0.0
+ * rolling_resistance: 0.015     # wheels only -- see PhysicsMaterial::rolling_resistance
  * friction_combine: Minimum      # Average | Minimum | Maximum | Multiply
  * restitution_combine: Average
  * @endcode
@@ -70,6 +71,8 @@ public:
         if (node.contains("dynamic_friction")) mat->dynamic_friction = node.at("dynamic_friction").get_value<float>();
         if (node.contains("static_friction"))  mat->static_friction  = node.at("static_friction").get_value<float>();
         if (node.contains("restitution"))      mat->restitution      = node.at("restitution").get_value<float>();
+        if (node.contains("rolling_resistance"))
+            mat->rolling_resistance = node.at("rolling_resistance").get_value<float>();
         mat->friction_combine    = detail::parse_combine_mode_(node, "friction_combine", mat->friction_combine);
         mat->restitution_combine = detail::parse_combine_mode_(node, "restitution_combine", mat->restitution_combine);
         return mat;

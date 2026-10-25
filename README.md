@@ -3,7 +3,7 @@
 **A header-only C++20 library for real-time rigid-body and cloth physics.**
 
 physxcoopa simulates rigid bodies with box, sphere, capsule and triangle-mesh colliders,
-hinge, ball and cone-twist joints, triggers and XPBD cloth, and builds navigation (A* and flow fields for crowds)
+hinge, ball and cone-twist joints, triggers and XPBD cloth, drives raycast-wheel vehicles, and builds navigation (A* and flow fields for crowds)
 from those same colliders. It has two layers. `PhysicsWorld` is a plain
 simulation you can drive from any program. `PhysicsSystem` is an optional adapter that binds
 the world to a [libcoopa](https://github.com/cooparobla/libcoopa) scene, so colliders and
@@ -89,6 +89,33 @@ debug geometry as plain line segments to draw however you like.
   geometry needs no asset: `TriangleMesh::from_triangles()` welds and builds adjacency, and
   `MeshCollider::set_mesh()` takes the result by `shared_ptr`.
 
+### Vehicles
+- **Raycast wheels.** The chassis is an ordinary dynamic body; each wheel is a ray from its
+  chassis-local anchor, and its hit is the contact patch. Suspension is a spring-damper with
+  separate bump and rebound rates and an anti-roll bar across each axle; the spring rate can be
+  given directly or derived from a corner's natural frequency.
+- **A real tyre curve.** Longitudinal and lateral force each rise with slip to a peak and fall to
+  a plateau, and the two are clamped together on a **friction circle** -- so a wheel spending its
+  grip accelerating has none left to corner with. Grip scales with the ground's own
+  `PhysicsMaterial`, which is what makes tarmac, gravel, mud and ice drive differently.
+- **Drivetrain.** A three-point engine torque curve, an automatic or manual gearbox, and open,
+  limited-slip or locked differentials. Reverse is selected by holding the brake at a standstill.
+- **Steering.** Rate-limited, speed-sensitive lock, Ackermann-split across a steered axle -- or
+  `Differential` (skid) steering, which drives the two sides against each other so a tracked
+  machine pivots on the spot.
+- **Aero and air.** Quadratic drag, speed-squared downforce, and an optional righting torque so a
+  vehicle that jumps lands on its wheels.
+- **Recovery.** One control rights a vehicle that has ended up on its roof: it floats clear, turns
+  smoothly back upright about the heading it had, and lands on its suspension. Optionally
+  automatic after a few seconds.
+- **Six tunings** ship by name: `sports_car`, `pickup_4x4`, `hauler_6x6`, `buggy`, `dozer`,
+  `trailer`. They share one code path; only the numbers differ.
+- **Scene component.** `Vehicle` + `install_vehicle_system()`, with the wheel visuals placed from
+  the simulation each frame. See
+  [`physxcoopa/vehicle/README.md`](physxcoopa/vehicle/README.md) -- including the traps, each of
+  which reads as a mistuned vehicle rather than as a bug.
+- Mud is a friction and rolling-resistance **surface**, not a deformable one: no ruts.
+
 ### Character motor
 - **`character::move()`** moves a kinematic capsule by a desired displacement and reports where
   it ended up: grounded or not, the ground normal, body and (for a kinematic ground) velocity,
@@ -140,7 +167,7 @@ debug geometry as plain line segments to draw however you like.
 - **Debug drawing.** Collider wireframes, contacts, joints and broadphase nodes as colored line
   segments.
 - **Scene components.** `BoxCollider`, `SphereCollider`, `CapsuleCollider`, `MeshCollider`,
-  `Rigidbody`, `HingeJoint`, `BallJoint`, `ConeTwistJoint` and `Cloth`, with YAML parsers and Unity-style collision callbacks.
+  `Rigidbody`, `HingeJoint`, `BallJoint`, `ConeTwistJoint`, `Cloth` and `Vehicle`, with YAML parsers and Unity-style collision callbacks.
 
 ## Getting started
 
