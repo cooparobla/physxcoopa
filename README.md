@@ -473,13 +473,14 @@ boxes, hand-built meshes, cloth sheets, nav worlds) are in `tests/support/`.
 | `contact_events` / `joints` | trigger and collision callbacks; hinge, ball and cone-twist joints |
 | `physics_system` / `physics_config` | scene binding and runtime changes; materials and settings YAML |
 | `cloth_solver` / `cloth_collision` | XPBD solver, anchors, determinism, binding; collider projection and mesh rules |
+| `hair_solver` | XPBD strands: pinned roots, inextensibility, the global and local shape constraints, collision, determinism, sleep |
 | `nav_build` / `nav_path` / `nav_flow` / `nav_crowd` / `nav_system` | baking, A\*, flow fields, crowds, and the scene system |
 
 ## Project layout
 
 ```
 physxcoopa/
-├── world.h        PhysicsWorld: bodies, joints, cloths, stepping, queries, debug draw
+├── world.h        PhysicsWorld: bodies, joints, cloths, hair, stepping, queries, debug draw
 ├── physx_yaml.h   register_physics_components(): YAML parsers and asset loaders
 ├── util/          PhysicsConfig, PhysicsSettings, math helpers, transform bridge
 ├── geometry/      AABB, ray, sphere, OBB, capsule, triangle mesh, mesh BVH
@@ -487,6 +488,7 @@ physxcoopa/
 ├── broadphase/    dynamic AABB tree, layer matrix, pair cache
 ├── dynamics/      bodies, inertia, integrator, islands, joints (hinge/ball/cone-twist), materials, solver
 ├── cloth/         cloth data, grid builder, collision, XPBD solver
+├── hair/          strand data, builder, XPBD solver (reuses cloth's particles and collision)
 ├── query/         query filter, raycast and overlap helpers, exact sweeps and penetration
 ├── character/     kinematic capsule character motor (collide-and-slide, steps, slopes, snap)
 ├── debug/         DebugDraw line output

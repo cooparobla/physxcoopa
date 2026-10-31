@@ -19,6 +19,8 @@
 #include <physxcoopa/cloth/cloth_builder.h>
 #include <physxcoopa/cloth/cloth_collision.h>
 #include <physxcoopa/cloth/cloth_solver.h>
+#include <physxcoopa/hair/strand_builder.h>
+#include <physxcoopa/hair/strand_solver.h>
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/collision/manifold.h>
 #include <physxcoopa/collision/contact_event.h>
@@ -617,6 +619,86 @@ public:
         }
     }
 
+    // --- Hair strands ---------------------------------------------------------------------
+    // The same shape as the cloth API above, and for the same reasons: a groom is a persistent,
+    // independently-created object with no 1:1 relationship to any body, and it is one-way
+    // coupled so nothing downstream ever reads it mid-step. See hair/strand.h.
+
+    /**
+     * @brief Takes ownership of a strand set and begins solving it.
+     * @param set Built by hair::make_strands(). Its `valid` flag is set by this call.
+     * @return A generational handle, or an invalid one if `set` has no particles.
+     */
+    hair::StrandSetId add_strands(hair::StrandSet&& set) {
+        if (set.particles.empty() || set.strands.empty()) return hair::StrandSetId{};
+        set.valid = true;
+        set.bounds = hair::compute_bounds(set);
+
+        uint32_t index;
+        if (!free_strand_indices_.empty()) {
+            index = free_strand_indices_.back();
+            free_strand_indices_.pop_back();
+            strand_sets_[index] = std::move(set);
+        } else {
+            index = static_cast<uint32_t>(strand_sets_.size());
+            strand_sets_.push_back(std::move(set));
+            strand_generations_.push_back(0);
+            strand_alive_.push_back(false);
+        }
+        strand_alive_[index] = true;
+        return hair::StrandSetId{index, strand_generations_[index]};
+    }
+
+    /** @brief True if `id` addresses a currently-alive strand set. */
+    bool is_valid(hair::StrandSetId id) const {
+        return id.is_valid() && id.index < strand_sets_.size() && strand_alive_[id.index] &&
+               strand_generations_[id.index] == id.generation;
+    }
+
+    /** @brief Destroys a strand set immediately. A no-op if `id` is already invalid/stale. The
+     *         slot's vectors are cleared so their memory is released rather than held until a
+     *         differently-sized groom recycles the slot. */
+    void remove_strands(hair::StrandSetId id) {
+        if (!is_valid(id)) return;
+        strand_sets_[id.index] = hair::StrandSet{};
+        strand_alive_[id.index] = false;
+        ++strand_generations_[id.index];
+        free_strand_indices_.push_back(id.index);
+    }
+
+    /** @brief The set `id` addresses, or nullptr. Mutable: driving the roots each frame and
+     *         retuning StrandParams need no rebuild, and a renderer reads the particles through
+     *         the const overload without a copy. */
+    hair::StrandSet* get_strands(hair::StrandSetId id) {
+        return is_valid(id) ? &strand_sets_[id.index] : nullptr;
+    }
+    const hair::StrandSet* get_strands(hair::StrandSetId id) const {
+        return is_valid(id) ? &strand_sets_[id.index] : nullptr;
+    }
+
+    /** @brief Invokes `fn(StrandSetId, StrandSet&)` for every alive set, in index order. */
+    template <typename Fn>
+    void for_each_strands(Fn&& fn) {
+        for (uint32_t i = 0; i < strand_sets_.size(); ++i) {
+            if (!strand_alive_[i]) continue;
+            fn(hair::StrandSetId{i, strand_generations_[i]}, strand_sets_[i]);
+        }
+    }
+    template <typename Fn>
+    void for_each_strands(Fn&& fn) const {
+        for (uint32_t i = 0; i < strand_sets_.size(); ++i) {
+            if (!strand_alive_[i]) continue;
+            fn(hair::StrandSetId{i, strand_generations_[i]}, strand_sets_[i]);
+        }
+    }
+
+    /** @brief Number of currently-alive strand sets. */
+    std::size_t strand_set_count() const {
+        std::size_t n = 0;
+        for (std::size_t i = 0; i < strand_sets_.size(); ++i) if (strand_alive_[i]) ++n;
+        return n;
+    }
+
     /**
      * @brief Invokes `fn(BodyId, Body&)` for every currently-alive body, in index order.
      *
@@ -1153,13 +1235,20 @@ public:
         }
         interpolation_alpha_ = accumulator_ / h;
 
-        if (!cloths_.empty() && frame_dt > 0.0f) {
-            // With no substep this frame, nothing has synced the broadphase trees step_cloths_()
-            // queries for candidate colliders, so their proxies still hold last frame's bounds.
-            // The query box absorbs a margin's worth of staleness but not a fast body's whole
-            // frame of travel -- sync first rather than rely on that.
+        // Cloth, then hair. Both run once per FRAME here rather than inside the substep loop,
+        // both query the broadphase for candidate colliders, and both are one-way coupled -- see
+        // step_cloths_() and step_strands_() for the full argument.
+        const bool soft_bodies = !cloths_.empty() || !strand_sets_.empty();
+        if (soft_bodies && frame_dt > 0.0f) {
+            // With no substep this frame, nothing has synced the broadphase trees these two
+            // query, so their proxies still hold last frame's bounds. The query box absorbs a
+            // margin's worth of staleness but not a fast body's whole frame of travel -- sync
+            // first rather than rely on that.
             if (n == 0) sync_broadphase_(frame_dt);
-            step_cloths_(frame_dt);
+            if (!cloths_.empty()) step_cloths_(frame_dt);
+            // Hair last, so a groom pinned to something a cloth is draped over still sees the
+            // frame's final poses.
+            if (!strand_sets_.empty()) step_strands_(frame_dt);
         }
     }
 
@@ -1749,6 +1838,105 @@ private:
     }
 
     /**
+     * @brief Advances every hair groom once, by this frame's dt.
+     *
+     * The structure mirrors step_cloths_() exactly -- resolve the driven roots, gather candidate
+     * colliders from both broadphase trees, gate on sleep, solve -- because hair makes the same
+     * three choices cloth does: one-way coupling, the frame clock rather than the substep grid,
+     * and no collider sweep (there is no un-solved drawn frame for a sweep to cover).
+     *
+     * Roots are driven from OUTSIDE -- hair::set_strand_roots(), called by the engine from the
+     * scalp's transform -- rather than from a body, because a groom follows a mesh, not a
+     * rigidbody. That is the one structural difference from a cloth anchor.
+     */
+    void step_strands_(float dt) {
+        const float internal_h = std::max(
+            config_.fixed_dt / static_cast<float>(std::max(1u, config_.cloth_substeps)),
+            util::k_epsilon);
+        const uint32_t frame_substeps = std::clamp<uint32_t>(
+            static_cast<uint32_t>(std::lround(dt / internal_h)), 1u, util::k_max_cloth_substeps);
+
+        for (uint32_t si = 0; si < strand_sets_.size(); ++si) {
+            if (!strand_alive_[si]) continue;
+            hair::StrandSet& set = strand_sets_[si];
+            if (!set.enabled || set.empty()) continue;
+
+            // A root that moved is motion the groom has to answer, so it also wakes it.
+            bool root_moved = false;
+            for (const hair::Strand& strand : set.strands) {
+                const glm::vec3 delta = strand.root_position - strand.prev_root_position;
+                if (glm::dot(delta, delta) > util::k_epsilon) { root_moved = true; break; }
+            }
+
+            cloth_colliders_.clear();
+            const float travel = hair::max_particle_speed(set) * dt;
+            const geometry::AABB query =
+                set.bounds.expand(set.params.thickness + travel + config_.aabb_margin);
+
+            bool collider_moving = false;
+            auto gather = [&](void* user_data) {
+                const uint32_t slot = user_data_to_index_(user_data);
+                if (slot >= shapes_.size() || !shape_alive_[slot]) return;
+                const collision::Shape& shape = shapes_[slot];
+                if (!shape.enabled || shape.is_trigger) return;
+                if (!layer_matrix_.should_collide(set.params.layer, shape.layer)) return;
+
+                const dynamics::BodyId owner = shape_owner_[slot];
+                if (!is_valid(owner)) return;
+                const dynamics::Body& body = bodies_[owner.index];
+
+                cloth::ClothCollider collider;
+                collider.shape = &shape;
+                collider.position = body.position;
+                collider.orientation = body.orientation;
+                collider.end_orientation = body.orientation;
+                collider.bounds = collision::world_bounds(shape, body.position, body.orientation);
+                if (!collider.bounds.overlaps(query)) return;
+                cloth_colliders_.push_back(collider);
+
+                // A spinning head has near-zero linear velocity and is very much moving, so the
+                // wake test reads both -- the same rule cloth and rigid sleep both apply.
+                if (body.type != dynamics::BodyType::Static &&
+                    (glm::dot(body.linear_velocity, body.linear_velocity) > util::k_epsilon ||
+                     glm::dot(body.angular_velocity, body.angular_velocity) > util::k_epsilon)) {
+                    collider_moving = true;
+                }
+            };
+            static_tree_.query(query, gather);
+            dynamic_tree_.query(query, gather);
+
+            if (root_moved || collider_moving) {
+                set.awake = true;
+                set.sleep_timer = 0.0f;
+            }
+            if (!set.awake) {
+                // Keep the root lerp's start where the groom actually is, or the first substep
+                // after waking would interpolate from a seconds-stale position and snap.
+                for (hair::Strand& strand : set.strands) {
+                    strand.prev_root_position = strand.root_position;
+                    strand.prev_root_orientation = strand.root_orientation;
+                }
+                continue;
+            }
+
+            const glm::vec3 centre = 0.5f * (set.bounds.min + set.bounds.max);
+            hair::solve_strands(set, cloth_colliders_,
+                                gravity_sources_.empty() ? gravity_ : gravity_at(centre),
+                                frame_substeps, config_.cloth_iterations, dt, strand_scratch_);
+
+            if (hair::max_particle_speed(set) < set.params.sleep_threshold) {
+                set.sleep_timer += dt;
+                if (set.sleep_timer >= set.params.sleep_time) {
+                    set.awake = false;
+                    for (cloth::ClothParticle& p : set.particles) p.velocity = glm::vec3(0.0f);
+                }
+            } else {
+                set.sleep_timer = 0.0f;
+            }
+        }
+    }
+
+    /**
      * @brief Broadphase (two-tree query, job-parallel) + narrowphase (job-parallel) over this
      *        step's overlapping pairs. See discover_pairs_()/narrowphase_()'s docs for the
      *        parallelization scheme and the determinism argument for each.
@@ -1934,6 +2122,15 @@ private:
      *         per cloth rather than reallocated, matching bounds_scratch_/manifold_scratch_. */
     cloth::ClothSolverScratch cloth_scratch_;
     std::vector<cloth::ClothCollider> cloth_colliders_;
+
+    /** @brief Hair grooms, stored exactly as cloths are and for the same reasons; see
+     *         hair/strand.h. The collider snapshot type is shared with cloth deliberately --
+     *         hair needs precisely the sphere/box/capsule/mesh projection cloth already has. */
+    std::vector<hair::StrandSet> strand_sets_;
+    std::vector<uint32_t> strand_generations_;
+    std::vector<bool> strand_alive_;
+    std::vector<uint32_t> free_strand_indices_;
+    hair::StrandSolverScratch strand_scratch_;
 
     std::vector<DeferredCommand> deferred_commands_;
     bool in_step_ = false;
