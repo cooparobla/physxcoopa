@@ -40,6 +40,7 @@
 #include <vector>
 
 #include <physxcoopa/cloth/cloth.h>
+#include <physxcoopa/dynamics/body.h>
 #include <physxcoopa/geometry/aabb.h>
 
 namespace coopa {
@@ -171,6 +172,12 @@ struct StrandSet {
     std::vector<glm::vec3> rest_offset;
 
     std::vector<Strand> strands;
+
+    /** @brief When non-empty, the ONLY bodies this set collides against -- the broadphase is not
+     *         queried at all. Written by the engine each frame from resolved object names; empty
+     *         (the default) collides with every nearby shape, layer-filtered, exactly as cloth
+     *         does. */
+    std::vector<dynamics::BodyId> collide_bodies;
 
     StrandParams   params;
     geometry::AABB bounds;

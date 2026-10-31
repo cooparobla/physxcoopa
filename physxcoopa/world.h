@@ -1874,8 +1874,7 @@ private:
                 set.bounds.expand(set.params.thickness + travel + config_.aabb_margin);
 
             bool collider_moving = false;
-            auto gather = [&](void* user_data) {
-                const uint32_t slot = user_data_to_index_(user_data);
+            auto add_shape = [&](uint32_t slot) {
                 if (slot >= shapes_.size() || !shape_alive_[slot]) return;
                 const collision::Shape& shape = shapes_[slot];
                 if (!shape.enabled || shape.is_trigger) return;
@@ -1902,8 +1901,20 @@ private:
                     collider_moving = true;
                 }
             };
-            static_tree_.query(query, gather);
-            dynamic_tree_.query(query, gather);
+
+            if (set.collide_bodies.empty()) {
+                auto gather = [&](void* user_data) { add_shape(user_data_to_index_(user_data)); };
+                static_tree_.query(query, gather);
+                dynamic_tree_.query(query, gather);
+            } else {
+                // An explicit allowlist: skip the broadphase entirely and build colliders straight
+                // from the named bodies, so cost is proportional to what the groom was told to
+                // avoid rather than to whatever happens to be nearby.
+                for (const dynamics::BodyId id : set.collide_bodies) {
+                    if (!is_valid(id)) continue;
+                    for (const uint32_t slot : shapes_of(id)) add_shape(slot);
+                }
+            }
 
             if (root_moved || collider_moving) {
                 set.awake = true;

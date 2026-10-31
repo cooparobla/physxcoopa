@@ -54,6 +54,22 @@ Velocities are re-derived from positions at stage 8 rather than tracked through 
 That is the defining property of PBD — every correction automatically becomes a velocity change,
 with no per-stage bookkeeping that could disagree with where the particles ended up.
 
+### Collision candidates: broadphase, or an explicit allowlist
+
+`StrandSet::collide_bodies` is empty by default, and `PhysicsWorld::step_strands_()` then queries
+both broadphase trees for stage 7's candidates — the same query cloth uses. When the engine
+(`toyengine/hair`'s `collide_with` key) fills it in instead, the broadphase is skipped entirely:
+candidates come straight from `shapes_of()` on each named `BodyId`. Both paths apply the same four
+guards (`shape.enabled && !is_trigger`, the layer matrix, an AABB overlap reject, and the
+collider-moving wake test) — the wake test matters even on the explicit path, since a kinematic
+body that moves without it would not wake a settled groom.
+
+Stage 7 records the **deepest** contact's normal and depth for stage 8's friction, not the last
+one in the candidate list — with two bodies touching one particle (a head resting against a neck,
+say) last-wins order is arbitrary, while the deepest contact is the one actually holding the
+particle in place. Every contact's position correction still applies, in order; only which normal
+friction uses changes.
+
 ## What a strand needs that a sheet does not
 
 This module reuses `cloth::ClothParticle`, `cloth::ClothConstraint`, `cloth::ConstraintBatch`,

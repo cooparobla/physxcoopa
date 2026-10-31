@@ -282,8 +282,15 @@ inline void solve_strands(StrandSet& set, const std::vector<cloth::ClothCollider
                     float depth = 0.0f;
                     if (cloth::project_particle(collider, set.params.thickness, p.position, normal,
                                                 depth, &p.prev_position)) {
-                        scratch.contact_normal[i] = normal;
-                        scratch.contact_depth[i] = depth;
+                        // Record the DEEPEST contact's normal for stage 8's friction, not merely
+                        // the last one in the list: with two colliders touching one particle (a
+                        // head and a neck it rests against, say) the last-wins order is arbitrary,
+                        // while the deepest is the one actually holding the particle in place.
+                        // The position correction from every contact still applies, in order.
+                        if (scratch.contacted[i] == 0 || depth > scratch.contact_depth[i]) {
+                            scratch.contact_normal[i] = normal;
+                            scratch.contact_depth[i] = depth;
+                        }
                         scratch.contacted[i] = 1;
                     }
                 }
