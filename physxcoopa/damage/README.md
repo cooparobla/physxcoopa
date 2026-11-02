@@ -27,9 +27,10 @@ ever decides what SHOULD happen, never touches geometry.
   0..1 saturation cells) that turns repeated `ResolvedDamage` deposits into a region, and fits a
   cleave plane through it once that region reads flat enough.
 - `toyengine::scene::Damageable` / `DestructionSystem` -- the scene-facing component and the
-  system that drains its blow queue, deposits into the field, and carries out Fracture/Cleave.
-  **Dent/Chip/Hole are not implemented yet** -- see `Damageable`'s own file doc for why (they
-  need a per-object private mesh clone this stage does not build).
+  system that drains its blow queue, deposits into the field, and carries out Fracture, Cleave,
+  and Dent/Chip (pushing vertices inward on a per-object mesh clone,
+  `toyengine/destruct/dent.h`). Hole is not implemented -- punching through is a topology change
+  a dynamic Mesh's fixed index buffer cannot express; see `Damageable`'s own file doc.
 
 ## Usage example
 
