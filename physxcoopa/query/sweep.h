@@ -27,6 +27,18 @@
  * than k_sweep_tolerance. Moving out of or along such a target ignores it, so a shape resting
  * against a surface can still be swept along or away from it (what a character motor's
  * collide-and-slide relies on). For a mesh this decision is made per triangle.
+ *
+ * No ConvexHull support, on EITHER side of a sweep -- not attempted, not approximated. Every
+ * routine here is built around a cast shape's "core" (a point/segment plus radius, time-marched
+ * by conservative advancement) or a box's fixed 3 face axes / 3 edge directions (swept SAT); a
+ * hull has neither, and generalizing swept_sat_() to a variable, per-hull axis set the way
+ * sat_hull.h generalized the STATIONARY case would be real new work, not a drop-in. Per the
+ * project's own precedent for exactly this situation (no speculative/CCD support for Capsule
+ * pairs either, "a tractable follow-up"), sweep_shape() below rejects a hull on either side
+ * outright rather than quietly computing a wrong time of impact against a zeroed-out core.
+ * compute_penetration() (PhysicsWorld, via convex_penetration()/mesh_penetrations() in this
+ * file) is unaffected -- stationary overlap already dispatches through generate_contacts()
+ * and mesh_triangle_contacts(), both of which DO have real ConvexHull branches.
  */
 
 #ifndef PHYSXCOOPA_QUERY_SWEEP_H
@@ -605,13 +617,16 @@ inline bool sweep_mesh(const collision::Shape& shape, const glm::vec3& pos, cons
 /**
  * @brief Casts convex `shape` (Sphere, Capsule or Box, at `pos`/`rot`) along unit `dir` up to
  *        `max_distance` against `target` at `tpos`/`trot`, any shape type. False for a
- *        TriangleMesh cast shape (mesh-vs-anything casts are not supported).
+ *        TriangleMesh cast shape (mesh-vs-anything casts are not supported), and false for a
+ *        ConvexHull on EITHER side -- see this file's doc for why that is a deliberate,
+ *        documented gap rather than an oversight.
  */
 inline bool sweep_shape(const collision::Shape& shape, const glm::vec3& pos, const glm::quat& rot,
                         const glm::vec3& dir, float max_distance,
                         const collision::Shape& target, const glm::vec3& tpos, const glm::quat& trot,
                         SweepResult& out) {
-    if (shape.type == collision::ShapeType::TriangleMesh || max_distance < 0.0f) return false;
+    if (shape.type == collision::ShapeType::TriangleMesh || shape.type == collision::ShapeType::ConvexHull ||
+        target.type == collision::ShapeType::ConvexHull || max_distance < 0.0f) return false;
     if (target.type == collision::ShapeType::TriangleMesh)
         return sweep_mesh(shape, pos, rot, dir, max_distance, target, tpos, trot, out);
     return sweep_convex(shape, pos, rot, dir, max_distance, target, tpos, trot, out);

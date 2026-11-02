@@ -30,8 +30,8 @@ debug geometry as plain line segments to draw however you like.
 - **Z-up, in metres.** Gravity defaults to `{0, 0, -9.81}`. A capsule's default axis is Z.
 - **Static, kinematic and dynamic bodies.** Kinematic bodies take their velocity from how far
   they moved, so they carry and push dynamic bodies.
-- **Colliders.** Box, sphere, capsule and triangle mesh. Several colliders under one rigid body
-  form a compound body. Colliders can have a local offset (`center`).
+- **Colliders.** Box, sphere, capsule, convex hull and triangle mesh. Several colliders under
+  one rigid body form a compound body. Colliders can have a local offset (`center`).
 - **Sequential-impulse solver.** Warm starting, a separate restitution pass and split-impulse
   position correction. Stacks settle and stay put.
 - **Physics materials.** Static and dynamic friction, restitution, and Unity-style combine
@@ -139,6 +139,19 @@ debug geometry as plain line segments to draw however you like.
 - **Wind and air.** Wind, turbulence, drag and lift.
 - **Sleeping.** A settled sheet stops simulating until an anchor or a nearby collider moves.
 
+### Damage
+- **Typed blows, not one scalar.** `damage::DamageType` (Impact/Slash/Pierce/Explosive/Fire) each
+  read a `DamageMaterial`'s per-type `resistance` plus its `hardness`/`toughness`/`fibrous`
+  differently -- `resolve_damage()` is the one function that decides an axe cleaves what a
+  bullet punches through, and the same impulse means neither. `impact_blow()` turns a solved
+  contact's accumulated normal impulse into an Impact blow; a `DamageDealer` on the other
+  collider overrides the type (a swung axe reads as Slash, not the generic Impact a bare
+  contact would otherwise read as).
+- **Pure, scene-free.** `DamageEvent`/`DamageMaterial`/`ResolvedDamage` carry no scene or mesh
+  types; the localized accumulation that actually carves a mesh (`DamageField`, `Damageable`)
+  is one layer up, in toyengine. See [`physxcoopa/damage/README.md`](physxcoopa/damage/README.md).
+- **Scene component.** `DamageDealer`, parsed in `physx_yaml.h`.
+
 ### Navigation
 - **Navmesh from colliders.** Static and kinematic colliders are voxelized, tile by tile, into a
   multi-layer walkable surface per agent profile (radius, height, climb). Stairs, ramps, bridges
@@ -167,7 +180,8 @@ debug geometry as plain line segments to draw however you like.
 - **Debug drawing.** Collider wireframes, contacts, joints and broadphase nodes as colored line
   segments.
 - **Scene components.** `BoxCollider`, `SphereCollider`, `CapsuleCollider`, `MeshCollider`,
-  `Rigidbody`, `HingeJoint`, `BallJoint`, `ConeTwistJoint`, `Cloth` and `Vehicle`, with YAML parsers and Unity-style collision callbacks.
+  `ConvexCollider`, `Rigidbody`, `HingeJoint`, `BallJoint`, `ConeTwistJoint`, `Cloth` and
+  `Vehicle`, with YAML parsers and Unity-style collision callbacks.
 
 ## Getting started
 
@@ -358,6 +372,7 @@ Every key is optional.
 | `SphereCollider` | `radius` |
 | `CapsuleCollider` | `radius`, `height` (total, including the caps), `direction` (0, 1 or 2 for X, Y or Z; default 2) |
 | `MeshCollider` | `mesh_path` (loads `meshes/<name>.yaml`, a `vertices:`/`faces:` mesh), `convex` |
+| `ConvexCollider` | `hull_mesh` (loads `meshes/<name>.yaml`; the hull is built from its vertices lazily, once) — legal on a dynamic `Rigidbody`, unlike `MeshCollider` |
 | `Rigidbody` | `mass`, `drag`, `angular_drag`, `use_gravity`, `is_kinematic`, `interpolation` (`Interpolate` or `None`), `freeze_position`, `freeze_rotation`, `velocity`, `angular_velocity` |
 | `HingeJoint` | `connected_object`, `anchor` and `axis` (in this object's local frame), `limits: { min, max }` (degrees; or flat `use_limits`, `min_angle`, `max_angle`), `enable_collision` |
 | `BallJoint` | `connected_object`, `anchor` (this object's local frame), `enable_collision` |
@@ -367,6 +382,7 @@ Every key is optional.
 | `NavVolume` | `size`, `center`, `area` (`NotWalkable` cuts a hole) |
 | `NavLink` | `start`, `end` (local space), `bidirectional`, `cost`, `area`, `snap_radius` |
 | `Cloth` | `resolution`, `size`, `mass`, `shear`, `stretch_compliance`, `bend_compliance`, `damping`, `thickness`, `friction`, `gravity_scale`, `max_velocity`, `external_acceleration`, `wind`, `wind_turbulence`, `air_drag`, `air_lift`, `self_collision`, `self_distance`, `tether_scale`, `substeps`, `iterations`, `sleep_threshold`, `sleep_time`, `layer`, `anchors: [{ object, point, radius }]` |
+| `DamageDealer` | `damage_type` (Impact/Slash/Pierce/Explosive/Fire; not `type`, which every component node's own YAML tag already owns), `amount` (non-Impact blows), `amount_from_impulse` (1; scales the contact impulse for an Impact blow), `edge_axis` (Slash's blade direction), `radius` (0 = the receiver's default), `one_shot` (false) |
 
 A cloth sheet is built in its object's local XY plane, centred on the object. Each anchor pins
 the particles within `radius` of `point`. With `object`, the point is in that object's local
@@ -467,7 +483,9 @@ boxes, hand-built meshes, cloth sheets, nav worlds) are in `tests/support/`.
 | `physics_world` | free fall vs. the integrator's closed form, handles, impulse/force API, `on_substep`, determinism (repeat and serial vs. job-parallel), debug draw |
 | `contact_solver` | restitution, kinematic pushing, tumbling to rest, CCD, stacking, friction, mass ratios, capsules |
 | `sleep` | sleeping, kinematic wake rules, joint islands |
-| `narrowphase` / `broadphase` | SAT contacts, BVH mesh contacts vs. brute force, internal edges; AABB tree vs. brute force, pair and layer filtering |
+| `narrowphase` / `broadphase` | SAT contacts (box, hull, mesh), BVH mesh contacts vs. brute force, internal edges; AABB tree vs. brute force, pair and layer filtering |
+| `convex_hull` | hull builder: face merging, volume/centroid, degenerates, determinism, `support()` |
+| `damage` | `resolve_damage()`: type x material -> response (Dent/Chip/Hole/Cleave/Fracture/None), resistance scales HP loss monotonically, a settling-contact impulse resolves to None |
 | `queries` | exact raycasts, overlaps, sweeps, `QueryFilter`, `compute_penetration` |
 | `character_motor` | step-up and slope limit |
 | `contact_events` / `joints` | trigger and collision callbacks; hinge, ball and cone-twist joints |
@@ -493,8 +511,9 @@ physxcoopa/
 ├── character/     kinematic capsule character motor (collide-and-slide, steps, slopes, snap)
 ├── debug/         DebugDraw line output
 ├── nav/           navigation: voxelized walkable surface, A*, flow fields, crowds
-├── loaders/       asset loaders for triangle meshes and physics materials
-├── components/    scene components: colliders, Rigidbody, Hinge/Ball/ConeTwistJoint, Cloth, FixedUpdateBehaviour, Nav*
+├── damage/        typed damage: DamageEvent/DamageMaterial/resolve_damage()/impact_blow()
+├── loaders/       asset loaders for triangle meshes, physics materials and damage materials
+├── components/    scene components: colliders, Rigidbody, Hinge/Ball/ConeTwistJoint, Cloth, FixedUpdateBehaviour, DamageDealer, Nav*
 ├── nav_yaml.h     register_nav_components() (called by register_physics_components())
 └── system/        PhysicsSystem, NavSystem and their install functions
 tests/             the test suites (tests/support/: shared fixtures)
@@ -514,7 +533,7 @@ itself uses only glm and libcoopa's signals, logger and job engine.
 - **Changing bodies during a substep.** From `on_substep` you can apply forces and set
   velocities. `create_body()` and `destroy_body()` are deferred to the start of the next substep.
 - **Mesh colliders are static or kinematic.** A `MeshCollider` on a dynamic `Rigidbody` throws
-  when it binds. The `convex` key is read but convex mesh colliders are not implemented yet.
+  when it binds; use a `ConvexCollider` for a dynamic convex body instead.
 - **Physics runs before animation.** At its default order (100), physics reads transforms
   before animation (300) writes them. To let animation drive kinematic bodies, install the
   system at a later order, for example `install_physics_system(scene, 325)`.

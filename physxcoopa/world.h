@@ -870,11 +870,14 @@ public:
      * an overlap first.
      *
      * @param dir Travel direction; normalized here (false for a zero vector).
-     * @return False if nothing is hit within `max_distance`, or `shape` is a TriangleMesh.
+     * @return False if nothing is hit within `max_distance`, or `shape` is a TriangleMesh or a
+     *         ConvexHull -- see query/sweep.h's file doc for why hull casts are a documented
+     *         gap (on either side of the pair) rather than an approximation.
      */
     bool shape_cast(const collision::Shape& shape, const glm::vec3& pos, const glm::quat& rot, const glm::vec3& dir,
                     float max_distance, query::RaycastHit& hit, const query::QueryFilter& filter = {}) const {
-        if (shape.type == collision::ShapeType::TriangleMesh || !(max_distance >= 0.0f)) return false;
+        if (shape.type == collision::ShapeType::TriangleMesh || shape.type == collision::ShapeType::ConvexHull ||
+            !(max_distance >= 0.0f)) return false;
         float dir_len = glm::length(dir);
         if (dir_len < 1e-8f) return false;
         const glm::vec3 unit_dir = dir / dir_len;
@@ -946,7 +949,8 @@ public:
     }
 
     /**
-     * @brief Every overlap between convex `shape` (Sphere, Capsule or Box at `pos`/`rot`) and the
+     * @brief Every overlap between convex `shape` (Sphere, Capsule, Box or ConvexHull at
+     *        `pos`/`rot`) and the
      *        world, as minimum-translation vectors: moving the shape by `normal * depth` clears
      *        that target (see query::Penetration). Candidates come from both broadphase trees;
      *        each runs the same pairwise contact math as the solver (collision::generate_contacts,
@@ -1410,6 +1414,11 @@ private:
             case collision::ShapeType::Box: return std::min({s.half_extents.x, s.half_extents.y, s.half_extents.z});
             case collision::ShapeType::Capsule: return std::min(s.capsule_radius, s.capsule_half_height);
             case collision::ShapeType::TriangleMesh: return std::numeric_limits<float>::max();
+            case collision::ShapeType::ConvexHull: {
+                if (!s.hull) return std::numeric_limits<float>::max();
+                const glm::vec3 half = s.hull->local_bounds.extents() * 0.5f * s.hull_scale;
+                return std::min({half.x, half.y, half.z});
+            }
         }
         return std::numeric_limits<float>::max();
     }

@@ -32,6 +32,7 @@
 #include <physxcoopa/geometry/obb.h>
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/collision/narrowphase.h>
+#include <physxcoopa/collision/sat_hull.h>
 #include <physxcoopa/dynamics/body.h>
 
 #include <glm/glm.hpp>
@@ -41,6 +42,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <vector>
 
 namespace coopa {
@@ -163,6 +165,40 @@ inline bool raycast_shape(const geometry::Ray& ray, const collision::Shape& shap
             normal = glm::normalize(mesh_rot * shape.mesh->triangle_normal(best_tri));
             return true;
         }
+        case collision::ShapeType::ConvexHull: {
+            // Exact: clips the ray's [0, max_distance] interval against every face's half-space,
+            // the same generalization of ray_vs_obb's per-axis slab test to a hull's per-face
+            // ones. A ray starting inside the hull reports t=0 at whichever face's entering
+            // value is largest (least negative) -- ray_vs_obb's same convention for the inside
+            // case, just compared across however many faces instead of 3 axis pairs.
+            if (!shape.hull) return false;
+            collision::PosedHull posed = collision::world_posed_hull(shape, pos, rot);
+            float t_near = -std::numeric_limits<float>::max();
+            float t_far = ray.max_distance;
+            int hit_face = -1;
+            for (std::size_t f = 0; f < posed.hull->face_count(); ++f) {
+                glm::vec3 n = posed.world_face_normal(f);
+                glm::vec3 fv = posed.world_vertex(posed.hull->face_vertices[posed.hull->face_starts[f]]);
+                float d = glm::dot(n, fv);
+                float denom = glm::dot(n, ray.direction);
+                float dist = d - glm::dot(n, ray.origin);
+                if (std::abs(denom) < 1e-9f) {
+                    if (dist < 0.0f) return false; // parallel to this face and outside it: never enters
+                    continue;
+                }
+                float tf = dist / denom;
+                if (denom < 0.0f) {
+                    if (tf > t_near) { t_near = tf; hit_face = int(f); }
+                } else if (tf < t_far) {
+                    t_far = tf;
+                }
+            }
+            if (hit_face < 0 || t_near > t_far) return false;
+            t = std::max(t_near, 0.0f);
+            if (t > ray.max_distance) return false;
+            normal = posed.world_face_normal(std::size_t(hit_face));
+            return true;
+        }
     }
     return false;
 }
@@ -184,6 +220,11 @@ inline bool shape_overlaps_sphere(const collision::Shape& shape, const glm::vec3
             collision::ContactManifold m;
             return collision::generate_mesh_contacts(sphere_shape, query.center, glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
                                                        shape, pos, rot, m);
+        }
+        case collision::ShapeType::ConvexHull: {
+            if (!shape.hull) return false;
+            collision::PosedHull posed = collision::world_posed_hull(shape, pos, rot);
+            return collision::hull_vs_sphere(posed, query, n, pen, p);
         }
     }
     return false;
@@ -209,6 +250,12 @@ inline bool shape_overlaps_obb(const collision::Shape& shape, const glm::vec3& p
             collision::Shape box_shape = collision::Shape::make_box(query.half_extents);
             collision::ContactManifold m;
             return collision::generate_mesh_contacts(box_shape, query.center, query.orientation, shape, pos, rot, m);
+        }
+        case collision::ShapeType::ConvexHull: {
+            if (!shape.hull) return false;
+            collision::PosedHull posed = collision::world_posed_hull(shape, pos, rot);
+            collision::ContactManifold m;
+            return collision::generate_hull_box_contacts(posed, query, m);
         }
     }
     return false;
@@ -257,6 +304,12 @@ inline bool shape_overlaps_capsule(const collision::Shape& shape, const glm::vec
             collision::Shape capsule_shape = collision::Shape::make_capsule(query.radius, len * 0.5f);
             collision::ContactManifold m;
             return collision::generate_mesh_contacts(capsule_shape, cap_pos, cap_rot, shape, pos, rot, m);
+        }
+        case collision::ShapeType::ConvexHull: {
+            if (!shape.hull) return false;
+            collision::PosedHull posed = collision::world_posed_hull(shape, pos, rot);
+            collision::ContactManifold m;
+            return collision::hull_vs_capsule(posed, query, m);
         }
     }
     return false;

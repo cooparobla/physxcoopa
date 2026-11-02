@@ -12,6 +12,7 @@
 #include <physxcoopa/geometry/obb.h>
 #include <physxcoopa/geometry/capsule.h>
 #include <physxcoopa/geometry/triangle_mesh.h>
+#include <physxcoopa/geometry/convex_hull.h>
 #include <physxcoopa/dynamics/physics_material.h>
 
 #include <glm/glm.hpp>
@@ -23,13 +24,18 @@ namespace coopa {
 namespace physx {
 namespace collision {
 
-/** @brief Which primitive a Shape's fields describe. No ConvexHull -- see the plan's
- *         "Design rationale" for why GJK/EPA/QuickHull are excluded from v1 entirely. */
+/**
+ * @brief Which primitive a Shape's fields describe.
+ *
+ * ConvexHull is SAT-only, same as Box -- no GJK, no EPA, no randomized convergence. See
+ * geometry/convex_hull.h's file doc for why that is the deliberate line, not an oversight.
+ */
 enum class ShapeType {
     Sphere,
     Box,
     Capsule,
     TriangleMesh,
+    ConvexHull,
 };
 
 /**
@@ -84,6 +90,13 @@ struct Shape {
      *         non-uniform scale without per-vertex scaling, which v1 doesn't support). */
     float mesh_scale = 1.0f;
 
+    // --- ConvexHull ---
+    /** @brief Non-owning; lifetime owned by ConvexCollider's `std::shared_ptr<const ConvexHull>`
+     *         (a runtime-built hull has no asset file to hold an AssetHandle to, unlike
+     *         TriangleMesh's `mesh` above). */
+    const geometry::ConvexHull* hull = nullptr;
+    float hull_scale = 1.0f; /**< Uniform scale, same convention as `mesh_scale`. */
+
     const dynamics::PhysicsMaterial* material = nullptr; /**< nullptr -> PhysicsMaterial::default_material(). */
     bool is_trigger = false;
     uint32_t layer = 0;
@@ -127,6 +140,17 @@ struct Shape {
         s.enabled = true;
         s.type = ShapeType::TriangleMesh;
         s.mesh = m;
+        s.local_center = center;
+        return s;
+    }
+
+    static Shape make_hull(const geometry::ConvexHull* h, float scale = 1.0f,
+                            const glm::vec3& center = glm::vec3(0.0f)) {
+        Shape s;
+        s.enabled = true;
+        s.type = ShapeType::ConvexHull;
+        s.hull = h;
+        s.hull_scale = scale;
         s.local_center = center;
         return s;
     }
@@ -194,6 +218,10 @@ inline geometry::AABB world_bounds(const Shape& s, const glm::vec3& pos, const g
             glm::mat4 m(glm::mat3_cast(rot * s.local_rotation) * s.mesh_scale);
             m[3] = glm::vec4(pos + rot * s.local_center, 1.0f);
             return s.mesh->bounds().transform(m);
+        }
+        case ShapeType::ConvexHull: {
+            if (!s.hull) return geometry::AABB{};
+            return s.hull->bounds(pos + rot * s.local_center, rot * s.local_rotation, s.hull_scale);
         }
     }
     return geometry::AABB{};

@@ -14,6 +14,10 @@
  *   Box           geometry::closest_point_on_obb        (geometry/obb.h)
  *   Capsule       geometry::closest_point_on_segment    (geometry/capsule.h)
  *   TriangleMesh  geometry::MeshBVH + collision::closest_point_on_triangle (collision/mesh_contact.h)
+ *   ConvexHull    collision::hull_vs_sphere, treating the particle as a zero-mass probe sphere
+ *                 of radius `thickness` (collision/sat_hull.h) -- same single-most-violated-face
+ *                 approximation that function already documents, never swept (like TriangleMesh;
+ *                 not among project_particle()'s two-pose Box/Capsule cases).
  */
 
 #ifndef PHYSXCOOPA_CLOTH_CLOTH_COLLISION_H
@@ -25,6 +29,7 @@
 #include <cmath>
 
 #include <physxcoopa/collision/mesh_contact.h>
+#include <physxcoopa/collision/sat_hull.h>
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/geometry/aabb.h>
 #include <physxcoopa/geometry/capsule.h>
@@ -331,6 +336,20 @@ inline bool project_at_pose_(const collision::Shape& s, const glm::vec3& pose_po
             depth_out = glm::length(local_p - local_fixed) * scale;
             p = mesh_origin + rot * (local_fixed * scale);
             normal_out = rot * best_normal;
+            return true;
+        }
+
+        case collision::ShapeType::ConvexHull: {
+            if (!s.hull) return false;
+            const collision::PosedHull posed = collision::world_posed_hull(s, pose_pos, pose_rot);
+            const geometry::Sphere probe{p, thickness};
+            glm::vec3 point;
+            float pen = 0.0f;
+            if (!collision::hull_vs_sphere(posed, probe, normal_out, pen, point)) return false;
+            // Same convention as every other branch here: final position = (point on the actual
+            // shape's surface) + normal * thickness.
+            p = point + normal_out * thickness;
+            depth_out = pen;
             return true;
         }
     }

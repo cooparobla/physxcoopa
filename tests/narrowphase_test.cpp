@@ -1,8 +1,10 @@
 /**
  * @file narrowphase_test.cpp
- * @brief Contact generation: box-box SAT (face and edge-edge features, exact depths), BVH-narrowed
- *        mesh contacts against a brute-force oracle, internal-edge correction on a tiled mesh floor,
- *        and box-on-mesh support: no phantom contacts from a wall below a ledge, triangle vertices
+ * @brief Contact generation: box-box SAT (face and edge-edge features, exact depths), hull SAT
+ *        (hull-sphere, hull-box and hull-hull reproducing the box-box results exactly, feature-id
+ *        stability across repeated calls, edge-edge resolution), BVH-narrowed mesh contacts
+ *        against a brute-force oracle, internal-edge correction on a tiled mesh floor, and
+ *        box-on-mesh support: no phantom contacts from a wall below a ledge, triangle vertices
  *        holding a box up on a triangle smaller than its face, and a box settling flat on a finely
  *        tessellated floor.
  */
@@ -11,6 +13,8 @@
 #include <physxcoopa/world.h>
 #include <physxcoopa/collision/sat.h>
 #include <physxcoopa/collision/shape.h>
+#include <physxcoopa/geometry/convex_hull.h>
+#include <physxcoopa/collision/sat_hull.h>
 #include <random>
 #include "support/physics_fixtures.h"
 
@@ -38,6 +42,40 @@ COOPA_TEST(box_box_face_contact_has_four_points_at_known_depth) {
     }
 }
 
+/**
+ * Regression for a sign bug found in sat_hull.h's hull_vs_sphere() inside-case: a sphere fully
+ * enclosed in a hull must resolve OUTWARD through the nearest face (sphere_vs_box()'s inside
+ * branch does the same for a box), not back toward where the center already was -- which,
+ * before the fix, pushed the sphere further through the OPPOSITE side instead.
+ */
+COOPA_TEST(sphere_fully_embedded_in_hull_resolves_outward_through_nearest_face) {
+    glm::vec3 pts[8];
+    int k = 0;
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2)
+            for (int sz = -1; sz <= 1; sz += 2) pts[k++] = glm::vec3(float(sx), float(sy), float(sz)) * 0.5f;
+    geometry::ConvexHull hull;
+    ASSERT_TRUE(geometry::build_convex_hull(pts, 8, hull));
+
+    collision::Shape hull_shape = collision::Shape::make_hull(&hull);
+    // Off-center toward +X: the nearest face is unambiguously +X, well clear of every other face.
+    const glm::vec3 sphere_pos(0.3f, 0.0f, 0.0f);
+    const glm::quat identity(1.0f, 0.0f, 0.0f, 0.0f);
+
+    collision::PosedHull posed = collision::world_posed_hull(hull_shape, glm::vec3(0.0f), identity);
+    glm::vec3 n, p;
+    float pen = 0.0f;
+    ASSERT_TRUE(collision::hull_vs_sphere(posed, geometry::Sphere{sphere_pos, 0.1f}, n, pen, p));
+    ASSERT_NEAR(n.x, 1.0f, 1e-3f);
+    ASSERT_NEAR(n.y, 0.0f, 1e-3f);
+    ASSERT_NEAR(n.z, 0.0f, 1e-3f);
+
+    // The correction must land the sphere genuinely OUTSIDE the hull, not merely "separated by
+    // the reported depth" in a direction that still leaves it enclosed.
+    const glm::vec3 pushed = sphere_pos + n * pen;
+    ASSERT_TRUE(pushed.x > 0.5f - 1e-3f);
+}
+
 COOPA_TEST(box_box_edge_contact_is_a_single_edge_feature) {
     geometry::OBB a;
     a.center = glm::vec3(0.0f);
@@ -56,6 +94,102 @@ COOPA_TEST(box_box_edge_contact_is_a_single_edge_feature) {
     ASSERT_TRUE(collision::generate_box_box_contacts(a, b, m));
     ASSERT_TRUE(m.count == 1);
     ASSERT_TRUE(m.points[0].feature_id >= 0x1000u); // edge-edge feature-id range
+}
+
+namespace {
+/** @brief An axis-aligned cube hull of the given half-extent, centred on the origin in its own
+ *         local space -- the hull analog of an OBB with that half_extents, used to pose against
+ *         sat_hull.h's hull-box/hull-hull routines and check they reproduce sat.h's box-box
+ *         result exactly. */
+geometry::ConvexHull make_cube_hull_(float half_extent) {
+    glm::vec3 pts[8];
+    int k = 0;
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2)
+            for (int sz = -1; sz <= 1; sz += 2) pts[k++] = glm::vec3(float(sx), float(sy), float(sz)) * half_extent;
+    geometry::ConvexHull hull;
+    bool ok = geometry::build_convex_hull(pts, 8, hull);
+    (void)ok; // callers assert their own expectations on the hull/result, not the build itself
+    return hull;
+}
+} // namespace
+
+/**
+ * The cheapest check that generalizing SAT from boxes to hulls did not invert a normal or scale
+ * a depth wrong: a cube hull against a world-posed box reproduces box_box_face_contact_has_
+ * four_points_at_known_depth's exact normal and depth.
+ */
+COOPA_TEST(hull_vs_box_reproduces_box_vs_box_face_contact) {
+    geometry::ConvexHull hull_a = make_cube_hull_(0.5f);
+    collision::PosedHull posed_a{&hull_a, glm::vec3(0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), 1.0f};
+
+    geometry::OBB b;
+    b.center = glm::vec3(0.8f, 0.0f, 0.0f);
+    b.half_extents = glm::vec3(0.5f);
+
+    collision::ContactManifold m;
+    ASSERT_TRUE(collision::generate_hull_box_contacts(posed_a, b, m));
+    ASSERT_NEAR(m.normal.x, 1.0f, 1e-3f);
+    ASSERT_NEAR(std::abs(m.normal.y), 0.0f, 1e-3f);
+    ASSERT_NEAR(std::abs(m.normal.z), 0.0f, 1e-3f);
+    ASSERT_TRUE(m.count == 4);
+    for (uint8_t i = 0; i < m.count; ++i) ASSERT_NEAR(m.points[i].penetration, 0.2f, 1e-3f);
+}
+
+/** @brief Same reproduction, hull-vs-hull this time: both boxes of box_box_face_contact_has_
+ *         four_points_at_known_depth built as cube hulls instead. */
+COOPA_TEST(hull_vs_hull_reproduces_box_vs_box_face_contact) {
+    geometry::ConvexHull hull_a = make_cube_hull_(0.5f);
+    geometry::ConvexHull hull_b = make_cube_hull_(0.5f);
+    collision::PosedHull posed_a{&hull_a, glm::vec3(0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), 1.0f};
+    collision::PosedHull posed_b{&hull_b, glm::vec3(0.8f, 0.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), 1.0f};
+
+    collision::ContactManifold m;
+    ASSERT_TRUE(collision::generate_hull_hull_contacts(posed_a, posed_b, m));
+    ASSERT_NEAR(m.normal.x, 1.0f, 1e-3f);
+    ASSERT_NEAR(std::abs(m.normal.y), 0.0f, 1e-3f);
+    ASSERT_NEAR(std::abs(m.normal.z), 0.0f, 1e-3f);
+    ASSERT_TRUE(m.count == 4);
+    for (uint8_t i = 0; i < m.count; ++i) ASSERT_NEAR(m.points[i].penetration, 0.2f, 1e-3f);
+}
+
+/**
+ * The warm-start guarantee SAT exists to provide (see sat_hull.h's file doc): two successive
+ * calls on the SAME resting pair -- unmoved -- must return the SAME feature ids, point for
+ * point, so the solver's accumulated impulses stay attached to the same contact next step. This
+ * is exactly the property EPA could not give (v1 plan's objection); it is the one assertion that
+ * justifies choosing SAT over it.
+ */
+COOPA_TEST(hull_hull_feature_ids_are_stable_across_repeated_calls) {
+    geometry::ConvexHull hull_a = make_cube_hull_(0.5f);
+    geometry::ConvexHull hull_b = make_cube_hull_(0.5f);
+    collision::PosedHull posed_a{&hull_a, glm::vec3(0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), 1.0f};
+    collision::PosedHull posed_b{&hull_b, glm::vec3(0.8f, 0.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), 1.0f};
+
+    collision::ContactManifold m1, m2;
+    ASSERT_TRUE(collision::generate_hull_hull_contacts(posed_a, posed_b, m1));
+    ASSERT_TRUE(collision::generate_hull_hull_contacts(posed_a, posed_b, m2));
+    ASSERT_TRUE(m1.count == m2.count);
+    for (uint8_t i = 0; i < m1.count; ++i) ASSERT_TRUE(m1.points[i].feature_id == m2.points[i].feature_id);
+}
+
+/**
+ * The hull-hull generalization of box_box_edge_contact_is_a_single_edge_feature: the same tilt
+ * and offset that lands sat.h's box-box routine on an edge-cross axis must do the same for two
+ * cube hulls -- a single point tagged with sat_hull.h's edge-edge bit (0x50000000), not a face.
+ */
+COOPA_TEST(hull_hull_edge_configuration_resolves_to_the_edge_axis) {
+    geometry::ConvexHull hull_a = make_cube_hull_(0.5f);
+    geometry::ConvexHull hull_b = make_cube_hull_(0.5f);
+    collision::PosedHull posed_a{&hull_a, glm::vec3(0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), 1.0f};
+    // Same tilt + diagonal offset as box_box_edge_contact_is_a_single_edge_feature.
+    collision::PosedHull posed_b{&hull_b, glm::vec3(0.864856f, 0.686217f, 0.79309f),
+                                 glm::quat(-0.996603f, -0.0278176f, -0.0606705f, -0.0482471f), 1.0f};
+
+    collision::ContactManifold m;
+    ASSERT_TRUE(collision::generate_hull_hull_contacts(posed_a, posed_b, m));
+    ASSERT_TRUE(m.count == 1);
+    ASSERT_TRUE((m.points[0].feature_id & 0x50000000u) == 0x50000000u);
 }
 
 /**

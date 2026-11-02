@@ -13,10 +13,12 @@
 
 #include <physxcoopa/util/math.h>
 #include <physxcoopa/collision/shape.h>
+#include <physxcoopa/geometry/convex_hull.h>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
+#include <cstdint>
 #include <vector>
 
 namespace coopa {
@@ -105,6 +107,90 @@ inline glm::vec3 capsule_inverse_inertia(float radius, float half_height, float 
 }
 
 /**
+ * @struct MassProperties
+ * @brief Composite mass/center-of-mass/inertia produced by compose_mass_properties() or
+ *        hull_mass_properties().
+ */
+struct MassProperties {
+    float mass = 0.0f;
+    glm::vec3 center_of_mass{0.0f};    /**< In the body's own local frame. */
+    glm::vec3 inv_inertia_local{0.0f}; /**< About center_of_mass, body-local axes -- see the
+                                             diagonal-only approximation note below. */
+};
+
+/**
+ * @brief Mass properties of a solid convex hull of uniform `density`, by tetrahedron
+ *        decomposition about the hull's own centroid (each face fanned from its first vertex,
+ *        apex at the centroid -- the same fan build_convex_hull() uses for its own volume).
+ *
+ * Returns the DIAGONAL of the inertia tensor about the centroid, in the hull's own vertex
+ * frame, discarding off-diagonal terms -- the same convention compose_mass_properties()
+ * documents. This is EXACT, not approximate, whenever the hull's vertices are already expressed
+ * in its principal frame: fracture_mesh()/slice_mesh() pieces always are (best_frame() rotates
+ * every piece into one before building its hull), so the off-diagonal terms are genuinely zero
+ * there, not merely dropped.
+ *
+ * @param hull    A built hull (build_convex_hull() succeeded).
+ * @param density Mass per unit volume.
+ * @return `mass` and `inv_inertia_local` both 0 for an empty or zero-volume hull.
+ */
+inline MassProperties hull_mass_properties(const geometry::ConvexHull& hull, float density) {
+    MassProperties out;
+    if (hull.vertices.empty() || hull.face_count() == 0) return out;
+
+    glm::vec3 centroid = hull.centroid;
+    double total_vol6 = 0.0, ixx = 0.0, iyy = 0.0, izz = 0.0;
+    for (std::size_t f = 0; f < hull.face_count(); ++f) {
+        std::uint32_t start = hull.face_starts[f];
+        std::uint32_t end = hull.face_starts[f + 1];
+        glm::vec3 v0 = hull.vertices[hull.face_vertices[start]] - centroid;
+        for (std::uint32_t k = start + 1; k + 1 < end; ++k) {
+            glm::vec3 v1 = hull.vertices[hull.face_vertices[k]] - centroid;
+            glm::vec3 v2 = hull.vertices[hull.face_vertices[k + 1]] - centroid;
+            // Tetrahedron (centroid, v0, v1, v2), v0/v1/v2 already relative to the centroid --
+            // the Tonon closed-form tensor-about-a-vertex formula with that vertex at the origin.
+            double vol6 = glm::dot(glm::dvec3(v0), glm::cross(glm::dvec3(v1), glm::dvec3(v2)));
+            total_vol6 += vol6;
+            double x1 = v0.x, y1 = v0.y, z1 = v0.z;
+            double x2 = v1.x, y2 = v1.y, z2 = v1.z;
+            double x3 = v2.x, y3 = v2.y, z3 = v2.z;
+            double fx = x1 * x1 + x2 * x2 + x3 * x3 + x1 * x2 + x1 * x3 + x2 * x3;
+            double fy = y1 * y1 + y2 * y2 + y3 * y3 + y1 * y2 + y1 * y3 + y2 * y3;
+            double fz = z1 * z1 + z2 * z2 + z3 * z3 + z1 * z2 + z1 * z3 + z2 * z3;
+            ixx += vol6 * (fy + fz) / 60.0;
+            iyy += vol6 * (fx + fz) / 60.0;
+            izz += vol6 * (fx + fy) / 60.0;
+        }
+    }
+    double volume = std::abs(total_vol6) / 6.0;
+    out.mass = float(volume) * density;
+    out.center_of_mass = centroid;
+    if (out.mass <= 0.0f) return out;
+
+    double dens = double(density) * (total_vol6 < 0.0 ? -1.0 : 1.0); // all tets share one sign
+    double Ixx = std::abs(ixx * dens), Iyy = std::abs(iyy * dens), Izz = std::abs(izz * dens);
+    out.inv_inertia_local = glm::vec3(float(1.0 / std::max(Ixx, double(util::k_epsilon))),
+                                       float(1.0 / std::max(Iyy, double(util::k_epsilon))),
+                                       float(1.0 / std::max(Izz, double(util::k_epsilon))));
+    return out;
+}
+
+/**
+ * @brief Mass-scaled inverse inertia of a ConvexHull shape at a GIVEN target `mass` (matching
+ *        every other inertia_for_shape() branch's contract, unlike hull_mass_properties() above
+ *        which derives mass FROM a density). Inertia scales linearly with mass for a fixed
+ *        shape and as scale^2 for a fixed mass (length^2 in I = m*r^2), so this rescales the
+ *        hull's own unit-density, unit-scale second moments rather than resolving a density.
+ */
+inline glm::vec3 hull_inverse_inertia(const geometry::ConvexHull& hull, float hull_scale, float mass) {
+    if (mass <= 0.0f) return glm::vec3(0.0f);
+    MassProperties unit = hull_mass_properties(hull, 1.0f);
+    if (unit.mass <= 0.0f) return glm::vec3(0.0f);
+    float s2 = std::max(hull_scale * hull_scale, util::k_epsilon);
+    return unit.inv_inertia_local * (unit.mass / (mass * s2));
+}
+
+/**
  * @brief Dispatches to the analytic inverse-inertia function matching `shape.type`, permuting
  *        the capsule result to match `shape.capsule_axis` (0=X, 1=Y, 2=Z; see
  *        capsule_inverse_inertia()'s doc -- its own result is Z-axis-local).
@@ -132,6 +218,8 @@ inline glm::vec3 inertia_for_shape(const collision::Shape& shape, float mass) {
             if (shape.capsule_axis == 1) return glm::vec3(raw.x, raw.z, raw.y);
             return raw;
         }
+        case collision::ShapeType::ConvexHull:
+            return shape.hull ? hull_inverse_inertia(*shape.hull, shape.hull_scale, mass) : glm::vec3(0.0f);
         case collision::ShapeType::TriangleMesh:
         default:
             return glm::vec3(0.0f);
@@ -150,17 +238,6 @@ struct ChildMassInput {
     /** @brief This child's OWN diagonal inverse inertia about ITS OWN center, in ITS OWN local
      *         frame -- exactly what inertia_for_shape() already returns for a single shape. */
     glm::vec3 inv_inertia_local{0.0f};
-};
-
-/**
- * @struct MassProperties
- * @brief Composite mass/center-of-mass/inertia produced by compose_mass_properties().
- */
-struct MassProperties {
-    float mass = 0.0f;
-    glm::vec3 center_of_mass{0.0f};    /**< In the body's own local frame. */
-    glm::vec3 inv_inertia_local{0.0f}; /**< About center_of_mass, body-local axes -- see the
-                                             diagonal-only approximation note below. */
 };
 
 /**

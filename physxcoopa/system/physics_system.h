@@ -279,8 +279,20 @@ private:
         return col->owner;
     }
 
+    /** @brief Whether `obj` and every ancestor of it is active. */
+    static bool active_in_hierarchy_(const coopa::scene::SceneObject& obj) {
+        for (const coopa::scene::SceneObject* o = &obj; o != nullptr; o = o->parent()) {
+            if (!o->active()) return false;
+        }
+        return true;
+    }
+
     void regather_(coopa::scene::Scene& scene) {
-        std::vector<components::Collider*> current = scene.get_components<components::Collider>();
+        std::vector<components::Collider*> current;
+        for (components::Collider* col : scene.get_components<components::Collider>()) {
+            if (col->owner == nullptr || !active_in_hierarchy_(*col->owner)) continue;
+            current.push_back(col);
+        }
         std::unordered_set<components::Collider*> current_set(current.begin(), current.end());
 
         std::unordered_map<components::Collider*, Binding> old_by_collider;
@@ -754,7 +766,9 @@ private:
      *         density approximation; there is no per-collider density/mass field anywhere in
      *         this codebase to do better). TriangleMesh returns 1.0 (a mesh child is always
      *         static or kinematic, where mass is irrelevant, or the dynamic-mesh case throws
-     *         in create_compound_body_() before this value would matter). */
+     *         in create_compound_body_() before this value would matter). ConvexHull returns
+     *         its real built volume (scaled by hull_scale^3) rather than guessing, since a
+     *         dynamic hull body -- unlike a mesh -- is exactly the case this split exists for. */
     static float shape_volume_(const collision::Shape& s) {
         constexpr float k_pi = 3.14159265358979323846f;
         switch (s.type) {
@@ -766,6 +780,8 @@ private:
                 float r = s.capsule_radius, hh = s.capsule_half_height;
                 return k_pi * r * r * (2.0f * hh) + (4.0f / 3.0f) * k_pi * r * r * r;
             }
+            case collision::ShapeType::ConvexHull:
+                return s.hull ? s.hull->volume * s.hull_scale * s.hull_scale * s.hull_scale : 1.0f;
             case collision::ShapeType::TriangleMesh:
             default:
                 return 1.0f;

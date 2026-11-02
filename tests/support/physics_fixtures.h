@@ -3,7 +3,8 @@
 /**
  * @file physics_fixtures.h
  * @brief Shared headless PhysicsWorld builders for physxcoopa's suites: ground, boxes, spheres,
- *        capsules, hand-built triangle meshes (with edge adjacency), and the "settled flat" check.
+ *        capsules, convex hulls, hand-built triangle meshes (with edge adjacency), and the
+ *        "settled flat" check.
  *
  * Every helper builds exactly what the tests' hand-computed expectations assume (unit mass, the
  * matching closed-form inertia, identity orientation unless given), so changing one changes the
@@ -14,6 +15,7 @@
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/dynamics/body.h>
 #include <physxcoopa/dynamics/inertia.h>
+#include <physxcoopa/geometry/convex_hull.h>
 #include <physxcoopa/geometry/triangle_mesh.h>
 
 #include <glm/gtc/quaternion.hpp>
@@ -65,6 +67,23 @@ inline dynamics::BodyId add_dynamic_box(PhysicsWorld& world, const glm::vec3& po
     body.inv_mass = 1.0f;
     body.inv_inertia_local = dynamics::box_inverse_inertia(half_extents, body.mass);
     collision::Shape shape = collision::Shape::make_box(half_extents);
+    shape.material = mat;
+    return world.add_body(body, shape);
+}
+
+/** @brief Unit-mass dynamic convex hull, with the matching closed-form (diagonal) inverse
+ *         inertia from hull_inverse_inertia() -- same contract as add_dynamic_box(). The caller
+ *         owns `hull` and must keep it alive for as long as the body exists: Shape::hull is
+ *         non-owning, same as Shape::mesh. */
+inline dynamics::BodyId add_dynamic_hull(PhysicsWorld& world, const geometry::ConvexHull* hull, const glm::vec3& pos,
+                                         const glm::quat& rot = k_identity, dynamics::PhysicsMaterial* mat = nullptr) {
+    dynamics::Body body;
+    body.position = pos;
+    body.orientation = rot;
+    body.mass = 1.0f;
+    body.inv_mass = 1.0f;
+    body.inv_inertia_local = dynamics::hull_inverse_inertia(*hull, 1.0f, body.mass);
+    collision::Shape shape = collision::Shape::make_hull(hull);
     shape.material = mat;
     return world.add_body(body, shape);
 }

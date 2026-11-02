@@ -5,14 +5,16 @@
  *
  * Sources are copied out of the PhysicsWorld on the calling thread, so a background tile
  * rebuild never reads live physics state. The one thing a snapshot does not own is a mesh
- * collider's TriangleMesh (an immutable asset), which is why NavBaker gathers a tile's
- * triangles on the calling thread before handing an async rebuild to a job (see nav_baker.h).
+ * collider's TriangleMesh, or a hull collider's ConvexHull (both non-owning pointers into an
+ * asset or a ConvexCollider's shared_ptr), which is why NavBaker gathers a tile's triangles on
+ * the calling thread before handing an async rebuild to a job (see nav_baker.h).
  */
 
 #ifndef PHYSXCOOPA_NAV_NAV_SOURCE_H
 #define PHYSXCOOPA_NAV_NAV_SOURCE_H
 
 #include <physxcoopa/nav/nav_types.h>
+#include <physxcoopa/collision/sat_hull.h>
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/dynamics/body.h>
 #include <physxcoopa/geometry/aabb.h>
@@ -110,6 +112,10 @@ inline uint64_t fingerprint(const SourceShape& s) {
             h = detail::hash_value_(h, sh.mesh);
             h = detail::hash_value_(h, sh.mesh_scale);
             break;
+        case collision::ShapeType::ConvexHull:
+            h = detail::hash_value_(h, sh.hull);
+            h = detail::hash_value_(h, sh.hull_scale);
+            break;
     }
     h = detail::hash_value_(h, s.position);
     h = detail::hash_value_(h, s.rotation);
@@ -159,6 +165,7 @@ inline void gather_sources(const PhysicsWorld& world, const SourceFilter& filter
             if (shape->layer < 32 && !((filter.layer_mask >> shape->layer) & 1u)) continue;
             bool include = body.type != dynamics::BodyType::Dynamic;
             if (shape->type == collision::ShapeType::TriangleMesh && !shape->mesh) continue;
+            if (shape->type == collision::ShapeType::ConvexHull && !shape->hull) continue;
 
             SourceShape s;
             s.shape = *shape;
@@ -242,8 +249,9 @@ inline void emit_capsule_(std::vector<glm::vec3>& out, const glm::vec3& center, 
 
 /**
  * @brief Appends `src`'s world-space triangles (3 vertices each) whose XY footprint overlaps
- *        `clip` to `out`. Boxes are exact; spheres and capsules are tessellated (16 x 8); meshes
- *        are culled through their BVH so a large terrain mesh only emits the tile's triangles.
+ *        `clip` to `out`. Boxes and hulls are exact (hull faces fan-triangulated); spheres and
+ *        capsules are tessellated (16 x 8); meshes are culled through their BVH so a large
+ *        terrain mesh only emits the tile's triangles.
  */
 inline void emit_triangles(const SourceShape& src, const geometry::AABB& clip, std::vector<glm::vec3>& out) {
     if (!detail::overlaps_xy_(src.bounds, clip)) return;
@@ -309,6 +317,21 @@ inline void emit_triangles(const SourceShape& src, const geometry::AABB& clip, s
                 detail::push_tri_if_overlaps_(out, center + r * (v0 * scale), center + r * (v1 * scale),
                                               center + r * (v2 * scale), clip);
             });
+            break;
+        }
+        case collision::ShapeType::ConvexHull: {
+            if (!s.hull) break;
+            const collision::PosedHull posed = collision::world_posed_hull(s, src.position, src.rotation);
+            const geometry::ConvexHull& hull = *posed.hull;
+            for (std::size_t f = 0; f < hull.face_count(); ++f) {
+                const std::uint32_t start = hull.face_starts[f];
+                const std::uint32_t end = hull.face_starts[f + 1];
+                const glm::vec3 v0 = posed.world_vertex(hull.face_vertices[start]);
+                for (std::uint32_t i = start + 1; i + 1 < end; ++i) {
+                    detail::push_tri_if_overlaps_(out, v0, posed.world_vertex(hull.face_vertices[i]),
+                                                  posed.world_vertex(hull.face_vertices[i + 1]), clip);
+                }
+            }
             break;
         }
     }

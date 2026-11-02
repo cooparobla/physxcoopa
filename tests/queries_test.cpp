@@ -1,9 +1,10 @@
 /**
  * @file queries_test.cpp
- * @brief Scene queries on PhysicsWorld: raycasts, overlaps, exact sphere/box/capsule sweeps (box
- *        corners, capsules, mesh ramps, started-inside and resting-contact rules), QueryFilter,
- *        compute_penetration, and Shape::local_rotation being honoured by every query path.
- *        The PhysicsSystem wrappers are in physics_system_test.cpp.
+ * @brief Scene queries on PhysicsWorld: raycasts (including a hull reproducing an equivalent
+ *        box), overlaps, exact sphere/box/capsule sweeps (box corners, capsules, mesh ramps,
+ *        started-inside and resting-contact rules), QueryFilter, compute_penetration, and
+ *        Shape::local_rotation being honoured by every query path. The PhysicsSystem wrappers
+ *        are in physics_system_test.cpp.
  */
 #include <coopa/testing/test.h>
 
@@ -30,6 +31,38 @@ COOPA_TEST(raycast_hits_box_with_exact_distance_point_and_normal) {
     query::RaycastHit hit;
     ASSERT_TRUE(world.raycast(ray, hit));
     ASSERT_NEAR(hit.distance, 4.5f, 1e-3f); // box's near face at x=4.5
+    ASSERT_VEC_NEAR(hit.point, glm::vec3(4.5f, 0.0f, 0.0f), 1e-3f);
+    ASSERT_VEC_NEAR(hit.normal, glm::vec3(-1.0f, 0.0f, 0.0f), 1e-3f);
+    ASSERT_TRUE(hit.body.index == id.index);
+}
+
+/** @brief A cube hull raycast hits at the same distance/point/normal as an equivalent box --
+ *         raycast_shape()'s ConvexHull case (exact per-face half-space clipping) must reproduce
+ *         ray_vs_obb() exactly for an axis-aligned cube. */
+COOPA_TEST(raycast_hits_hull_where_it_hits_an_equivalent_box) {
+    PhysicsWorld world;
+
+    glm::vec3 pts[8];
+    int k = 0;
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2)
+            for (int sz = -1; sz <= 1; sz += 2) pts[k++] = glm::vec3(float(sx), float(sy), float(sz)) * 0.5f;
+    geometry::ConvexHull hull;
+    ASSERT_TRUE(geometry::build_convex_hull(pts, 8, hull));
+
+    dynamics::Body body;
+    body.type = dynamics::BodyType::Static;
+    body.position = glm::vec3(5.0f, 0.0f, 0.0f);
+    dynamics::BodyId id = world.add_body(body, collision::Shape::make_hull(&hull));
+
+    geometry::Ray ray;
+    ray.origin = glm::vec3(0.0f, 0.0f, 0.0f);
+    ray.direction = glm::vec3(1.0f, 0.0f, 0.0f);
+    ray.max_distance = 100.0f;
+
+    query::RaycastHit hit;
+    ASSERT_TRUE(world.raycast(ray, hit));
+    ASSERT_NEAR(hit.distance, 4.5f, 1e-3f); // hull's near face at x=4.5, same as the box above
     ASSERT_VEC_NEAR(hit.point, glm::vec3(4.5f, 0.0f, 0.0f), 1e-3f);
     ASSERT_VEC_NEAR(hit.normal, glm::vec3(-1.0f, 0.0f, 0.0f), 1e-3f);
     ASSERT_TRUE(hit.body.index == id.index);

@@ -9,12 +9,14 @@
 
 #include <physxcoopa/system/physics_system.h>
 #include <physxcoopa/components/box_collider.h>
+#include <physxcoopa/components/convex_collider.h>
 #include <physxcoopa/components/sphere_collider.h>
 #include <physxcoopa/components/rigidbody.h>
 #include <physxcoopa/components/hinge_joint.h>
 #include <physxcoopa/components/ball_joint.h>
 #include <physxcoopa/components/cone_twist_joint.h>
 #include <physxcoopa/dynamics/joint.h>
+#include <physxcoopa/geometry/convex_hull.h>
 #include <coopa/scene/scene.h>
 #include <coopa/scene/scene_object.h>
 #include <coopa/scene/components/transform_component.h>
@@ -441,6 +443,55 @@ COOPA_TEST(scene_queries_resolve_collider_and_object) {
 }
 
 /**
+ * A ground Collider under a deactivated ANCESTOR (not deactivated itself) must leave the
+ * physics world -- regather_()'s gather now walks up to the root checking active(), matching
+ * the ancestor-active check WaterSystem::refresh_bodies() already had. Without that walk, a
+ * scene that deactivates one subtree of several terrain-flavour objects (the toyengine demo
+ * this guards) leaves the hidden flavour's colliders solid and a player stands on a terrain
+ * that isn't being drawn. refresh() must be called after set_active() for the gather to notice
+ * -- nothing dirties the system on activation by itself.
+ */
+COOPA_TEST(a_collider_under_a_deactivated_ancestor_leaves_the_world) {
+    using namespace coopa::scene;
+
+    Scene scene("PhysicsAncestorActiveTest");
+
+    auto group = std::make_unique<SceneObject>("group");
+    group->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f));
+    SceneObject* group_ptr = group.get();
+
+    auto ground = std::make_unique<SceneObject>("ground");
+    auto* ground_tc = ground->add_component<TransformComponent>();
+    ground_tc->set_parent_transform(&group_ptr->get_transform()->transform());
+    ground_tc->transform().set_position(glm::vec3(0.0f));
+    ground->add_component<components::BoxCollider>()->set_size(glm::vec3(8.0f, 8.0f, 1.0f));
+    group_ptr->add_child(std::move(ground));
+
+    scene.add_root_object(std::move(group));
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+    scene.update(util::k_default_fixed_dt); // first execute() binds the ground body
+
+    geometry::Ray down;
+    down.origin = glm::vec3(0.0f, 0.0f, 5.0f);
+    down.direction = glm::vec3(0.0f, 0.0f, -1.0f);
+    down.max_distance = 100.0f;
+
+    system::PhysicsSystem::RaycastHit hit;
+    ASSERT_TRUE(sys->raycast(down, hit)); // solid while the group is active
+
+    group_ptr->set_active(false);
+    sys->refresh();
+    scene.update(util::k_default_fixed_dt);
+    ASSERT_TRUE(!sys->raycast(down, hit)); // the ancestor-active walk drops it from the gather
+
+    group_ptr->set_active(true);
+    sys->refresh();
+    scene.update(util::k_default_fixed_dt);
+    ASSERT_TRUE(sys->raycast(down, hit)); // reactivating puts it straight back
+}
+
+/**
  * Hierarchical dynamic bodies (a ragdoll's shape: each link a CHILD of the previous one, each
  * with its own Rigidbody + Collider, jointed with a BallJoint and a ConeTwistJoint component)
  * must be written back as correct LOCAL poses -- computed from the parent's new body pose, not
@@ -582,4 +633,54 @@ COOPA_TEST(a_placed_kinematic_body_reports_no_velocity) {
     t.set_position(glm::vec3(0.0f, 0.0f, 0.0f));
     scene.update(dt);
     ASSERT_TRUE(glm::length(sys->world().get_body(id)->linear_velocity) > 100.0f);
+}
+
+/**
+ * ConvexCollider on a non-kinematic Rigidbody must bind and simulate normally -- unlike
+ * MeshCollider, where exactly this configuration throws (see create_compound_body_()'s mesh-
+ * collider-static-only check). A dynamic hull body is the entire reason ConvexCollider exists,
+ * so this is the regression guard that the TriangleMesh-specific throw never widens to catch it.
+ */
+COOPA_TEST(convex_collider_on_a_dynamic_rigidbody_binds_and_settles_flat) {
+    using namespace coopa::scene;
+
+    glm::vec3 pts[8];
+    int k = 0;
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2)
+            for (int sz = -1; sz <= 1; sz += 2) pts[k++] = glm::vec3(float(sx), float(sy), float(sz)) * 0.5f;
+    auto hull = std::make_shared<geometry::ConvexHull>();
+    ASSERT_TRUE(geometry::build_convex_hull(pts, 8, *hull));
+
+    Scene scene("ConvexColliderDynamicTest");
+
+    auto ground = std::make_unique<SceneObject>("ground");
+    ground->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, -0.5f));
+    ground->add_component<components::BoxCollider>()->set_size(glm::vec3(8.0f, 8.0f, 1.0f));
+    scene.add_root_object(std::move(ground));
+
+    auto obj = std::make_unique<SceneObject>("hull");
+    obj->add_component<TransformComponent>()->transform().set_position(glm::vec3(0.0f, 0.0f, 2.0f));
+    obj->add_component<components::ConvexCollider>()->set_hull(hull);
+    obj->add_component<components::RigidbodyComponent>(); // non-kinematic: must NOT throw
+    scene.add_root_object(std::move(obj));
+
+    scene.start();
+    system::PhysicsSystem* sys = system::install_physics_system(scene);
+
+    for (int i = 0; i < 300; ++i) {
+        scene.update(util::k_default_fixed_dt);
+        scene.late_update(util::k_default_fixed_dt);
+    }
+    EXPECT_EQ(sys->bound_count(), 2u);
+
+    SceneObject* obj_ptr = scene.find_object("hull");
+    ASSERT_TRUE(obj_ptr != nullptr);
+    dynamics::BodyId id = obj_ptr->get_component<components::ConvexCollider>()->body_id();
+    const dynamics::Body* b = sys->world().get_body(id);
+    ASSERT_TRUE(b != nullptr);
+    EXPECT_TRUE(b->type == dynamics::BodyType::Dynamic);
+    EXPECT_TRUE(is_settled(*b));
+    EXPECT_NEAR(b->position.z, 0.5f, 0.02f);
+    EXPECT_GT(best_up_alignment(b->orientation), 0.999f);
 }

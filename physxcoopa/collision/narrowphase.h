@@ -13,6 +13,7 @@
 #include <physxcoopa/collision/shape.h>
 #include <physxcoopa/collision/manifold.h>
 #include <physxcoopa/collision/sat.h>
+#include <physxcoopa/collision/sat_hull.h>
 #include <physxcoopa/collision/segment.h>
 #include <physxcoopa/collision/mesh_contact.h>
 #include <physxcoopa/dynamics/physics_material.h>
@@ -267,6 +268,48 @@ inline bool generate_contacts(
         geometry::OBB A = world_obb(shape_a, pos_a, rot_a);
         geometry::Capsule B = world_capsule(shape_b, pos_b, rot_b);
         hit = capsule_vs_box(B, A, out); // normal already points box(A)->capsule(B)
+    } else if (shape_a.type == ShapeType::ConvexHull && shape_b.type == ShapeType::ConvexHull) {
+        PosedHull A = world_posed_hull(shape_a, pos_a, rot_a);
+        PosedHull B = world_posed_hull(shape_b, pos_b, rot_b);
+        hit = generate_hull_hull_contacts(A, B, out);
+    } else if (shape_a.type == ShapeType::ConvexHull && shape_b.type == ShapeType::Box) {
+        PosedHull A = world_posed_hull(shape_a, pos_a, rot_a);
+        geometry::OBB B = world_obb(shape_b, pos_b, rot_b);
+        hit = generate_hull_box_contacts(A, B, out); // normal already points hull(a) -> box(b)
+    } else if (shape_a.type == ShapeType::Box && shape_b.type == ShapeType::ConvexHull) {
+        geometry::OBB A = world_obb(shape_a, pos_a, rot_a);
+        PosedHull B = world_posed_hull(shape_b, pos_b, rot_b);
+        hit = generate_hull_box_contacts(B, A, out); // generated as B(hull) -> A(box); flip to A -> B
+        if (hit) out.normal = -out.normal;
+    } else if (shape_a.type == ShapeType::ConvexHull && shape_b.type == ShapeType::Sphere) {
+        PosedHull A = world_posed_hull(shape_a, pos_a, rot_a);
+        geometry::Sphere B = world_sphere(shape_b, pos_b, rot_b);
+        glm::vec3 n, p;
+        float pen;
+        if (hull_vs_sphere(A, B, n, pen, p)) {
+            out.normal = n; // already hull(a) -> sphere(b)
+            out.add_point(p, pen, 0);
+            hit = true;
+        }
+    } else if (shape_a.type == ShapeType::Sphere && shape_b.type == ShapeType::ConvexHull) {
+        geometry::Sphere A = world_sphere(shape_a, pos_a, rot_a);
+        PosedHull B = world_posed_hull(shape_b, pos_b, rot_b);
+        glm::vec3 n, p;
+        float pen;
+        if (hull_vs_sphere(B, A, n, pen, p)) {
+            out.normal = -n; // hull_vs_sphere's normal points hull(b) -> sphere(a); flip to a -> b
+            out.add_point(p, pen, 0);
+            hit = true;
+        }
+    } else if (shape_a.type == ShapeType::ConvexHull && shape_b.type == ShapeType::Capsule) {
+        PosedHull A = world_posed_hull(shape_a, pos_a, rot_a);
+        geometry::Capsule B = world_capsule(shape_b, pos_b, rot_b);
+        hit = hull_vs_capsule(A, B, out); // already hull(a) -> capsule(b)
+    } else if (shape_a.type == ShapeType::Capsule && shape_b.type == ShapeType::ConvexHull) {
+        geometry::Capsule A = world_capsule(shape_a, pos_a, rot_a);
+        PosedHull B = world_posed_hull(shape_b, pos_b, rot_b);
+        hit = hull_vs_capsule(B, A, out);
+        if (hit) out.normal = -out.normal; // hull(b) -> capsule(a); flip to a -> b
     } else if (shape_a.type != ShapeType::TriangleMesh && shape_b.type == ShapeType::TriangleMesh) {
         hit = generate_mesh_contacts(shape_a, pos_a, rot_a, shape_b, pos_b, rot_b, out);
         if (hit) out.normal = -out.normal; // generate_mesh_contacts's normal points mesh(b)->shape(a); flip to a->b

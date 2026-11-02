@@ -2,8 +2,10 @@
  * @file physics_world_test.cpp
  * @brief PhysicsWorld as a container and integrator: free fall against the semi-implicit Euler answer,
  *        generational body handles, the immediate-impulse/force API and its wake rule, the
- *        on_substep signal, determinism (repeat and serial-vs-job-parallel), and debug drawing.
- *        Contact resolution is contact_solver_test.cpp; sleeping is sleep_test.cpp.
+ *        on_substep signal, determinism (repeat and serial-vs-job-parallel), debug drawing, and
+ *        convex-hull integration (a hull resting on and stacked on a floor, catching a bad
+ *        manifold/normal/inertia at once). Contact resolution is contact_solver_test.cpp;
+ *        sleeping is sleep_test.cpp.
  */
 #include <coopa/testing/test.h>
 
@@ -219,4 +221,70 @@ COOPA_TEST(debug_draw_emits_lines_and_respects_flags) {
     world.debug_draw(colliders_only, debug::DebugDrawFlags::Colliders);
     ASSERT_TRUE(!colliders_only.lines.empty());
     ASSERT_TRUE(colliders_only.lines.size() < draw.lines.size()); // strictly fewer without BVH/contacts
+}
+
+namespace {
+/** @brief An axis-aligned cube hull of the given half-extent -- see narrowphase_test.cpp's
+ *         make_cube_hull_() for the same construction; duplicated locally rather than shared
+ *         across test binaries' translation units. */
+geometry::ConvexHull make_cube_hull_for_world_test_(float half_extent) {
+    glm::vec3 pts[8];
+    int k = 0;
+    for (int sx = -1; sx <= 1; sx += 2)
+        for (int sy = -1; sy <= 1; sy += 2)
+            for (int sz = -1; sz <= 1; sz += 2) pts[k++] = glm::vec3(float(sx), float(sy), float(sz)) * half_extent;
+    geometry::ConvexHull hull;
+    bool ok = geometry::build_convex_hull(pts, 8, hull);
+    (void)ok;
+    return hull;
+}
+} // namespace
+
+/**
+ * The single cheapest integration check that catches a bad hull manifold, a bad normal, or a
+ * bad inertia all at once (Stage 1's own risk list): a cube hull dropped on a static floor
+ * must come to rest flat, its center at exactly half its own height above the floor -- not
+ * sunk into it (a flipped normal) and not left floating (a wrong inertia stalling the solver).
+ */
+COOPA_TEST(dynamic_cube_hull_rests_on_the_floor_without_sinking) {
+    PhysicsWorld world;
+    add_static_ground(world);
+
+    geometry::ConvexHull hull = make_cube_hull_for_world_test_(0.5f);
+    dynamics::BodyId id = add_dynamic_hull(world, &hull, glm::vec3(0.0f, 0.0f, 2.0f));
+
+    for (int i = 0; i < 300; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    const dynamics::Body* b = world.get_body(id);
+    EXPECT_TRUE(is_settled(*b));
+    EXPECT_NEAR(b->position.z, 0.5f, 0.02f);
+    EXPECT_GT(best_up_alignment(b->orientation), 0.999f);
+}
+
+/**
+ * Three flush-stacked cube hulls must settle without drifting sideways or buzzing -- the
+ * feature-id-stability test's (narrowphase_test.cpp) integration-level counterpart: an unstable
+ * manifold between steps is exactly what would show up here as jitter that never sleeps.
+ */
+COOPA_TEST(three_cube_hulls_stacked_settle_without_jittering) {
+    PhysicsWorld world;
+    add_static_box(world, glm::vec3(0.0f, 0.0f, -0.5f), glm::vec3(5.0f, 5.0f, 0.5f));
+
+    geometry::ConvexHull hull = make_cube_hull_for_world_test_(0.5f);
+    const float half = 0.5f;
+    std::vector<dynamics::BodyId> ids;
+    for (int i = 0; i < 3; ++i) {
+        glm::vec3 pos(0.0f, 0.0f, half * (2 * i + 1));
+        ids.push_back(add_dynamic_hull(world, &hull, pos));
+    }
+
+    for (int i = 0; i < 1000; ++i) world.step_fixed(util::k_default_fixed_dt);
+
+    for (auto id : ids) {
+        const dynamics::Body* b = world.get_body(id);
+        EXPECT_LT(std::abs(b->position.x), 0.05f);
+        EXPECT_LT(std::abs(b->position.y), 0.05f);
+        EXPECT_GT(best_up_alignment(b->orientation), 0.999f);
+        EXPECT_TRUE(is_settled(*b));
+    }
 }

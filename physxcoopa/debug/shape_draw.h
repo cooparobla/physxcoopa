@@ -13,6 +13,7 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <physxcoopa/collision/shape.h>
+#include <physxcoopa/collision/sat_hull.h>
 #include <physxcoopa/debug/debug_draw.h>
 
 namespace coopa {
@@ -40,6 +41,16 @@ inline void add_shape(DebugDraw& out, const collision::Shape& shape, const glm::
             glm::mat4 transform(glm::mat3_cast(orientation * shape.local_rotation) * shape.mesh_scale);
             transform[3] = glm::vec4(position + orientation * shape.local_center, 1.0f);
             out.add_mesh(*shape.mesh, transform, color);
+            break;
+        }
+        case collision::ShapeType::ConvexHull: {
+            // No add_hull() on DebugDraw -- a hull's edges (already deduplicated by
+            // build_convex_hull()'s face merging) are just world-space line segments, so drawing
+            // them directly is simpler than adding a new DebugDraw method for one caller.
+            if (!shape.hull) break;
+            const collision::PosedHull posed = collision::world_posed_hull(shape, position, orientation);
+            for (const glm::uvec2& edge : posed.hull->edges)
+                out.add_line(posed.world_vertex(edge.x), posed.world_vertex(edge.y), color);
             break;
         }
     }

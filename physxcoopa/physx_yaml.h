@@ -11,6 +11,7 @@
 #include <physxcoopa/components/box_collider.h>
 #include <physxcoopa/components/sphere_collider.h>
 #include <physxcoopa/components/capsule_collider.h>
+#include <physxcoopa/components/convex_collider.h>
 #include <physxcoopa/components/mesh_collider.h>
 #include <physxcoopa/components/rigidbody.h>
 #include <physxcoopa/components/vehicle.h>
@@ -18,11 +19,15 @@
 #include <physxcoopa/components/ball_joint.h>
 #include <physxcoopa/components/cone_twist_joint.h>
 #include <physxcoopa/components/cloth.h>
+#include <physxcoopa/components/damage_dealer.h>
+#include <physxcoopa/damage/damage_material.h>
+#include <physxcoopa/damage/damage_types.h>
 #include <physxcoopa/dynamics/physics_material.h>
 #include <physxcoopa/dynamics/body.h>
 #include <physxcoopa/geometry/triangle_mesh.h>
 #include <physxcoopa/loaders/triangle_mesh_loader.h>
 #include <physxcoopa/loaders/physics_material_loader.h>
+#include <physxcoopa/loaders/damage_material_loader.h>
 #include <physxcoopa/util/physics_settings.h>
 #include <physxcoopa/nav_yaml.h>
 
@@ -186,6 +191,21 @@ inline void read_joint_common_(const fkyaml::node& node, components::JointCompon
     if (node.contains("enable_collision")) jc.enable_collision = node.at("enable_collision").get_value<bool>();
 }
 
+/** @brief Parses a DamageType name (case-sensitive, matching the enum's spelling). Unknown or
+ *         absent values fall back to `fallback` rather than throwing, same policy as every
+ *         other enum-ish key in this file. */
+inline damage::DamageType parse_damage_type_(const fkyaml::node& node, const std::string& key,
+                                             damage::DamageType fallback) {
+    if (!node.contains(key)) return fallback;
+    std::string v = node.at(key).get_value<std::string>();
+    if (v == "Impact") return damage::DamageType::Impact;
+    if (v == "Slash") return damage::DamageType::Slash;
+    if (v == "Pierce") return damage::DamageType::Pierce;
+    if (v == "Explosive") return damage::DamageType::Explosive;
+    if (v == "Fire") return damage::DamageType::Fire;
+    return fallback;
+}
+
 } // namespace detail
 
 /**
@@ -195,10 +215,11 @@ inline void read_joint_common_(const fkyaml::node& node, components::JointCompon
  * every lookup, so a single "BoxCollider" registration matches both a `!BoxCollider` YAML
  * tag and a `type: BoxCollider` key (see the plan's constraint 5).
  *
- * @param assets   AssetManager used to resolve MeshCollider's mesh reference and colliders'
- *                 named `material:` references. Must outlive every subsequent
- *                 SceneLoader::load() call, matching gfxcoopa::register_render_components()'s
- *                 convention.
+ * @param assets   AssetManager used to resolve MeshCollider's/ConvexCollider's mesh reference,
+ *                 colliders' named `material:` references and DamageDealer-adjacent
+ *                 `damage_materials/<name>.yaml` lookups (loaders/damage_material_loader.h).
+ *                 Must outlive every subsequent SceneLoader::load() call, matching
+ *                 gfxcoopa::register_render_components()'s convention.
  * @param settings Project-wide physics settings (see util/physics_settings.h) -- specifically,
  *                 seeds the layer-name registry so `layer: "Ground"` resolves. Defaults to an
  *                 empty PhysicsSettings (no named layers; `layer:` must be a bare integer).
@@ -212,6 +233,7 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
 
     assets.register_loader<geometry::TriangleMesh>(std::make_unique<loaders::TriangleMeshLoader>());
     assets.register_loader<dynamics::PhysicsMaterial>(std::make_unique<loaders::PhysicsMaterialLoader>());
+    assets.register_loader<damage::DamageMaterial>(std::make_unique<loaders::DamageMaterialLoader>());
 
     SceneLoader::register_component_parser("BoxCollider",
         [&assets](const fkyaml::node& node, SceneObject& obj, const SceneLoader::ParseContext& ctx) {
@@ -246,6 +268,36 @@ inline void register_physics_components(coopa::asset::AssetManager& assets,
                 c->set_mesh(assets.load<geometry::TriangleMesh>(virtual_path, ctx.base_dir()));
             }
             detail::apply_common_collider_fields_(node, *c, assets, ctx);
+        });
+
+    SceneLoader::register_component_parser("ConvexCollider",
+        [&assets](const fkyaml::node& node, SceneObject& obj, const SceneLoader::ParseContext& ctx) {
+            auto* c = obj.add_component<components::ConvexCollider>();
+            if (node.contains("hull_mesh")) {
+                std::string key = node.at("hull_mesh").get_value<std::string>();
+                std::string virtual_path = "meshes/" + key + ".yaml";
+                c->set_hull_mesh(assets.load<geometry::TriangleMesh>(virtual_path, ctx.base_dir()));
+            }
+            detail::apply_common_collider_fields_(node, *c, assets, ctx);
+        });
+
+    // What a collider's hits ARE (components/damage_dealer.h) -- put on a weapon head, a
+    // bullet, a falling weight, alongside the Collider that actually touches things.
+    SceneLoader::register_component_parser("DamageDealer",
+        [](const fkyaml::node& node, SceneObject& obj, const SceneLoader::ParseContext&) {
+            auto* d = obj.add_component<components::DamageDealer>();
+            // The YAML key is "damage_type", not "type": every component node's own "type:"
+            // key already names WHICH COMPONENT this is ("type: DamageDealer"), so a field
+            // literally called "type" collides with it in the editor's generic schema/default-
+            // component machinery (confirmed by component_schema_test.cpp).
+            d->type = detail::parse_damage_type_(node, "damage_type", d->type);
+            if (node.contains("amount")) d->amount = node.at("amount").get_value<float>();
+            if (node.contains("amount_from_impulse")) {
+                d->amount_from_impulse = node.at("amount_from_impulse").get_value<float>();
+            }
+            if (node.contains("edge_axis")) d->edge_axis = detail::read_vec3_(node, "edge_axis", d->edge_axis);
+            if (node.contains("radius")) d->radius = node.at("radius").get_value<float>();
+            if (node.contains("one_shot")) d->one_shot = node.at("one_shot").get_value<bool>();
         });
 
     SceneLoader::register_component_parser("Rigidbody",
